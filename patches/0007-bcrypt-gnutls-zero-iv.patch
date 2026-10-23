@@ -1,0 +1,36 @@
+bcrypt: Pass an all-zero vector to GnuTLS for block ciphers without IV.
+ECB is emulated with CBC and an empty vector. The GnuTLS 3.8.7 build shipped with
+the macOS Wine bundle crashes in gnutls_cipher_decrypt2/encrypt2 when a CBC handle
+is initialized with a NULL IV, so BCryptDecrypt/BCryptEncrypt in ECB mode and
+BCryptImportKey (AES key wrap) returned STATUS_ACCESS_VIOLATION.
+bcrypt tests (wine-11.0): 15 failures -> 0.
+
+diff --git a/dlls/bcrypt/gnutls.c b/dlls/bcrypt/gnutls.c
+index b80e7f85..aad02163 100644
+--- a/dlls/bcrypt/gnutls.c
++++ b/dlls/bcrypt/gnutls.c
+@@ -656,6 +656,7 @@ static NTSTATUS key_symmetric_vector_reset( void *args )
+ 
+ static NTSTATUS init_cipher_handle( struct key *key )
+ {
++    static UCHAR zero_vector[16];
+     gnutls_cipher_algorithm_t cipher;
+     gnutls_datum_t secret, vector;
+     int ret;
+@@ -669,7 +670,15 @@ static NTSTATUS init_cipher_handle( struct key *key )
+     vector.data = key->u.s.vector;
+     vector.size = key->u.s.vector_len;
+ 
+-    if ((ret = pgnutls_cipher_init( &key_data(key)->cipher, cipher, &secret, key->u.s.vector ? &vector : NULL )))
++    /* ECB is emulated with CBC and an all-zero vector; some GnuTLS builds crash
++     * in cipher_encrypt2/decrypt2 when a block cipher is initialized without one. */
++    if (!vector.data && key->u.s.mode != CHAIN_MODE_GCM && key->u.s.block_size <= sizeof(zero_vector))
++    {
++        vector.data = zero_vector;
++        vector.size = key->u.s.block_size;
++    }
++
++    if ((ret = pgnutls_cipher_init( &key_data(key)->cipher, cipher, &secret, vector.data ? &vector : NULL )))
+     {
+         pgnutls_perror( ret );
+         return STATUS_INTERNAL_ERROR;

@@ -13,6 +13,8 @@ it is skipped cleanly instead of breaking the build).
 | `0004-connectivity-implement.patch` | Implements `Windows.Networking.Connectivity` |
 | `0005-enumeration-upstream-fixes.patch` | Four pending upstream fixes for `windows.devices.enumeration` (Wine merge request !11997, original commit messages kept) |
 | `0006-devices-implement.patch` | Implements `Windows.Devices.Enumeration` further (real audio endpoints, names, device classes, CreateFromId, watcher events) and the `Windows.Media.Devices` selectors |
+| `0007-bcrypt-gnutls-zero-iv.patch` | AES/3DES in ECB mode and AES key wrap no longer crash: the bundled GnuTLS 3.8.7 faults on block ciphers initialized without IV, so bcrypt now passes an all-zero vector (bcrypt tests: 15 failures → 0) |
+| `0008-ncrypt-ecdsa-persisted-keys.patch` | ncrypt: ECDSA P-256 keys (from upstream) and named, persisted keys (`NCryptOpenKey`/`NCryptDeleteKey`, stored in the prefix registry, not DPAPI-protected). Needed by Epic Games Launcher / EOS for its DPoP login key (ncrypt tests: 470, 0 failures) |
 
 They are applied in this order on top of `WINE_TAG` (wine-11.0). Details, limits and
 tests: `winrt/README.md`.
