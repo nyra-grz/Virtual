@@ -1,0 +1,12 @@
+# Generated runtime & user data — never committed, never deployed
+/runtime/
+/prefix/
+/logs/
+/app/.build/
+/build/
+*.app/
+graphify-out/
+.DS_Store
+# downloaded third-party runtime payloads
+/thirdparty/
+/library.json

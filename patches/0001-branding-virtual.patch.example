@@ -1,0 +1,22 @@
+Description: renames the visible brand strings in winecfg (About dialog,
+window title) from "Wine" to "Virtual". Purely cosmetic, does not break any API.
+
+NOTE: example/template file. The exact context (line numbers, resource strings)
+depends on the chosen WINE_TAG. Before enabling it, check it against the source
+that was actually cloned:
+
+    cd thirdparty/wine
+    git grep -n "Wine configuration" programs/winecfg
+
+Then adapt this file, rename it to patches/0001-branding-virtual.patch (without
+.example) and run build-wine.sh again. build-wine.sh checks every patch with
+`git apply --check` and skips it cleanly if it does not fit.
+
+--- a/programs/winecfg/winecfg.rc
++++ b/programs/winecfg/winecfg.rc
+@@
+-    IDS_WINECFG_TITLE  "Wine configuration"
++    IDS_WINECFG_TITLE  "Virtual configuration"
+@@
+-    IDS_ABOUT          "Wine"
++    IDS_ABOUT          "Virtual (auf Wine-Basis, LGPL)"

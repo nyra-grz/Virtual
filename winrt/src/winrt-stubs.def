@@ -1,0 +1,4 @@
+; Exporte der WinRT-Stub-DLLs für einen MinGW-Build (siehe winrt/README.md)
+EXPORTS
+DllCanUnloadNow PRIVATE
+DllGetActivationFactory PRIVATE
