@@ -95,6 +95,45 @@ for key in 'HKCU\Software\Wine' "$NTKEY"; do
 done
 [ "$missing" = 0 ] || fail "$missing Registry-Werte stimmen nicht."
 
+# Ein frischer Wine-Prefix kann den Windows-Cursor-Schlüssel ganz auslassen.
+# Leere Cursorpfade wählen die tatsächlich eingebauten Systemcursor. Vorhandene
+# Benutzerschemata bleiben erhalten; keine anwendungsspezifische Prüfung wird geändert.
+cursor_query="$(mktemp "${TMPDIR:-/tmp}/virtual-cursor-query.XXXXXX")" || fail "Cursor-Konfiguration nicht lesbar."
+if ! "$BIN/virtual" reg query 'HKCU\Control Panel' >"$cursor_query" 2>&1; then
+    rm -f "$cursor_query"
+    fail "Windows-Systemeinstellungen sind nicht lesbar."
+fi
+if ! tr -d '\r' <"$cursor_query" | grep -Fxiq 'HKEY_CURRENT_USER\Control Panel\Cursors'; then
+    cursor_reg="$(mktemp "${TMPDIR:-/tmp}/virtual-cursors.XXXXXX")" || fail "Cursor-Konfiguration nicht anlegbar."
+    cat >"$cursor_reg" <<'REG'
+REGEDIT4
+
+[HKEY_CURRENT_USER\Control Panel\Cursors]
+"Scheme Source"=dword:00000000
+"AppStarting"=""
+"Arrow"=""
+"Crosshair"=""
+"Hand"=""
+"Help"=""
+"IBeam"=""
+"No"=""
+"NWPen"=""
+"SizeAll"=""
+"SizeNESW"=""
+"SizeNS"=""
+"SizeNWSE"=""
+"SizeWE"=""
+"UpArrow"=""
+"Wait"=""
+REG
+    "$BIN/virtual" regedit /s "$cursor_reg" >"$cursor_reg.log" 2>&1
+    cursor_status=$?
+    rm -f "$cursor_reg" "$cursor_reg.log"
+    [ "$cursor_status" = 0 ] || fail "Windows-Standardcursor konnten nicht eingerichtet werden."
+fi
+
+rm -f "$cursor_query"
+
 # .NET: nur anbieten, wenn eine Datei bereitliegt (kein Zwang, kein Download hier).
 DOTNET="${WINMAC_DOTNET:-$HOME/Downloads/dotnet-desktop.exe}"
 DOTNET_FAILED=0
@@ -109,6 +148,20 @@ if [ -f "$DOTNET" ]; then
 else
     echo "==> .NET-Installer nicht gefunden ($DOTNET) – übersprungen."
     echo "    (Zum Mitinstallieren dotnet-desktop.exe dorthin legen oder WINMAC_DOTNET setzen.)"
+fi
+
+# DirectX 10/11 wie im Standard-Raum über DXVK. Ohne DXVK scheitert in einem neuen
+# Raum schon D3D11CreateDevice (z. B. Epic Games Launcher stürzt sofort ab).
+# Nur aus dem bereits geladenen Paket, kein Download hier; schlägt es fehl, bleibt
+# der Raum bei WineD3D.
+if [ -s "$ROOT/thirdparty/graphics/dxvk.tar.gz" ] && [ -x "$ROOT/setup-graphics.sh" ]; then
+    echo "==> Richte DXVK (DirectX 10/11) ein…"
+    if ! run_logged "$ROOT/setup-graphics.sh"; then
+        echo "    Hinweis: DXVK-Einrichtung fehlgeschlagen – der Raum nutzt WineD3D."
+    fi
+else
+    echo "==> DXVK-Paket nicht geladen – übersprungen."
+    echo "    (Einmal ./setup-graphics.sh ausführen, dann bekommen neue Räume DXVK.)"
 fi
 
 # Registry auf die Platte schreiben lassen (endet der Server, speichert er sie).

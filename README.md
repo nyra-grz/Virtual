@@ -144,6 +144,27 @@ that Wine 11 does not resolve through HKCR. Unusual handlers using DDE or Window
 environment placeholders may still need application-specific setup.
 Dynamic URL registration needs a writable app bundle and re-signs it ad hoc.
 
+## Managed applications (.NET Framework)
+
+The source-built Wine 11.0 runtime includes [Wine Mono 10.4.1](https://github.com/wine-mono/wine-mono/releases/tag/wine-mono-10.4.1), the version
+expected by that Wine release. `scripts/setup-managed-runtime.sh` downloads the
+upstream archive, verifies its pinned SHA-256 checksum, and installs it only under
+Virtual's generated `runtime/wine-build/share/wine/mono/` directory. Runtime
+creation runs this step automatically; existing source runtimes can run the script
+once and regenerate their wrappers with `scripts/make-runtime-from-brew.sh`.
+Other Wine installations are not modified.
+
+Virtual no longer disables `mscoree` or `mshtml` globally. Explicit
+`WINEDLLOVERRIDES` remain respected. Runtime errors are logged by default
+(`WINEDEBUG=err+all`); use `WINEDEBUG=-all` explicitly to silence them. New room
+setup also supplies missing Windows default cursor preferences without replacing
+an existing user cursor scheme.
+
+Wine Mono supplies .NET Framework-compatible APIs, including Windows service
+support. A modern **.NET Desktop Runtime** (such as .NET 8) is a separate product
+and does not replace the .NET Framework 4.8 dependency of older applications.
+Compatibility still depends on each application's Windows APIs.
+
 ## Updates
 
 On launch (at most once a day) the app checks

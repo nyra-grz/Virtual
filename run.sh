@@ -7,8 +7,8 @@ PREFIX="$ROOT/prefix"
 WINE="$HOME/Downloads/Wine Staging.app/Contents/Resources/wine/bin"
 
 export WINEPREFIX="$PREFIX"
-export WINEDEBUG="${WINEDEBUG:--all}"
-export WINEDLLOVERRIDES="mscoree=d;mshtml=d"
+export WINEDEBUG="${WINEDEBUG:-err+all}"
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES-}"
 
 mkdir -p "$ROOT"
 

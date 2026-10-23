@@ -208,6 +208,50 @@ else
     report übersprungen "Registry ProductName" "Runtime-Dateien fehlen"
 fi
 
+# .NET muss über den echten CLR-Einstieg laufen; ein vorhandenes Verzeichnis
+# allein beweist nicht, dass mscoree und der verwaltete Code funktionieren.
+managed_test() {
+    local compiler="$WINMAC_HOME/runtime/wine-build/share/wine/mono/wine-mono-10.4.1/lib/mono/4.5/csc.exe"
+    local source_path output_path status output
+    if [ "$PREFIX_READY" != 1 ] || [ ! -f "$compiler" ]; then
+        report übersprungen ".NET-CLR" "eingerichteter Prefix und eigene Wine-Mono-Runtime erforderlich"
+        return
+    fi
+    if ! WINEDLLOVERRIDES='winedbg.exe=d' "$WINMAC_RUNTIME/bin/virtualboot" -u >mono-setup.log 2>&1; then
+        report FEHLER "Wine-Mono-Prefix einrichten"
+        show_log mono-setup.log
+        return
+    fi
+    cat >managed.cs <<'CS'
+using System;
+class ManagedSmoke {
+    static int Main() {
+        Console.WriteLine("WINMAC_SMOKE_CLR=" + Environment.Version.Major + ";BITS=" + (IntPtr.Size * 8));
+        return 37;
+    }
+}
+CS
+    source_path="Z:${SCRATCH//\//\\}\\managed.cs"
+    output_path="Z:${SCRATCH//\//\\}\\managed.exe"
+    if ! WINEDLLOVERRIDES='winedbg.exe=d' "$WINMAC_RUNTIME/bin/virtual" "$compiler" /nologo /platform:x64 "/out:$output_path" "$source_path" >managed-compile.log 2>&1; then
+        report FEHLER ".NET-Test kompilieren"
+        show_log managed-compile.log
+        return
+    fi
+    report ok ".NET-Test kompilieren"
+    WINEDLLOVERRIDES='winedbg.exe=d' "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/managed.exe" >managed.out 2>managed.err
+    status=$?
+    output="$(tr -d '\r' <managed.out)"
+    if [ "$status" = 37 ] && [ "$output" = 'WINMAC_SMOKE_CLR=4;BITS=64' ]; then
+        report ok ".NET-CLR ausführen" "$output; Exitcode 37"
+    else
+        report FEHLER ".NET-CLR ausführen" "Exitcode $status oder unerwartete Ausgabe"
+        show_log managed.out
+        show_log managed.err
+    fi
+}
+managed_test
+
 # d) Ein echter, absichtlich von null verschiedener Programm-Exitcode prüft,
 # dass Wrapper nicht nur printf ausgeben, sondern den Status weiterreichen.
 cat >console.c <<'C'

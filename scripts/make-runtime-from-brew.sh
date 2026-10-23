@@ -39,6 +39,12 @@ WINE_BIN="$(find_wine_bin)" || {
 }
 echo "==> Nutze Wine aus: $WINE_BIN"
 
+# Der eigene Wine-Build benötigt seine passende verwaltete Laufzeit. Andere
+# Wine-Installationen bringen Mono selbst mit und werden nicht verändert.
+if [ "$WINE_BIN" = "$RUNTIME/wine-build/bin" ]; then
+    "$ROOT/scripts/setup-managed-runtime.sh"
+fi
+
 mkdir -p "$BINDIR"
 
 # --- Wrapper erzeugen ---------------------------------------------------------
@@ -51,9 +57,9 @@ make_wrapper() {
 set -uo pipefail
 WINE_BIN="\${WINMAC_WINE_BIN:-$WINE_BIN}"
 export WINEPREFIX="\${WINEPREFIX:-$HOME/WinMac_Virtual/prefix}"
-export WINEDEBUG="\${WINEDEBUG:--all}"
-# Standard-DLL-Overrides: kein mono/gecko-Popup
-export WINEDLLOVERRIDES="\${WINEDLLOVERRIDES:-mscoree=d;mshtml=d}"
+export WINEDEBUG="\${WINEDEBUG:-err+all}"
+# .NET und HTML nicht global deaktivieren; installierte Laufzeiten müssen laden können.
+export WINEDLLOVERRIDES="\${WINEDLLOVERRIDES-}"
 # Grafik-Runtime (MoltenVK/DXVK/VKD3D), falls eingerichtet
 [ -f "$RUNTIME/graphics-env.sh" ] && source "$RUNTIME/graphics-env.sh"
 exec "\$WINE_BIN/$target" $prefixcmd "\$@"
@@ -75,7 +81,7 @@ else
 set -uo pipefail
 WINE_BIN="\${WINMAC_WINE_BIN:-$WINE_BIN}"
 export WINEPREFIX="\${WINEPREFIX:-$HOME/WinMac_Virtual/prefix}"
-export WINEDEBUG="\${WINEDEBUG:--all}"
+export WINEDEBUG="\${WINEDEBUG:-err+all}"
 exec "\$WINE_BIN/wine" wineboot "\$@"
 WRAP
     chmod +x "$BINDIR/virtualboot"

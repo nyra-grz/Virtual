@@ -111,7 +111,7 @@ final class RoomStore {
     func environment(for room: Room) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["WINEPREFIX"] = room.prefixPath
-        env["WINEDEBUG"] = env["WINEDEBUG"] ?? "-all"
+        env["WINEDEBUG"] = env["WINEDEBUG"] ?? "err+all"
         return env
     }
 }
