@@ -26,9 +26,11 @@ init_prefix() {
 }
 
 install_dotnet() {
+    # Nur ein ausdrücklich angegebener Installer, nie still eine Datei aus ~/Downloads.
+    [ -n "${WINMAC_DOTNET:-}" ] || return 0
     if [ ! -d "$PREFIX/drive_c/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App" ]; then
         echo "==> Installiere .NET Desktop Runtime…"
-        "$WINE/wine" "$HOME/Downloads/dotnet-desktop.exe" /install /quiet /norestart >/dev/null 2>&1
+        "$WINE/wine" "$WINMAC_DOTNET" /install /quiet /norestart >/dev/null 2>&1
     fi
 }
 
