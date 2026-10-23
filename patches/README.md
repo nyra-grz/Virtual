@@ -15,6 +15,7 @@ it is skipped cleanly instead of breaking the build).
 | `0006-devices-implement.patch` | Implements `Windows.Devices.Enumeration` further (real audio endpoints, names, device classes, CreateFromId, watcher events) and the `Windows.Media.Devices` selectors |
 | `0007-bcrypt-gnutls-zero-iv.patch` | AES/3DES in ECB mode and AES key wrap no longer crash: the bundled GnuTLS 3.8.7 faults on block ciphers initialized without IV, so bcrypt now passes an all-zero vector (bcrypt tests: 15 failures → 0) |
 | `0008-ncrypt-ecdsa-persisted-keys.patch` | ncrypt: ECDSA P-256 keys (from upstream) and named, persisted keys (`NCryptOpenKey`/`NCryptDeleteKey`, stored in the prefix registry, not DPAPI-protected). Needed by Epic Games Launcher / EOS for its DPoP login key (ncrypt tests: 470, 0 failures) |
+| `0009-win32u-accessibility-keys-setcursors.patch` | StickyKeys, ToggleKeys and FilterKeys can be read and changed via `SystemParametersInfo` (stored like on Windows, Windows 10 defaults), so games can turn off the Shift-x5 hotkey. `SPI_SETCURSORS` succeeds instead of failing (built-in cursors only) |
 
 They are applied in this order on top of `WINE_TAG` (wine-11.0). Details, limits and
 tests: `winrt/README.md`.

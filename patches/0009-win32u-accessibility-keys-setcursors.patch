@@ -1,0 +1,198 @@
+win32u: Implement SPI_GET/SETSTICKYKEYS, SPI_GET/SETTOGGLEKEYS, SPI_GET/SETFILTERKEYS and SPI_SETCURSORS.
+StickyKeys, ToggleKeys and FilterKeys are stored like on Windows under
+HKCU\Control Panel\Accessibility\{StickyKeys,ToggleKeys,Keyboard Response} with the
+Windows 10 defaults (Flags 510 / 62 / 126, so the *_AVAILABLE bit is set). Before,
+the GET calls reported dwFlags = 0 ("feature not available") and the SET calls failed
+with ERROR_INVALID_SPI_VALUE, so games could not turn off the Shift-x5 hotkey
+("Failed to disable sticky keys (functionality unavailable)"). Without
+SPIF_UPDATEINIFILE the change is volatile, as on Windows.
+SPI_SETCURSORS (reload the system cursors) now succeeds instead of failing; custom
+cursor schemes are still not supported, so the built-in cursors stay current.
+Test program (get, set, read back, restore, bad cbSize, SPI_SETCURSORS): 12/12 ok.
+
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index eee81497..9d98c156 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -192,6 +192,9 @@ enum parameter_key
+     KEYBOARDPREF_KEY,
+     SCREENREADER_KEY,
+     AUDIODESC_KEY,
++    STICKYKEYS_KEY,
++    TOGGLEKEYS_KEY,
++    FILTERKEYS_KEY,
+     NB_PARAM_KEYS
+ };
+ 
+@@ -208,6 +211,9 @@ static const char *parameter_key_names[NB_PARAM_KEYS] =
+     "Control Panel\\Accessibility\\Keyboard Preference",
+     "Control Panel\\Accessibility\\Blind Access",
+     "Control Panel\\Accessibility\\AudioDescription",
++    "Control Panel\\Accessibility\\StickyKeys",
++    "Control Panel\\Accessibility\\ToggleKeys",
++    "Control Panel\\Accessibility\\Keyboard Response",
+ };
+ 
+ /* System parameters storage */
+@@ -5558,6 +5564,12 @@ static BOOL set_entry( void *ptr, UINT int_param, void *ptr_param, UINT flags )
+ static UINT_ENTRY( DRAGWIDTH, 4, DESKTOP_KEY, "DragWidth" );
+ static UINT_ENTRY( DRAGHEIGHT, 4, DESKTOP_KEY, "DragHeight" );
+ static UINT_ENTRY( DOUBLECLICKTIME, 500, MOUSE_KEY, "DoubleClickSpeed" );
++static UINT_ENTRY( FILTERKEYS, FKF_AVAILABLE | FKF_HOTKEYACTIVE | FKF_CONFIRMHOTKEY | FKF_HOTKEYSOUND |
++                   FKF_INDICATOR | FKF_CLICKON, FILTERKEYS_KEY, "Flags" );
++static UINT_ENTRY( FILTERKEYSBOUNCE, 0, FILTERKEYS_KEY, "BounceTime" );
++static UINT_ENTRY( FILTERKEYSDELAY, 1000, FILTERKEYS_KEY, "AutoRepeatDelay" );
++static UINT_ENTRY( FILTERKEYSREPEAT, 500, FILTERKEYS_KEY, "AutoRepeatRate" );
++static UINT_ENTRY( FILTERKEYSWAIT, 1000, FILTERKEYS_KEY, "DelayBeforeAcceptance" );
+ static UINT_ENTRY( FONTSMOOTHING, 2, DESKTOP_KEY, "FontSmoothing" );
+ static UINT_ENTRY( GRIDGRANULARITY, 0, DESKTOP_KEY, "GridGranularity" );
+ static UINT_ENTRY( KEYBOARDDELAY, 1, KEYBOARD_KEY, "KeyboardDelay" );
+@@ -5573,6 +5585,10 @@ static UINT_ENTRY( MOUSEHOVERWIDTH, 4, MOUSE_KEY, "MouseHoverWidth" );
+ static UINT_ENTRY( MOUSESPEED, 10, MOUSE_KEY, "MouseSensitivity" );
+ static UINT_ENTRY( MOUSETRAILS, 0, MOUSE_KEY, "MouseTrails" );
+ static UINT_ENTRY( SCREENSAVETIMEOUT, 300, DESKTOP_KEY, "ScreenSaveTimeOut" );
++static UINT_ENTRY( STICKYKEYS, SKF_AVAILABLE | SKF_HOTKEYACTIVE | SKF_CONFIRMHOTKEY | SKF_HOTKEYSOUND |
++                   SKF_INDICATOR | SKF_AUDIBLEFEEDBACK | SKF_TRISTATE | SKF_TWOKEYSOFF, STICKYKEYS_KEY, "Flags" );
++static UINT_ENTRY( TOGGLEKEYS, TKF_AVAILABLE | TKF_HOTKEYACTIVE | TKF_CONFIRMHOTKEY | TKF_HOTKEYSOUND |
++                   0x20 /* TKF_INDICATOR */, TOGGLEKEYS_KEY, "Flags" );
+ static UINT_ENTRY( WHEELSCROLLCHARS, 3, DESKTOP_KEY, "WheelScrollChars" );
+ static UINT_ENTRY( WHEELSCROLLLINES, 3, DESKTOP_KEY, "WheelScrollLines" );
+ static UINT_ENTRY_MIRROR( DOUBLECLKHEIGHT, 4, MOUSE_KEY, "DoubleClickHeight", DESKTOP_KEY );
+@@ -5730,6 +5746,11 @@ static union sysparam_all_entry * const default_entries[] =
+     (union sysparam_all_entry *)&entry_DRAGFULLWINDOWS,
+     (union sysparam_all_entry *)&entry_DRAGHEIGHT,
+     (union sysparam_all_entry *)&entry_DRAGWIDTH,
++    (union sysparam_all_entry *)&entry_FILTERKEYS,
++    (union sysparam_all_entry *)&entry_FILTERKEYSBOUNCE,
++    (union sysparam_all_entry *)&entry_FILTERKEYSDELAY,
++    (union sysparam_all_entry *)&entry_FILTERKEYSREPEAT,
++    (union sysparam_all_entry *)&entry_FILTERKEYSWAIT,
+     (union sysparam_all_entry *)&entry_FOCUSBORDERHEIGHT,
+     (union sysparam_all_entry *)&entry_FOCUSBORDERWIDTH,
+     (union sysparam_all_entry *)&entry_FONTSMOOTHING,
+@@ -5765,6 +5786,8 @@ static union sysparam_all_entry * const default_entries[] =
+     (union sysparam_all_entry *)&entry_SMCAPTIONHEIGHT,
+     (union sysparam_all_entry *)&entry_SMCAPTIONWIDTH,
+     (union sysparam_all_entry *)&entry_SNAPTODEFBUTTON,
++    (union sysparam_all_entry *)&entry_STICKYKEYS,
++    (union sysparam_all_entry *)&entry_TOGGLEKEYS,
+     (union sysparam_all_entry *)&entry_USERPREFERENCESMASK,
+     (union sysparam_all_entry *)&entry_WHEELSCROLLCHARS,
+     (union sysparam_all_entry *)&entry_WHEELSCROLLLINES,
+@@ -6341,36 +6364,54 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
+ 
+     case SPI_GETFILTERKEYS:
+     {
+-        LPFILTERKEYS filter_keys = ptr;
+-        WARN("SPI_GETFILTERKEYS not fully implemented\n");
+-        if (filter_keys && filter_keys->cbSize == sizeof(FILTERKEYS))
++        FILTERKEYS *filter_keys = ptr;
++        UINT flags, wait, delay, repeat, bounce;
++
++        if (!filter_keys || filter_keys->cbSize != sizeof(FILTERKEYS)) break;
++        if ((ret = get_entry( &entry_FILTERKEYS, 0, &flags ) &&
++                   get_entry( &entry_FILTERKEYSWAIT, 0, &wait ) &&
++                   get_entry( &entry_FILTERKEYSDELAY, 0, &delay ) &&
++                   get_entry( &entry_FILTERKEYSREPEAT, 0, &repeat ) &&
++                   get_entry( &entry_FILTERKEYSBOUNCE, 0, &bounce )))
+         {
+-            /* Indicate that no FilterKeys feature available */
+-            filter_keys->dwFlags = 0;
+-            filter_keys->iWaitMSec = 0;
+-            filter_keys->iDelayMSec = 0;
+-            filter_keys->iRepeatMSec = 0;
+-            filter_keys->iBounceMSec = 0;
+-            ret = TRUE;
++            filter_keys->dwFlags = flags;
++            filter_keys->iWaitMSec = wait;
++            filter_keys->iDelayMSec = delay;
++            filter_keys->iRepeatMSec = repeat;
++            filter_keys->iBounceMSec = bounce;
+         }
+         break;
+     }
+-    WINE_SPI_FIXME(SPI_SETFILTERKEYS);
++    case SPI_SETFILTERKEYS:
++    {
++        FILTERKEYS *filter_keys = ptr;
++
++        if (!filter_keys || filter_keys->cbSize != sizeof(FILTERKEYS)) break;
++        ret = set_entry( &entry_FILTERKEYS, filter_keys->dwFlags, NULL, winini ) &&
++              set_entry( &entry_FILTERKEYSWAIT, filter_keys->iWaitMSec, NULL, winini ) &&
++              set_entry( &entry_FILTERKEYSDELAY, filter_keys->iDelayMSec, NULL, winini ) &&
++              set_entry( &entry_FILTERKEYSREPEAT, filter_keys->iRepeatMSec, NULL, winini ) &&
++              set_entry( &entry_FILTERKEYSBOUNCE, filter_keys->iBounceMSec, NULL, winini );
++        break;
++    }
+ 
+     case SPI_GETTOGGLEKEYS:
+     {
+-        LPTOGGLEKEYS toggle_keys = ptr;
+-        WARN("SPI_GETTOGGLEKEYS not fully implemented\n");
+-        if (toggle_keys && toggle_keys->cbSize == sizeof(TOGGLEKEYS))
+-        {
+-            /* Indicate that no ToggleKeys feature available */
+-            toggle_keys->dwFlags = 0;
+-            ret = TRUE;
+-        }
++        TOGGLEKEYS *toggle_keys = ptr;
++        UINT flags;
++
++        if (!toggle_keys || toggle_keys->cbSize != sizeof(TOGGLEKEYS)) break;
++        if ((ret = get_entry( &entry_TOGGLEKEYS, 0, &flags ))) toggle_keys->dwFlags = flags;
+         break;
+     }
++    case SPI_SETTOGGLEKEYS:
++    {
++        TOGGLEKEYS *toggle_keys = ptr;
+ 
+-    WINE_SPI_FIXME(SPI_SETTOGGLEKEYS);
++        if (!toggle_keys || toggle_keys->cbSize != sizeof(TOGGLEKEYS)) break;
++        ret = set_entry( &entry_TOGGLEKEYS, toggle_keys->dwFlags, NULL, winini );
++        break;
++    }
+ 
+     case SPI_GETMOUSEKEYS:
+     {
+@@ -6401,17 +6442,20 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
+     case SPI_GETSTICKYKEYS:
+     {
+         STICKYKEYS *sticky_keys = ptr;
+-        WARN("SPI_GETSTICKYKEYS not fully implemented\n");
+-        if (sticky_keys && sticky_keys->cbSize == sizeof(STICKYKEYS))
+-        {
+-            /* Indicate that no StickyKeys feature available */
+-            sticky_keys->dwFlags = 0;
+-            ret = TRUE;
+-        }
++        UINT flags;
++
++        if (!sticky_keys || sticky_keys->cbSize != sizeof(STICKYKEYS)) break;
++        if ((ret = get_entry( &entry_STICKYKEYS, 0, &flags ))) sticky_keys->dwFlags = flags;
+         break;
+     }
++    case SPI_SETSTICKYKEYS:
++    {
++        STICKYKEYS *sticky_keys = ptr;
+ 
+-    WINE_SPI_FIXME(SPI_SETSTICKYKEYS);
++        if (!sticky_keys || sticky_keys->cbSize != sizeof(STICKYKEYS)) break;
++        ret = set_entry( &entry_STICKYKEYS, sticky_keys->dwFlags, NULL, winini );
++        break;
++    }
+ 
+     case SPI_GETACCESSTIMEOUT:
+     {
+@@ -6552,7 +6596,11 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
+         ret = set_entry( &entry_POWEROFFACTIVE, val, ptr, winini );
+         break;
+ 
+-    WINE_SPI_FIXME(SPI_SETCURSORS);
++    case SPI_SETCURSORS:
++        /* Reload the system cursors. Custom cursor schemes are not supported,
++         * so the built-in system cursors are always the current ones. */
++        ret = TRUE;
++        break;
+     WINE_SPI_FIXME(SPI_SETICONS);
+ 
+     case SPI_GETDEFAULTINPUTLANG:
