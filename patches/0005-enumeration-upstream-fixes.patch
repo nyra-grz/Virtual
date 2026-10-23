@@ -1,0 +1,122 @@
+From 080c2d662ea91a6f64862f1a344c8dca25d6a8f4 Mon Sep 17 00:00:00 2001
+From: Vibhav Pant <vpant@codeweavers.com>
+Date: Tue, 15 Sep 2026 20:03:58 +0530
+Subject: [PATCH] windows.devices.enumeration: Fix potential memory leak in
+ devpropcompkeys_append_names.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60241
+
+Signed-off-by: Vibhav Pant <vpant@codeweavers.com>
+---
+ dlls/windows.devices.enumeration/main.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index 441de3b37b0..c19a29b83f0 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -514,7 +514,11 @@ static HRESULT WINAPI devpropcompkeys_append_names( DEVPROPCOMPKEY **ret_keys, U
+     *ret_keys = NULL;
+     *ret_keys_len = 0;
+ 
+-    if (FAILED(hr = IIterable_HSTRING_First( names_iterable, &names ))) return hr;
++    if (FAILED(hr = IIterable_HSTRING_First( names_iterable, &names )))
++    {
++        free( keys );
++        return hr;
++    }
+     for (hr = IIterator_HSTRING_get_HasCurrent( names, &valid ); SUCCEEDED( hr ) && valid; hr = IIterator_HSTRING_MoveNext( names, &valid ))
+     {
+         DEVPROPCOMPKEY key = {0};
+-- 
+GitLab
+
+From b581027b8629ca090907b5b5cb5473880f838c3f Mon Sep 17 00:00:00 2001
+From: Vibhav Pant <vpant@codeweavers.com>
+Date: Tue, 15 Sep 2026 20:02:23 +0530
+Subject: [PATCH] windows.devices.enumeration: Fix potential NULL deref in
+ debugstr_DEV_QUERY_RESULT_ACTION_DATA.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60241
+
+Signed-off-by: Vibhav Pant <vpant@codeweavers.com>
+---
+ dlls/windows.devices.enumeration/main.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index 1509313c015..441de3b37b0 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -292,8 +292,10 @@ static HRESULT WINAPI device_watcher_get_Status( IDeviceWatcher *iface, DeviceWa
+ 
+ static const char *debugstr_DEV_QUERY_RESULT_ACTION_DATA( const DEV_QUERY_RESULT_ACTION_DATA *data )
+ {
+-    const DEV_OBJECT *obj = &data->Data.DeviceObject;
++    const DEV_OBJECT *obj;
++
+     if (!data) return wine_dbg_sprintf( "(null)" );
++    obj = &data->Data.DeviceObject;
+     if (data->Action == DevQueryResultStateChange)
+         return wine_dbg_sprintf( "{%d {%d}}", data->Action, data->Data.State );
+     return wine_dbg_sprintf( "{%d {{%d %s %lu %p}}}", data->Action, obj->ObjectType, debugstr_w( obj->pszObjectId ), obj->cPropertyCount, obj->pProperties );
+-- 
+GitLab
+
+From 621a3a5225afd89ec9b8b06fb6203d0e6996756e Mon Sep 17 00:00:00 2001
+From: Vibhav Pant <vpant@codeweavers.com>
+Date: Tue, 15 Sep 2026 20:00:59 +0530
+Subject: [PATCH] windows.devices.enumeration: Remove stray '5' from the list
+ of legal special characters.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60241
+
+Signed-off-by: Vibhav Pant <vpant@codeweavers.com>
+---
+ dlls/windows.devices.enumeration/aqs.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dlls/windows.devices.enumeration/aqs.c b/dlls/windows.devices.enumeration/aqs.c
+index 5c818038fe0..85c7332166d 100644
+--- a/dlls/windows.devices.enumeration/aqs.c
++++ b/dlls/windows.devices.enumeration/aqs.c
+@@ -34,7 +34,7 @@ WINE_DEFAULT_DEBUG_CHANNEL( aqs );
+ 
+ static BOOL is_idchar( WCHAR chr )
+ {
+-    static const WCHAR legal[] = { 5, '#', '-', '.', '_', '{', '}' };
++    static const WCHAR legal[] = { '#', '-', '.', '_', '{', '}' };
+     int i;
+ 
+     if (iswdigit( chr ) || iswalpha( chr ) || (chr >= 125 && chr <= 255)) return TRUE;
+-- 
+GitLab
+
+From af8d922ead94c3164140ea092a274f44f83a5d41 Mon Sep 17 00:00:00 2001
+From: Vibhav Pant <vpant@codeweavers.com>
+Date: Tue, 15 Sep 2026 20:00:24 +0530
+Subject: [PATCH] windows.devices.enumeration: Remove shadowed HRESULT in
+ device_watcher_Start.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60241
+
+Signed-off-by: Vibhav Pant <vpant@codeweavers.com>
+---
+ dlls/windows.devices.enumeration/main.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index 081260da759..1509313c015 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -391,7 +391,6 @@ static HRESULT WINAPI device_watcher_Start( IDeviceWatcher *iface )
+         const DEVPROP_FILTER_EXPRESSION *filters = NULL;
+         ULONG filters_len = 0;
+         IWeakReference *weak;
+-        HRESULT hr;
+ 
+         if (query_params->expr)
+         {
+-- 
+GitLab
+

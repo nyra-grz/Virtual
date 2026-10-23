@@ -4,6 +4,19 @@ After cloning, `build-wine.sh` applies every `*.patch` in this folder to the Win
 source (`git apply --check` first; if a patch does not fit the chosen `WINE_TAG`,
 it is skipped cleanly instead of breaking the build).
 
+## The patches
+
+| Patch | What it does |
+| --- | --- |
+| `0002-nsiproxy-macos-wifi-type.patch` | Reports Wi-Fi interfaces on macOS as IEEE 802.11 (IfType 71) instead of Ethernet |
+| `0003-hostname-implement.patch` | Implements `Windows.Networking.HostName` |
+| `0004-connectivity-implement.patch` | Implements `Windows.Networking.Connectivity` |
+| `0005-enumeration-upstream-fixes.patch` | Four pending upstream fixes for `windows.devices.enumeration` (Wine merge request !11997, original commit messages kept) |
+| `0006-devices-implement.patch` | Implements `Windows.Devices.Enumeration` further (real audio endpoints, names, device classes, CreateFromId, watcher events) and the `Windows.Media.Devices` selectors |
+
+They are applied in this order on top of `WINE_TAG` (wine-11.0). Details, limits and
+tests: `winrt/README.md`.
+
 ## Renaming: what actually happens (honestly)
 
 The goal was "wine → virtual" in the source code as well. In practice:

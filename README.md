@@ -28,7 +28,7 @@ English translation.
 │   └── release.sh                  publish a new version as a GitHub release (for the updater)
 ├── VERSION              app version number
 ├── patches/             own Wine changes (+ honest notes on the renaming)
-├── winrt/               WinRT stub scaffolding + test programs
+├── winrt/               WinRT networking and devices: documentation and tests
 ├── runtime/             generated: virtual* commands (not committed)
 ├── prefix/              Windows environment / WINEPREFIX (not committed)
 └── logs/                launch logs (not committed)
@@ -129,8 +129,9 @@ Publish a new version (requires the GitHub CLI `gh`):
 
 - A Wine fork is **not** a real Windows machine. Full API parity only exists on
   real Windows.
-- **WinRT** is not fully available in Wine. `winrt/` provides the pattern and a
-  stub, not a complete WinRT implementation (that would be a months-long project).
+- **WinRT** as a whole is not complete in Wine. Virtual implements the networking
+  (`Windows.Networking.Connectivity`, `HostName`) and device enumeration APIs with
+  the real data of the Mac (see `winrt/README.md`); other WinRT areas are as in Wine.
 - The source code is **not** blindly rewritten "wine → virtual" – that would break
   the build. The outward-facing commands are renamed; what stays "wine" internally
   and why is described in `patches/README.md`, including a list of how a program
@@ -146,7 +147,7 @@ Publish a new version (requires the GitHub CLI `gh`):
 - [x] Logs work (one file per launch in `logs/`, live in the window)
 - [x] Reproducible runtime (`build-wine.sh` from source **or** quick runtime)
 - [x] Finder double-click & drag and drop (CFBundleDocumentTypes for `.exe`/`.msi`)
-- [x] WinRT scaffolding + test programs (`winrt/`)
+- [x] WinRT networking and devices with real Mac data + tests (`winrt/`, `patches/`)
 - [x] Graphics runtime script with an honest fallback (`setup-graphics.sh`)
 - [x] Smoke test in a throwaway prefix (`scripts/smoke-test.sh`)
 - [x] Update check via GitHub releases (`scripts/release.sh`)

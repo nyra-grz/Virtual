@@ -165,6 +165,13 @@ done
 echo "==> make -j$(sysctl -n hw.ncpu) …"
 ( cd "$BUILD" && make -j"$(sysctl -n hw.ncpu)" )
 
+# Zum Entwickeln von Patches: nur bauen, die laufende Runtime nicht anfassen.
+# Danach einzelne DLLs mit  make -C thirdparty/wine-build-tree dlls/<name>  neu bauen.
+if [ "${WINMAC_BUILD_ONLY:-0}" = 1 ]; then
+    echo "==> WINMAC_BUILD_ONLY=1: fertig gebaut in $BUILD, nichts installiert."
+    exit 0
+fi
+
 echo "==> make install → $PREFIX_INSTALL"
 rm -rf "$PREFIX_INSTALL"
 ( cd "$BUILD" && make install )

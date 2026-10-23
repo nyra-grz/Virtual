@@ -1,0 +1,1042 @@
+windows.devices.enumeration: Real audio endpoints, names and device class queries.
+
+Audio endpoints from mmdevapi (the real speakers and microphones) are registered as
+SWD\MMDEVAPI device interfaces like on Windows. DeviceInformation gets Name, IsEnabled,
+IsDefault, EnclosureLocation and Update; CreateFromIdAsync, FindAllAsync and
+CreateWatcher by DeviceClass and by DeviceInformationKind, GetAqsFilterFromDeviceClass,
+and the DeviceWatcher Updated and Removed events. windows.media.devices returns the
+matching AQS selectors.
+
+diff --git a/dlls/windows.devices.enumeration/Makefile.in b/dlls/windows.devices.enumeration/Makefile.in
+index c1892dc4..88b2d325 100644
+--- a/dlls/windows.devices.enumeration/Makefile.in
++++ b/dlls/windows.devices.enumeration/Makefile.in
+@@ -1,7 +1,8 @@
+ MODULE = windows.devices.enumeration.dll
+-IMPORTS = cfgmgr32 combase propsys uuid
++IMPORTS = cfgmgr32 combase ole32 propsys setupapi advapi32 uuid
+ SOURCES = \
+ 	access.c \
++	audio.c \
+ 	aqs.c \
+ 	aqs.y \
+ 	async.c \
+diff --git a/dlls/windows.devices.enumeration/audio.c b/dlls/windows.devices.enumeration/audio.c
+new file mode 100644
+index 00000000..9385c07f
+--- /dev/null
++++ b/dlls/windows.devices.enumeration/audio.c
+@@ -0,0 +1,192 @@
++/* Audio endpoints as device interfaces
++ *
++ * Copyright (C) 2026 Daniel Özdek
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdio.h>
++
++#include "private.h"
++#include "setupapi.h"
++#include "devpkey.h"
++#include "initguid.h"
++#include "mmdeviceapi.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(enumeration);
++
++/* Setup class of Windows' audio endpoint devices ("AudioEndpoint"). */
++static const GUID audio_endpoint_class = {0xc166523c, 0xfe0c, 0x4a94, {0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e}};
++
++static CRITICAL_SECTION audio_cs;
++static CRITICAL_SECTION_DEBUG audio_cs_debug =
++{
++    0, 0, &audio_cs,
++    { &audio_cs_debug.ProcessLocksList, &audio_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": audio_cs") }
++};
++static CRITICAL_SECTION audio_cs = { &audio_cs_debug, -1, 0, 0, 0, 0 };
++
++/* setupapi treats an interface as enabled when <interface key>\#\Control has Linked = 1. */
++static void set_interface_linked( HDEVINFO set, SP_DEVICE_INTERFACE_DATA *iface, BOOL linked )
++{
++    WCHAR buffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) / sizeof(WCHAR) + 512], path[1024], guid[39];
++    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)buffer;
++    DWORD value = linked;
++    WCHAR *symlink;
++    HKEY key;
++
++    detail->cbSize = sizeof(*detail);
++    if (!SetupDiGetDeviceInterfaceDetailW( set, iface, detail, sizeof(buffer), NULL, NULL )) return;
++    if (wcslen( detail->DevicePath ) < 4) return;
++    StringFromGUID2( &iface->InterfaceClassGuid, guid, ARRAY_SIZE(guid) );
++    symlink = detail->DevicePath;
++    symlink[0] = symlink[1] = symlink[3] = '#';
++    swprintf( path, ARRAY_SIZE(path), L"System\\CurrentControlSet\\Control\\DeviceClasses\\%s\\%s\\#\\Control", guid, symlink );
++    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, REG_OPTION_VOLATILE, KEY_SET_VALUE, NULL, &key, NULL )) return;
++    RegSetValueExW( key, L"Linked", 0, REG_DWORD, (BYTE *)&value, sizeof(value) );
++    RegCloseKey( key );
++}
++
++static void register_endpoint( HDEVINFO set, IMMDevice *device )
++{
++    SP_DEVICE_INTERFACE_DATA iface = {.cbSize = sizeof(iface)};
++    SP_DEVINFO_DATA dev = {.cbSize = sizeof(dev)};
++    PROPVARIANT name = {.vt = VT_EMPTY};
++    WCHAR *id = NULL, instance[256];
++    IPropertyStore *store;
++    IMMEndpoint *endpoint;
++    EDataFlow flow;
++    DWORD state = 0;
++
++    if (FAILED(IMMDevice_GetId( device, &id ))) return;
++    if (FAILED(IMMDevice_QueryInterface( device, &IID_IMMEndpoint, (void **)&endpoint ))) goto done;
++    if (FAILED(IMMEndpoint_GetDataFlow( endpoint, &flow ))) flow = eAll;
++    IMMEndpoint_Release( endpoint );
++    if (flow != eRender && flow != eCapture) goto done;
++    IMMDevice_GetState( device, &state );
++
++    /* Windows names these software devices SWD\MMDEVAPI\<endpoint id>. */
++    swprintf( instance, ARRAY_SIZE(instance), L"SWD\\MMDEVAPI\\%s", id );
++    if (!SetupDiOpenDeviceInfoW( set, instance, NULL, 0, &dev ) &&
++        (!SetupDiCreateDeviceInfoW( set, instance, &audio_endpoint_class, NULL, NULL, 0, &dev ) ||
++         !SetupDiRegisterDeviceInfo( set, &dev, 0, NULL, NULL, NULL )))
++    {
++        WARN( "failed to register %s, error %lu.\n", debugstr_w(instance), GetLastError() );
++        goto done;
++    }
++    if (!SetupDiCreateDeviceInterfaceW( set, &dev, flow == eRender ? &DEVINTERFACE_AUDIO_RENDER : &DEVINTERFACE_AUDIO_CAPTURE,
++                                        NULL, 0, &iface ))
++    {
++        WARN( "failed to create interface for %s, error %lu.\n", debugstr_w(instance), GetLastError() );
++        goto done;
++    }
++
++    if (SUCCEEDED(IMMDevice_OpenPropertyStore( device, STGM_READ, &store )))
++    {
++        if (SUCCEEDED(IPropertyStore_GetValue( store, (const PROPERTYKEY *)&DEVPKEY_Device_FriendlyName, &name )) &&
++            name.vt == VT_LPWSTR && name.pwszVal)
++        {
++            DWORD size = (wcslen( name.pwszVal ) + 1) * sizeof(WCHAR);
++            SetupDiSetDevicePropertyW( set, &dev, &DEVPKEY_Device_FriendlyName, DEVPROP_TYPE_STRING, (BYTE *)name.pwszVal, size, 0 );
++            SetupDiSetDeviceInterfacePropertyW( set, &iface, &DEVPKEY_DeviceInterface_FriendlyName, DEVPROP_TYPE_STRING,
++                                                (BYTE *)name.pwszVal, size, 0 );
++        }
++        PropVariantClear( &name );
++        IPropertyStore_Release( store );
++    }
++
++    /* Only endpoints that are currently plugged in and enabled count as enabled interfaces. */
++    set_interface_linked( set, &iface, state == DEVICE_STATE_ACTIVE );
++    TRACE( "registered %s, state %#lx.\n", debugstr_w(instance), state );
++
++done:
++    CoTaskMemFree( id );
++}
++
++/* Makes the audio endpoints known to mmdevapi (the real Mac speakers, microphones, headsets ...)
++ * visible as device interfaces, as on Windows, so queries, filters and watchers find them. */
++void audio_endpoints_sync( void )
++{
++    IMMDeviceCollection *devices;
++    IMMDeviceEnumerator *devenum;
++    IMMDevice *device;
++    UINT count = 0, i;
++    HDEVINFO set;
++    HRESULT init;
++
++    init = CoInitializeEx( NULL, COINIT_MULTITHREADED );
++    if (FAILED(CoCreateInstance( &CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER, &IID_IMMDeviceEnumerator, (void **)&devenum )))
++        goto done;
++
++    EnterCriticalSection( &audio_cs );
++    if ((set = SetupDiCreateDeviceInfoList( &audio_endpoint_class, NULL )) != INVALID_HANDLE_VALUE)
++    {
++        if (SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints( devenum, eAll, DEVICE_STATEMASK_ALL, &devices )))
++        {
++            IMMDeviceCollection_GetCount( devices, &count );
++            for (i = 0; i < count; i++)
++            {
++                if (FAILED(IMMDeviceCollection_Item( devices, i, &device ))) continue;
++                register_endpoint( set, device );
++                IMMDevice_Release( device );
++            }
++            IMMDeviceCollection_Release( devices );
++        }
++        SetupDiDestroyDeviceInfoList( set );
++    }
++    LeaveCriticalSection( &audio_cs );
++    IMMDeviceEnumerator_Release( devenum );
++
++done:
++    if (SUCCEEDED(init)) CoUninitialize();
++}
++
++/* Is this the interface of the default (console) audio endpoint of its direction? */
++BOOL audio_endpoint_is_default( const WCHAR *interface_id )
++{
++    static const WCHAR prefix[] = L"\\\\?\\SWD#MMDEVAPI#";
++    const WCHAR *id = interface_id + ARRAY_SIZE(prefix) - 1, *end;
++    IMMDeviceEnumerator *devenum;
++    WCHAR *default_id;
++    IMMDevice *device;
++    BOOL ret = FALSE;
++    EDataFlow flow;
++    HRESULT init;
++
++    if (!interface_id || wcsnicmp( interface_id, prefix, ARRAY_SIZE(prefix) - 1 )) return FALSE;
++    if (!(end = wcschr( id, '#' ))) return FALSE;
++    if (!wcsnicmp( end + 1, L"{e6327cad-dcec-4949-ae8a-991e976a79d2}", 38 )) flow = eRender;
++    else if (!wcsnicmp( end + 1, L"{2eef81be-33fa-4800-9670-1cd474972c3f}", 38 )) flow = eCapture;
++    else return FALSE;
++
++    init = CoInitializeEx( NULL, COINIT_MULTITHREADED );
++    if (SUCCEEDED(CoCreateInstance( &CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER, &IID_IMMDeviceEnumerator, (void **)&devenum )))
++    {
++        if (SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint( devenum, flow, eConsole, &device )))
++        {
++            if (SUCCEEDED(IMMDevice_GetId( device, &default_id )))
++            {
++                ret = wcslen( default_id ) == end - id && !wcsnicmp( default_id, id, end - id );
++                CoTaskMemFree( default_id );
++            }
++            IMMDevice_Release( device );
++        }
++        IMMDeviceEnumerator_Release( devenum );
++    }
++    if (SUCCEEDED(init)) CoUninitialize();
++    return ret;
++}
+diff --git a/dlls/windows.devices.enumeration/information.c b/dlls/windows.devices.enumeration/information.c
+index 0620975e..9b3f323b 100644
+--- a/dlls/windows.devices.enumeration/information.c
++++ b/dlls/windows.devices.enumeration/information.c
+@@ -18,6 +18,8 @@
+  */
+ 
+ #include "private.h"
++#include "setupapi.h"
++#include "devpkey.h"
+ 
+ #include "roapi.h"
+ #include "wine/debug.h"
+@@ -31,6 +33,9 @@ struct device_information
+ 
+     IMap_HSTRING_IInspectable *properties;
+     HSTRING id;
++    HSTRING name;
++    boolean enabled;
++    boolean is_default;
+ };
+ 
+ static inline struct device_information *impl_from_IDeviceInformation( IDeviceInformation *iface )
+@@ -76,6 +81,7 @@ static ULONG WINAPI device_information_Release( IDeviceInformation *iface )
+     {
+         if (impl->properties) IMap_HSTRING_IInspectable_Release( impl->properties );
+         WindowsDeleteString( impl->id );
++        WindowsDeleteString( impl->name );
+         free( impl );
+     }
+ 
+@@ -110,26 +116,37 @@ static HRESULT WINAPI device_information_get_Id( IDeviceInformation *iface, HSTR
+ 
+ static HRESULT WINAPI device_information_get_Name( IDeviceInformation *iface, HSTRING *name )
+ {
+-    FIXME( "iface %p, name %p stub!\n", iface, name );
+-    return E_NOTIMPL;
++    struct device_information *impl = impl_from_IDeviceInformation( iface );
++    TRACE( "iface %p, name %p.\n", iface, name );
++    if (!name) return E_POINTER;
++    return WindowsDuplicateString( impl->name, name );
+ }
+ 
+ static HRESULT WINAPI device_information_get_IsEnabled( IDeviceInformation *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct device_information *impl = impl_from_IDeviceInformation( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = impl->enabled;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI device_information_IsDefault( IDeviceInformation *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct device_information *impl = impl_from_IDeviceInformation( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = impl->is_default;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI device_information_get_EnclosureLocation( IDeviceInformation *iface, IEnclosureLocation **location )
+ {
+-    FIXME( "iface %p, location %p stub!\n", iface, location );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, location %p.\n", iface, location );
++    if (!location) return E_POINTER;
++    /* No physical location (panel, lid) is known for any device, as for most devices on Windows. */
++    *location = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI device_information_get_Properties( IDeviceInformation *iface, IMapView_HSTRING_IInspectable **properties )
+@@ -141,8 +158,54 @@ static HRESULT WINAPI device_information_get_Properties( IDeviceInformation *ifa
+ 
+ static HRESULT WINAPI device_information_Update( IDeviceInformation *iface, IDeviceInformationUpdate *update )
+ {
+-    FIXME( "iface %p, update %p stub!\n", iface, update );
+-    return E_NOTIMPL;
++    struct device_information *impl = impl_from_IDeviceInformation( iface );
++    IIterable_IKeyValuePair_HSTRING_IInspectable *iterable;
++    IIterator_IKeyValuePair_HSTRING_IInspectable *iterator;
++    IMapView_HSTRING_IInspectable *view;
++    IKeyValuePair_HSTRING_IInspectable *pair;
++    boolean valid = FALSE, replaced;
++    IPropertyValue *property;
++    IInspectable *value;
++    HSTRING key, name;
++    HRESULT hr;
++
++    TRACE( "iface %p, update %p.\n", iface, update );
++
++    if (!update) return E_INVALIDARG;
++    if (FAILED(hr = IDeviceInformationUpdate_get_Properties( update, &view ))) return hr;
++    hr = IMapView_HSTRING_IInspectable_QueryInterface( view, &IID_IIterable_IKeyValuePair_HSTRING_IInspectable, (void **)&iterable );
++    IMapView_HSTRING_IInspectable_Release( view );
++    if (FAILED(hr)) return hr;
++    hr = IIterable_IKeyValuePair_HSTRING_IInspectable_First( iterable, &iterator );
++    IIterable_IKeyValuePair_HSTRING_IInspectable_Release( iterable );
++    if (FAILED(hr)) return hr;
++
++    /* Merge the changed properties; a new display name also renames the device. */
++    if (SUCCEEDED(hr = IIterator_IKeyValuePair_HSTRING_IInspectable_get_HasCurrent( iterator, &valid )))
++    {
++        while (valid && SUCCEEDED(hr = IIterator_IKeyValuePair_HSTRING_IInspectable_get_Current( iterator, &pair )))
++        {
++            IKeyValuePair_HSTRING_IInspectable_get_Key( pair, &key );
++            IKeyValuePair_HSTRING_IInspectable_get_Value( pair, &value );
++            IKeyValuePair_HSTRING_IInspectable_Release( pair );
++            hr = IMap_HSTRING_IInspectable_Insert( impl->properties, key, value, &replaced );
++            if (SUCCEEDED(hr) && value && !wcscmp( WindowsGetStringRawBuffer( key, NULL ), L"System.ItemNameDisplay" ) &&
++                SUCCEEDED(IInspectable_QueryInterface( value, &IID_IPropertyValue, (void **)&property )))
++            {
++                if (SUCCEEDED(IPropertyValue_GetString( property, &name )))
++                {
++                    WindowsDeleteString( impl->name );
++                    impl->name = name;
++                }
++                IPropertyValue_Release( property );
++            }
++            WindowsDeleteString( key );
++            if (value) IInspectable_Release( value );
++            if (FAILED(hr) || FAILED(hr = IIterator_IKeyValuePair_HSTRING_IInspectable_MoveNext( iterator, &valid ))) break;
++        }
++    }
++    IIterator_IKeyValuePair_HSTRING_IInspectable_Release( iterator );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI device_information_GetThumbnailAsync( IDeviceInformation *iface, IAsyncOperation_DeviceThumbnail **async )
+@@ -326,6 +389,79 @@ static const char *debugstr_DEV_OBJECT( const DEV_OBJECT *obj )
+                              obj->pProperties );
+ }
+ 
++static const WCHAR *dev_object_string( const DEV_OBJECT *obj, const DEVPROPKEY *key )
++{
++    ULONG i;
++
++    for (i = 0; i < obj->cPropertyCount; i++)
++    {
++        const DEVPROPERTY *prop = &obj->pProperties[i];
++        if (IsEqualDevPropKey( prop->CompKey.Key, *key ) && prop->Type == DEVPROP_TYPE_STRING &&
++            prop->BufferSize >= 2 * sizeof(WCHAR))
++            return prop->Buffer;
++    }
++    return NULL;
++}
++
++/* Friendly name or description of the device instance behind an object. Descriptions can be
++ * stored in the "@file.inf,%key%;Text" form, of which only the text is shown. */
++static HRESULT device_name_from_instance( const WCHAR *instance, HSTRING *name )
++{
++    static const DEVPROPKEY *keys[] = { &DEVPKEY_Device_FriendlyName, &DEVPKEY_Device_DeviceDesc };
++    SP_DEVINFO_DATA dev = {.cbSize = sizeof(dev)};
++    WCHAR buffer[512], *text;
++    HRESULT hr = E_FAIL;
++    DEVPROPTYPE type;
++    HDEVINFO set;
++    ULONG i;
++
++    if ((set = SetupDiCreateDeviceInfoList( NULL, NULL )) == INVALID_HANDLE_VALUE) return E_FAIL;
++    if (SetupDiOpenDeviceInfoW( set, instance, NULL, 0, &dev ))
++    {
++        for (i = 0; i < ARRAY_SIZE(keys) && FAILED(hr); i++)
++        {
++            if (!SetupDiGetDevicePropertyW( set, &dev, keys[i], &type, (BYTE *)buffer, sizeof(buffer) - sizeof(WCHAR), NULL, 0 ) ||
++                type != DEVPROP_TYPE_STRING || !*buffer)
++                continue;
++            buffer[ARRAY_SIZE(buffer) - 1] = 0;
++            text = (*buffer == '@' && wcsrchr( buffer, ';' )) ? wcsrchr( buffer, ';' ) + 1 : buffer;
++            hr = WindowsCreateString( text, wcslen( text ), name );
++        }
++    }
++    SetupDiDestroyDeviceInfoList( set );
++    return hr;
++}
++
++static HRESULT init_device_information( struct device_information *impl, const DEV_OBJECT *obj )
++{
++    const WCHAR *name, *instance;
++    ULONG i;
++
++    /* Interfaces report whether they are enabled; other objects exist only while present. */
++    impl->enabled = TRUE;
++    for (i = 0; i < obj->cPropertyCount; i++)
++    {
++        const DEVPROPERTY *prop = &obj->pProperties[i];
++        if (IsEqualDevPropKey( prop->CompKey.Key, DEVPKEY_DeviceInterface_Enabled ) && prop->Type == DEVPROP_TYPE_BOOLEAN &&
++            prop->BufferSize >= sizeof(DEVPROP_BOOLEAN))
++            impl->enabled = *(DEVPROP_BOOLEAN *)prop->Buffer != DEVPROP_FALSE;
++    }
++
++    impl->is_default = audio_endpoint_is_default( obj->pszObjectId );
++
++    if ((name = dev_object_string( obj, &DEVPKEY_DeviceInterface_FriendlyName )) ||
++        (name = dev_object_string( obj, &DEVPKEY_NAME ))) /* System.ItemNameDisplay */
++        return WindowsCreateString( name, wcslen( name ), &impl->name );
++
++    instance = dev_object_string( obj, &DEVPKEY_Device_InstanceId );
++    if (!instance && obj->ObjectType == DevObjectTypeDevice) instance = obj->pszObjectId;
++    if (instance && SUCCEEDED(device_name_from_instance( instance, &impl->name ))) return S_OK;
++
++    /* Last resort: the instance id still tells the device apart. */
++    name = instance ? instance : obj->pszObjectId;
++    return WindowsCreateString( name, wcslen( name ), &impl->name );
++}
++
+ HRESULT device_information_create( const DEV_OBJECT *obj, IDeviceInformation **info )
+ {
+     struct device_information *impl;
+@@ -342,9 +478,11 @@ HRESULT device_information_create( const DEV_OBJECT *obj, IDeviceInformation **i
+         return hr;
+     }
+ 
+-    if (FAILED(hr = WindowsCreateString( obj->pszObjectId, wcslen( obj->pszObjectId ), &impl->id )))
++    if (FAILED(hr = WindowsCreateString( obj->pszObjectId, wcslen( obj->pszObjectId ), &impl->id )) ||
++        FAILED(hr = init_device_information( impl, obj )))
+     {
+         IMap_HSTRING_IInspectable_Release( impl->properties );
++        WindowsDeleteString( impl->id );
+         free( impl );
+         return hr;
+     }
+@@ -353,3 +491,135 @@ HRESULT device_information_create( const DEV_OBJECT *obj, IDeviceInformation **i
+     TRACE( "created DeviceInformation %p\n", impl );
+     return S_OK;
+ }
++
++struct device_information_update
++{
++    IDeviceInformationUpdate IDeviceInformationUpdate_iface;
++    LONG ref;
++
++    IMap_HSTRING_IInspectable *properties;
++    HSTRING id;
++};
++
++static inline struct device_information_update *impl_from_IDeviceInformationUpdate( IDeviceInformationUpdate *iface )
++{
++    return CONTAINING_RECORD( iface, struct device_information_update, IDeviceInformationUpdate_iface );
++}
++
++static HRESULT WINAPI device_information_update_QueryInterface( IDeviceInformationUpdate *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IDeviceInformationUpdate ))
++    {
++        IUnknown_AddRef( iface );
++        *out = iface;
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI device_information_update_AddRef( IDeviceInformationUpdate *iface )
++{
++    struct device_information_update *impl = impl_from_IDeviceInformationUpdate( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI device_information_update_Release( IDeviceInformationUpdate *iface )
++{
++    struct device_information_update *impl = impl_from_IDeviceInformationUpdate( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        IMap_HSTRING_IInspectable_Release( impl->properties );
++        WindowsDeleteString( impl->id );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI device_information_update_GetIids( IDeviceInformationUpdate *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI device_information_update_GetRuntimeClassName( IDeviceInformationUpdate *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Devices.Enumeration.DeviceInformationUpdate";
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI device_information_update_GetTrustLevel( IDeviceInformationUpdate *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI device_information_update_get_Id( IDeviceInformationUpdate *iface, HSTRING *id )
++{
++    struct device_information_update *impl = impl_from_IDeviceInformationUpdate( iface );
++    TRACE( "iface %p, id %p.\n", iface, id );
++    if (!id) return E_POINTER;
++    return WindowsDuplicateString( impl->id, id );
++}
++
++static HRESULT WINAPI device_information_update_get_Properties( IDeviceInformationUpdate *iface, IMapView_HSTRING_IInspectable **properties )
++{
++    struct device_information_update *impl = impl_from_IDeviceInformationUpdate( iface );
++    TRACE( "iface %p, properties %p.\n", iface, properties );
++    if (!properties) return E_POINTER;
++    return IMap_HSTRING_IInspectable_GetView( impl->properties, properties );
++}
++
++static const struct IDeviceInformationUpdateVtbl device_information_update_vtbl =
++{
++    /* IUnknown */
++    device_information_update_QueryInterface,
++    device_information_update_AddRef,
++    device_information_update_Release,
++    /* IInspectable */
++    device_information_update_GetIids,
++    device_information_update_GetRuntimeClassName,
++    device_information_update_GetTrustLevel,
++    /* IDeviceInformationUpdate */
++    device_information_update_get_Id,
++    device_information_update_get_Properties,
++};
++
++/* The argument of DeviceWatcher.Updated and .Removed: the object id and its changed properties. */
++HRESULT device_information_update_create( const DEV_OBJECT *obj, IDeviceInformationUpdate **out )
++{
++    struct device_information_update *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IDeviceInformationUpdate_iface.lpVtbl = &device_information_update_vtbl;
++    impl->ref = 1;
++    if (FAILED(hr = create_device_properties( obj->pProperties, obj->cPropertyCount, &impl->properties )))
++    {
++        free( impl );
++        return hr;
++    }
++    if (FAILED(hr = WindowsCreateString( obj->pszObjectId, wcslen( obj->pszObjectId ), &impl->id )))
++    {
++        IMap_HSTRING_IInspectable_Release( impl->properties );
++        free( impl );
++        return hr;
++    }
++    *out = &impl->IDeviceInformationUpdate_iface;
++    return S_OK;
++}
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index c19a29b8..cc733133 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -39,6 +39,7 @@ struct devquery_params
+     struct aqs_expr *expr;
+     DEVPROPCOMPKEY *prop_keys;
+     ULONG prop_keys_len;
++    HSTRING id; /* object looked up by CreateFromIdAsync */
+     LONG ref;
+ };
+ 
+@@ -82,6 +83,7 @@ static ULONG WINAPI devquery_params_Release( IUnknown *iface )
+     {
+         free_aqs_expr( impl->expr );
+         free( impl->prop_keys );
++        WindowsDeleteString( impl->id );
+         free( impl );
+     }
+     return ref;
+@@ -118,6 +120,8 @@ struct device_watcher
+     struct weak_reference_source weak_reference_source;
+ 
+     struct list added_handlers;
++    struct list updated_handlers;
++    struct list removed_handlers;
+     struct list enumerated_handlers;
+     struct list stopped_handlers;
+     IUnknown *query_params;
+@@ -177,6 +181,8 @@ static ULONG WINAPI device_watcher_Release( IDeviceWatcher *iface )
+     if (!ref)
+     {
+         typed_event_handlers_clear( &impl->added_handlers );
++        typed_event_handlers_clear( &impl->updated_handlers );
++        typed_event_handlers_clear( &impl->removed_handlers );
+         typed_event_handlers_clear( &impl->enumerated_handlers );
+         typed_event_handlers_clear( &impl->stopped_handlers );
+         IUnknown_Release( impl->query_params );
+@@ -225,27 +231,35 @@ static HRESULT WINAPI device_watcher_remove_Added( IDeviceWatcher *iface, EventR
+ static HRESULT WINAPI device_watcher_add_Updated( IDeviceWatcher *iface, ITypedEventHandler_DeviceWatcher_DeviceInformationUpdate *handler,
+                                                   EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    return S_OK;
++    struct device_watcher *impl = impl_from_IDeviceWatcher( iface );
++
++    TRACE( "iface %p, handler %p, token %p\n", iface, handler, token );
++    return typed_event_handlers_append( &impl->updated_handlers, (ITypedEventHandler_IInspectable_IInspectable *)handler, token );
+ }
+ 
+ static HRESULT WINAPI device_watcher_remove_Updated( IDeviceWatcher *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    struct device_watcher *impl = impl_from_IDeviceWatcher( iface );
++
++    TRACE( "iface %p, token %#I64x\n", iface, token.value );
++    return typed_event_handlers_remove( &impl->updated_handlers, &token );
+ }
+ 
+ static HRESULT WINAPI device_watcher_add_Removed( IDeviceWatcher *iface, ITypedEventHandler_DeviceWatcher_DeviceInformationUpdate *handler,
+                                                   EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    return E_NOTIMPL;
++    struct device_watcher *impl = impl_from_IDeviceWatcher( iface );
++
++    TRACE( "iface %p, handler %p, token %p\n", iface, handler, token );
++    return typed_event_handlers_append( &impl->removed_handlers, (ITypedEventHandler_IInspectable_IInspectable *)handler, token );
+ }
+ 
+ static HRESULT WINAPI device_watcher_remove_Removed( IDeviceWatcher *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    struct device_watcher *impl = impl_from_IDeviceWatcher( iface );
++
++    TRACE( "iface %p, token %#I64x\n", iface, token.value );
++    return typed_event_handlers_remove( &impl->removed_handlers, &token );
+ }
+ 
+ static HRESULT WINAPI device_watcher_add_EnumerationCompleted( IDeviceWatcher *iface, ITypedEventHandler_DeviceWatcher_IInspectable *handler,
+@@ -361,6 +375,17 @@ static void WINAPI device_object_query_callback( HDEVQUERY query, void *data,
+         IDeviceInformation_Release( info );
+         break;
+     }
++    case DevQueryResultUpdate:
++    case DevQueryResultRemove:
++    {
++        IDeviceInformationUpdate *update;
++        if (FAILED(hr = device_information_update_create( &action_data->Data.DeviceObject, &update )))
++            break;
++        typed_event_handlers_notify( action_data->Action == DevQueryResultUpdate ? &watcher->updated_handlers : &watcher->removed_handlers,
++                                     (IInspectable *)iface, (IInspectable *)update );
++        IDeviceInformationUpdate_Release( update );
++        break;
++    }
+     default:
+         FIXME( "Unhandled DEV_QUERY_RESULT_ACTION value: %d\n", action_data->Action );
+         break;
+@@ -400,6 +425,7 @@ static HRESULT WINAPI device_watcher_Start( IDeviceWatcher *iface )
+             filters_len = query_params->expr->len;
+         }
+ 
++        audio_endpoints_sync();
+         IWeakReferenceSource_GetWeakReference( &impl->weak_reference_source.IWeakReferenceSource_iface, &weak );
+         hr = DevCreateObjectQuery( query_params->type, DevQueryFlagAsyncClose, query_params->prop_keys_len, query_params->prop_keys, filters_len, filters,
+                                    device_object_query_callback, weak, &impl->query );
+@@ -549,22 +575,43 @@ static HRESULT WINAPI devpropcompkeys_append_names( DEVPROPCOMPKEY **ret_keys, U
+     return hr;
+ }
+ 
++static const DEV_OBJECT_TYPE kind_type[] = {
++    DevObjectTypeUnknown,
++    DevObjectTypeDeviceInterfaceDisplay,
++    DevObjectTypeDeviceContainerDisplay,
++    DevObjectTypeDevice,
++    DevObjectTypeDeviceInterfaceClass,
++    DevObjectTypeAEP,
++    DevObjectTypeAEPContainer,
++    DevObjectTypeAEPService,
++    DevObjectTypeDevicePanel,
++};
++
++/* The AQS filters Windows uses for DeviceClass (as in MediaDevice.GetAudioRenderSelector):
++ * enabled interfaces of the class's device interface GUID. */
++static const WCHAR *device_class_filter( DeviceClass device_class )
++{
++#define CLASS_FILTER( guid ) L"System.Devices.InterfaceClassGuid:=\"" guid L"\" AND System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True"
++    switch (device_class)
++    {
++    case DeviceClass_All: return L"";
++    case DeviceClass_AudioCapture: return CLASS_FILTER( L"{2EEF81BE-33FA-4800-9670-1CD474972C3F}" );
++    case DeviceClass_AudioRender: return CLASS_FILTER( L"{E6327CAD-DCEC-4949-AE8A-991E976A79D2}" );
++    case DeviceClass_PortableStorageDevice: return CLASS_FILTER( L"{6AC27878-A6FA-4155-BA85-F98F491D4F33}" );
++    case DeviceClass_VideoCapture: return CLASS_FILTER( L"{E5323777-F976-4F5B-9B55-B94699C46E44}" );
++    case DeviceClass_ImageScanner: return CLASS_FILTER( L"{6BDD1FC6-810F-11D0-BEC7-08002BE2092F}" );
++    case DeviceClass_Location: return CLASS_FILTER( L"{BA1BB692-9B7A-4833-9A1E-525ED134E7E2}" );
++    default: return NULL;
++    }
++#undef CLASS_FILTER
++}
++
+ static HRESULT device_watcher_create( HSTRING filter, IIterable_HSTRING *additional_props, DeviceInformationKind kind, IDeviceWatcher **out )
+ {
+-    static const DEV_OBJECT_TYPE kind_type[] = {
+-        DevObjectTypeUnknown,
+-        DevObjectTypeDeviceInterfaceDisplay,
+-        DevObjectTypeDeviceContainerDisplay,
+-        DevObjectTypeDevice,
+-        DevObjectTypeDeviceInterfaceClass,
+-        DevObjectTypeAEP,
+-        DevObjectTypeAEPContainer,
+-        DevObjectTypeAEPService,
+-        DevObjectTypeDevicePanel,
+-    };
+     const DEVPROPCOMPKEY device_iface_default_props[] = {
+         { DEVPKEY_DeviceInterface_Enabled, DEVPROP_STORE_SYSTEM, NULL },
+         { DEVPKEY_Device_InstanceId, DEVPROP_STORE_SYSTEM, NULL },
++        { DEVPKEY_DeviceInterface_FriendlyName, DEVPROP_STORE_SYSTEM, NULL },
+     };
+     DEV_OBJECT_TYPE type = DevObjectTypeUnknown;
+     DEVPROPCOMPKEY *prop_keys = NULL;
+@@ -597,6 +644,8 @@ static HRESULT device_watcher_create( HSTRING filter, IIterable_HSTRING *additio
+     if (FAILED(hr = devquery_params_create( type, expr, prop_keys, prop_keys_len, &impl->query_params ))) goto failed;
+ 
+     list_init( &impl->added_handlers );
++    list_init( &impl->updated_handlers );
++    list_init( &impl->removed_handlers );
+     list_init( &impl->enumerated_handlers );
+     list_init( &impl->stopped_handlers );
+ 
+@@ -715,19 +764,85 @@ static const struct IActivationFactoryVtbl activation_factory_vtbl =
+ 
+ DEFINE_IINSPECTABLE( device_statics, IDeviceInformationStatics, struct device_information_statics, IActivationFactory_iface );
+ 
++static HRESULT create_from_id_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    struct devquery_params *params;
++    IDeviceInformation *info = NULL;
++    const DEV_OBJECT *objects;
++    ULONG len, i;
++    HRESULT hr;
++
++    TRACE( "invoker %p, param %p, result %p, called_async %d\n", invoker, param, result, called_async );
++
++    if (!called_async) return STATUS_PENDING;
++
++    params = impl_from_IUnknown( param );
++    audio_endpoints_sync();
++    if (FAILED(hr = DevGetObjects( params->type, DevQueryFlagNone, params->prop_keys_len, params->prop_keys, 0, NULL, &len, &objects ))) return hr;
++    for (i = 0; i < len; i++)
++    {
++        if (wcsicmp( objects[i].pszObjectId, WindowsGetStringRawBuffer( params->id, NULL ) )) continue;
++        hr = device_information_create( &objects[i], &info );
++        break;
++    }
++    DevFreeObjects( len, objects );
++    if (FAILED(hr)) return hr;
++    if (!info) return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++
++    result->vt = VT_UNKNOWN;
++    result->punkVal = (IUnknown *)info;
++    return S_OK;
++}
++
++static HRESULT create_from_id( IUnknown *invoker, HSTRING id, IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
++                               IAsyncOperation_DeviceInformation **op )
++{
++    const DEVPROPCOMPKEY device_iface_default_props[] = {
++        { DEVPKEY_DeviceInterface_Enabled, DEVPROP_STORE_SYSTEM, NULL },
++        { DEVPKEY_Device_InstanceId, DEVPROP_STORE_SYSTEM, NULL },
++        { DEVPKEY_DeviceInterface_FriendlyName, DEVPROP_STORE_SYSTEM, NULL },
++    };
++    DEVPROPCOMPKEY *prop_keys = NULL;
++    ULONG prop_keys_len = 0;
++    IUnknown *params;
++    HRESULT hr;
++
++    if (!op) return E_POINTER;
++    if (!WindowsGetStringLen( id ) || kind >= ARRAY_SIZE( kind_type ) || kind == DeviceInformationKind_Unknown) return E_INVALIDARG;
++
++    if (kind == DeviceInformationKind_DeviceInterface &&
++        FAILED(hr = devpropcompkeys_init( &prop_keys, &prop_keys_len, device_iface_default_props, ARRAY_SIZE( device_iface_default_props ) )))
++        return hr;
++    if (additional_properties && FAILED(hr = devpropcompkeys_append_names( &prop_keys, &prop_keys_len, additional_properties )))
++    {
++        free( prop_keys );
++        return hr;
++    }
++    if (FAILED(hr = devquery_params_create( kind_type[kind], NULL, prop_keys, prop_keys_len, &params )))
++    {
++        free( prop_keys );
++        return hr;
++    }
++    if (SUCCEEDED(hr = WindowsDuplicateString( id, &impl_from_IUnknown( params )->id )))
++        hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformation, invoker, params, create_from_id_async,
++                                                 (IAsyncOperation_IInspectable **)op );
++    IUnknown_Release( params );
++    return hr;
++}
++
+ static HRESULT WINAPI device_statics_CreateFromIdAsync( IDeviceInformationStatics *iface, HSTRING id,
+                                                         IAsyncOperation_DeviceInformation **op )
+ {
+-    FIXME( "iface %p, id %s, op %p stub!\n", iface, debugstr_hstring(id), op );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, id %s, op %p\n", iface, debugstr_hstring( id ), op );
++    return create_from_id( (IUnknown *)iface, id, NULL, DeviceInformationKind_DeviceInterface, op );
+ }
+ 
+ static HRESULT WINAPI device_statics_CreateFromIdAsyncAdditionalProperties( IDeviceInformationStatics *iface, HSTRING id,
+                                                                             IIterable_HSTRING *additional_properties,
+                                                                             IAsyncOperation_DeviceInformation **op )
+ {
+-    FIXME( "iface %p, id %s, additional_properties %p, op %p stub!\n", iface, debugstr_hstring(id), additional_properties, op );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, id %s, additional_properties %p, op %p\n", iface, debugstr_hstring( id ), additional_properties, op );
++    return create_from_id( (IUnknown *)iface, id, additional_properties, DeviceInformationKind_DeviceInterface, op );
+ }
+ 
+ static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+@@ -758,6 +873,7 @@ static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *
+         filters_len = params->expr->len;
+     }
+     if (FAILED(hr = vector_create( &iids, (void *)&vector ))) return hr;
++    audio_endpoints_sync();
+     hr = DevGetObjects( params->type, DevQueryFlagNone, params->prop_keys_len, params->prop_keys, filters_len, filters, &len, &objects );
+     if (FAILED(hr))
+     {
+@@ -793,8 +909,17 @@ static HRESULT WINAPI device_statics_FindAllAsync( IDeviceInformationStatics *if
+ static HRESULT WINAPI device_statics_FindAllAsyncDeviceClass( IDeviceInformationStatics *iface, DeviceClass class,
+                                                               IAsyncOperation_DeviceInformationCollection **op )
+ {
+-    FIXME( "iface %p, class %d, op %p stub!\n", iface, class, op );
+-    return E_NOTIMPL;
++    const WCHAR *filter = device_class_filter( class );
++    HSTRING str;
++    HRESULT hr;
++
++    TRACE( "iface %p, class %d, op %p\n", iface, class, op );
++
++    if (!filter) return E_INVALIDARG;
++    if (FAILED(hr = WindowsCreateString( filter, wcslen( filter ), &str ))) return hr;
++    hr = IDeviceInformationStatics_FindAllAsyncAqsFilter( iface, str, op );
++    WindowsDeleteString( str );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI device_statics_FindAllAsyncAqsFilter( IDeviceInformationStatics *iface, HSTRING filter,
+@@ -804,13 +929,24 @@ static HRESULT WINAPI device_statics_FindAllAsyncAqsFilter( IDeviceInformationSt
+     return IDeviceInformationStatics_FindAllAsyncAqsFilterAndAdditionalProperties( iface, filter, NULL, op );
+ }
+ 
++static HRESULT find_all( IUnknown *invoker, HSTRING filter, IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
++                         IAsyncOperation_DeviceInformationCollection **op );
++
+ static HRESULT WINAPI device_statics_FindAllAsyncAqsFilterAndAdditionalProperties( IDeviceInformationStatics *iface, HSTRING filter,
+                                                                                    IIterable_HSTRING *additional_properties,
+                                                                                    IAsyncOperation_DeviceInformationCollection **op )
++{
++    TRACE( "iface %p, aqs %s, additional_properties %p, op %p\n", iface, debugstr_hstring(filter), additional_properties, op );
++    return find_all( (IUnknown *)iface, filter, additional_properties, DeviceInformationKind_DeviceInterface, op );
++}
++
++static HRESULT find_all( IUnknown *invoker, HSTRING filter, IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
++                         IAsyncOperation_DeviceInformationCollection **op )
+ {
+     const DEVPROPCOMPKEY device_iface_default_props[] = {
+         { DEVPKEY_DeviceInterface_Enabled, DEVPROP_STORE_SYSTEM, NULL },
+         { DEVPKEY_Device_InstanceId, DEVPROP_STORE_SYSTEM, NULL },
++        { DEVPKEY_DeviceInterface_FriendlyName, DEVPROP_STORE_SYSTEM, NULL },
+     };
+     DEVPROPCOMPKEY *prop_keys = NULL;
+     struct aqs_expr *expr = NULL;
+@@ -818,14 +954,15 @@ static HRESULT WINAPI device_statics_FindAllAsyncAqsFilterAndAdditionalPropertie
+     IUnknown *params;
+     HRESULT hr;
+ 
+-    TRACE( "iface %p, aqs %s, additional_properties %p, op %p\n", iface, debugstr_hstring(filter), additional_properties, op );
+-
+-    if (FAILED(hr = devpropcompkeys_init( &prop_keys, &prop_keys_len, device_iface_default_props, ARRAY_SIZE( device_iface_default_props ) ))) goto failed;
++    if (!op) return E_POINTER;
++    if (kind >= ARRAY_SIZE( kind_type ) || kind == DeviceInformationKind_Unknown) return E_INVALIDARG;
++    if (kind == DeviceInformationKind_DeviceInterface &&
++        FAILED(hr = devpropcompkeys_init( &prop_keys, &prop_keys_len, device_iface_default_props, ARRAY_SIZE( device_iface_default_props ) ))) goto failed;
+     if (additional_properties && FAILED(hr = devpropcompkeys_append_names( &prop_keys, &prop_keys_len, additional_properties ))) goto failed;
+     if (FAILED(hr = aqs_parse_query(WindowsGetStringRawBuffer( filter, NULL ), &expr, NULL ))) goto failed;
+-    if (FAILED(hr = devquery_params_create( DevObjectTypeDeviceInterfaceDisplay, expr, prop_keys, prop_keys_len, &params ))) goto failed;
++    if (FAILED(hr = devquery_params_create( kind_type[kind], expr, prop_keys, prop_keys_len, &params ))) goto failed;
+ 
+-    hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformationCollection, (IUnknown *)iface, params, find_all_async,
++    hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformationCollection, invoker, params, find_all_async,
+                                              (IAsyncOperation_IInspectable **)op );
+     IUnknown_Release( params );
+     return hr;
+@@ -844,8 +981,17 @@ static HRESULT WINAPI device_statics_CreateWatcher( IDeviceInformationStatics *i
+ 
+ static HRESULT WINAPI device_statics_CreateWatcherDeviceClass( IDeviceInformationStatics *iface, DeviceClass class, IDeviceWatcher **watcher )
+ {
+-    FIXME( "iface %p, class %d, watcher %p stub!\n", iface, class, watcher );
+-    return E_NOTIMPL;
++    const WCHAR *filter = device_class_filter( class );
++    HSTRING str;
++    HRESULT hr;
++
++    TRACE( "iface %p, class %d, watcher %p\n", iface, class, watcher );
++
++    if (!filter) return E_INVALIDARG;
++    if (FAILED(hr = WindowsCreateString( filter, wcslen( filter ), &str ))) return hr;
++    hr = device_watcher_create( str, NULL, DeviceInformationKind_DeviceInterface, watcher );
++    WindowsDeleteString( str );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI device_statics_CreateWatcherAqsFilter( IDeviceInformationStatics *iface, HSTRING filter, IDeviceWatcher **watcher )
+@@ -888,26 +1034,31 @@ DEFINE_IINSPECTABLE( device_statics2, IDeviceInformationStatics2, struct device_
+ static HRESULT WINAPI device_statics2_GetAqsFilterFromDeviceClass( IDeviceInformationStatics2 *iface, DeviceClass device_class,
+                                                                    HSTRING *filter )
+ {
+-    FIXME( "iface %p, device_class %u, filter %p stub!\n", iface, device_class, filter );
+-    return E_NOTIMPL;
++    const WCHAR *str = device_class_filter( device_class );
++
++    TRACE( "iface %p, device_class %u, filter %p\n", iface, device_class, filter );
++
++    if (!filter) return E_POINTER;
++    if (!str) return E_INVALIDARG;
++    return WindowsCreateString( str, wcslen( str ), filter );
+ }
+ 
+ static HRESULT WINAPI device_statics2_CreateFromIdAsync( IDeviceInformationStatics2 *iface, HSTRING device_id,
+                                                          IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
+                                                          IAsyncOperation_DeviceInformation **async_operation )
+ {
+-    FIXME( "iface %p, device_id %s, additional_properties %p, kind %u, async_operation %p stub!\n",
+-            iface, debugstr_hstring( device_id ), additional_properties, kind, async_operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, device_id %s, additional_properties %p, kind %u, async_operation %p\n",
++           iface, debugstr_hstring( device_id ), additional_properties, kind, async_operation );
++    return create_from_id( (IUnknown *)iface, device_id, additional_properties, kind, async_operation );
+ }
+ 
+ static HRESULT WINAPI device_statics2_FindAllAsync( IDeviceInformationStatics2 *iface, HSTRING filter,
+                                                     IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
+                                                     IAsyncOperation_DeviceInformationCollection **async_operation )
+ {
+-    FIXME( "iface %p, filter %s, additional_properties %p, kind %u, async_operation %p stub!\n",
+-            iface, debugstr_hstring( filter ), additional_properties, kind, async_operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, filter %s, additional_properties %p, kind %u, async_operation %p\n",
++           iface, debugstr_hstring( filter ), additional_properties, kind, async_operation );
++    return find_all( (IUnknown *)iface, filter, additional_properties, kind, async_operation );
+ }
+ 
+ static const char *debugstr_DeviceInformationKind( DeviceInformationKind kind )
+diff --git a/dlls/windows.devices.enumeration/private.h b/dlls/windows.devices.enumeration/private.h
+index 033e866b..5699276c 100644
+--- a/dlls/windows.devices.enumeration/private.h
++++ b/dlls/windows.devices.enumeration/private.h
+@@ -67,6 +67,9 @@ extern HRESULT async_action_create( IUnknown *invoker, async_operation_callback
+ 
+ extern HRESULT vector_create( const struct vector_iids *iids, void **out );
+ extern HRESULT device_information_create( const DEV_OBJECT *obj, IDeviceInformation **info );
++extern HRESULT device_information_update_create( const DEV_OBJECT *obj, IDeviceInformationUpdate **out );
++extern void audio_endpoints_sync( void );
++extern BOOL audio_endpoint_is_default( const WCHAR *interface_id );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/dlls/windows.media.devices/main.c b/dlls/windows.media.devices/main.c
+index 22562f96..4cfa45bb 100644
+--- a/dlls/windows.media.devices/main.c
++++ b/dlls/windows.media.devices/main.c
+@@ -261,22 +261,37 @@ static HRESULT WINAPI media_device_statics_GetTrustLevel(IMediaDeviceStatics *if
+ static HRESULT WINAPI media_device_statics_GetAudioCaptureSelector(IMediaDeviceStatics *iface,
+         HSTRING *value)
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
+-    return E_NOTIMPL;
++    static const WCHAR selector[] = L"System.Devices.InterfaceClassGuid:=\"{2EEF81BE-33FA-4800-9670-1CD474972C3F}\" AND "
++                                    L"System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
++
++    TRACE("iface %p, value %p\n", iface, value);
++
++    if (!value) return E_POINTER;
++    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
+ }
+ 
+ static HRESULT WINAPI media_device_statics_GetAudioRenderSelector(IMediaDeviceStatics *iface,
+         HSTRING *value)
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
+-    return E_NOTIMPL;
++    static const WCHAR selector[] = L"System.Devices.InterfaceClassGuid:=\"{E6327CAD-DCEC-4949-AE8A-991E976A79D2}\" AND "
++                                    L"System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
++
++    TRACE("iface %p, value %p\n", iface, value);
++
++    if (!value) return E_POINTER;
++    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
+ }
+ 
+ static HRESULT WINAPI media_device_statics_GetVideoCaptureSelector(IMediaDeviceStatics *iface,
+         HSTRING *value)
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
+-    return E_NOTIMPL;
++    static const WCHAR selector[] = L"System.Devices.InterfaceClassGuid:=\"{E5323777-F976-4F5B-9B55-B94699C46E44}\" AND "
++                                    L"System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
++
++    TRACE("iface %p, value %p\n", iface, value);
++
++    if (!value) return E_POINTER;
++    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
+ }
+ 
+ static HRESULT WINAPI media_device_statics_GetDefaultAudioCaptureId(IMediaDeviceStatics *iface,

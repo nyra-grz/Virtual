@@ -1,0 +1,39 @@
+Report Wi-Fi interfaces on macOS as IEEE 802.11 (IfType 71) instead of Ethernet.
+nsiproxy reads the interface functional type (SIOCGIFFUNCTIONALTYPE), which macOS
+provides for Wi-Fi infrastructure and AWDL links.
+
+diff --git a/dlls/nsiproxy.sys/ndis.c b/dlls/nsiproxy.sys/ndis.c
+index c7d1f73f..ca2a8d7f 100644
+--- a/dlls/nsiproxy.sys/ndis.c
++++ b/dlls/nsiproxy.sys/ndis.c
+@@ -259,6 +259,30 @@ static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRE
+     }
+ 
+     free( buf );
++
++#ifdef SIOCGIFFUNCTIONALTYPE
++    /* macOS reports Wi-Fi interfaces as plain Ethernet; the functional type tells them apart. */
++    if (*type == MIB_IF_TYPE_ETHERNET)
++    {
++        struct ifreq ifr;
++        int fd = socket( AF_INET, SOCK_DGRAM, 0 );
++
++        if (fd != -1)
++        {
++            memset( &ifr, 0, sizeof(ifr) );
++            snprintf( ifr.ifr_name, sizeof(ifr.ifr_name), "%s", name );
++            if (!ioctl( fd, SIOCGIFFUNCTIONALTYPE, &ifr ) &&
++                (ifr.ifr_ifru.ifru_functional_type == IFRTYPE_FUNCTIONAL_WIFI_INFRA ||
++                 ifr.ifr_ifru.ifru_functional_type == IFRTYPE_FUNCTIONAL_WIFI_AWDL))
++            {
++                TRACE( "iface %s is a Wi-Fi interface.\n", debugstr_a(name) );
++                *type = IF_TYPE_IEEE80211;
++            }
++            close( fd );
++        }
++    }
++#endif
++
+     return STATUS_SUCCESS;
+ }
+ #endif
