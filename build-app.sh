@@ -38,6 +38,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>CFBundleName</key><string>$NAME</string>
     <key>CFBundleDisplayName</key><string>$NAME</string>
     <key>CFBundleIdentifier</key><string>com.oezdek.winmacvirtual</string>
+    <key>CFBundleDevelopmentRegion</key><string>de</string>
+    <key>CFBundleLocalizations</key><array><string>de</string></array>
     <key>CFBundleExecutable</key><string>Virtual</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
@@ -61,10 +63,31 @@ cat > "$CONTENTS/Info.plist" <<PLIST
                 <string>com.microsoft.msi-installer</string>
             </array>
         </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Windows-Zertifikat</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>CFBundleTypeExtensions</key>
+            <array><string>cer</string><string>crt</string><string>der</string><string>pem</string><string>p7b</string><string>p7c</string><string>pfx</string><string>p12</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Windows-Datei</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key><array><string>public.data</string></array>
+        </dict>
     </array>
 </dict>
 </plist>
 PLIST
+
+# Windows-Helfer vor dem Signieren ins Bundle aufnehmen.
+if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    x86_64-w64-mingw32-gcc -municode -O2 -s "$ROOT/app/Helpers/certimport.c" \
+        -o "$CONTENTS/Resources/certimport.exe" -lcrypt32
+    x86_64-w64-mingw32-gcc -municode -O2 -s "$ROOT/app/Helpers/program-runner.c" \
+        -o "$CONTENTS/Resources/program-runner.exe" -lole32 -luuid
+fi
 
 # Ad-hoc-Signatur, damit macOS die App ohne Gatekeeper-Murren lokal startet.
 codesign --force --deep --sign - "$BUNDLE" >/dev/null 2>&1 || echo "   (Signatur übersprungen)"

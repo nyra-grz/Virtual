@@ -49,7 +49,7 @@ final class SettingsWindowController: NSWindowController {
         runtimeStatus.font = .systemFont(ofSize: 11)
         runtimeStatus.translatesAutoresizingMaskIntoConstraints = false
 
-        let prefixLabel = label("Windows-Umgebung (WINEPREFIX):")
+        let prefixLabel = label("Standard-Raum (WINEPREFIX)")
         prefixField = NSTextField(string: Settings.shared.prefixPath.path)
         prefixField.translatesAutoresizingMaskIntoConstraints = false
         let prefixPick = NSButton(title: "Wählen…", target: self, action: #selector(pickPrefix))
@@ -170,13 +170,18 @@ final class SettingsWindowController: NSWindowController {
         setupButton.isEnabled = false
         let setup = PrefixSetup()
         prefixSetup = setup
-        setup.run()
+        setup.run(RoomStore.shared.defaultRoom)
     }
 
     private func apply() {
         Settings.shared.runtimePath = URL(fileURLWithPath: (runtimeField.stringValue as NSString).expandingTildeInPath)
         Settings.shared.prefixPath = URL(fileURLWithPath: (prefixField.stringValue as NSString).expandingTildeInPath)
+        // Das Feld beschreibt den Standard-Raum.
+        RoomStore.shared.defaultRoom.prefixPath = Settings.shared.prefixPath.path
         Settings.shared.windowsVersion = versionPopup.titleOfSelectedItem ?? "win10"
+        RoomStore.shared.defaultRoom.windowsVersion = Settings.shared.windowsVersion
+        RoomStore.shared.save()
+        NotificationCenter.default.post(name: RoomStore.didChange, object: nil)
         Settings.shared.autoUpdate = autoUpdateBox.state == .on
         updateRuntimeStatus()
     }
@@ -188,15 +193,17 @@ final class SettingsWindowController: NSWindowController {
 
     private func observe() {
         NotificationCenter.default.addObserver(forName: PrefixSetup.didLog, object: nil, queue: .main) { [weak self] note in
-            guard let line = note.userInfo?["line"] as? String else { return }
-            self?.setupLog.textStorage?.append(NSAttributedString(string: line))
+            guard note.userInfo?["room"] as? UUID == self?.prefixSetup?.room?.id,
+                  let line = note.userInfo?["line"] as? String else { return }
+            self?.setupLog.textStorage?.append(NSAttributedString(string: line, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular), .foregroundColor: NSColor.textColor]))
             self?.setupLog.scrollToEndOfDocument(nil)
         }
         NotificationCenter.default.addObserver(forName: PrefixSetup.didFinish, object: nil, queue: .main) { [weak self] note in
+            guard note.userInfo?["room"] as? UUID == self?.prefixSetup?.room?.id else { return }
             let status = (note.userInfo?["status"] as? Int32) ?? -1
             self?.setupButton.isEnabled = true
             let msg = status == 0 ? "\n✓ Einrichtung abgeschlossen.\n" : "\n✗ Einrichtung fehlgeschlagen (Status \(status)).\n"
-            self?.setupLog.textStorage?.append(NSAttributedString(string: msg))
+            self?.setupLog.textStorage?.append(NSAttributedString(string: msg, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular), .foregroundColor: NSColor.textColor]))
         }
     }
 }

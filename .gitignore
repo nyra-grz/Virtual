@@ -10,3 +10,7 @@ graphify-out/
 # downloaded third-party runtime payloads
 /thirdparty/
 /library.json
+
+# Room metadata and Wine environments are local user data
+/rooms.json
+/rooms/

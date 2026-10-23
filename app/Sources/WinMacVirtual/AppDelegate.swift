@@ -9,34 +9,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainController.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
 
-        // Erststart: wenn keine eingerichtete Umgebung vorhanden ist, Einstellungen öffnen.
-        if Settings.shared.runtimeIsInstalled && !Settings.shared.didInitPrefix {
-            let prefixReady = FileManager.default.fileExists(
-                atPath: Settings.shared.prefixPath.appendingPathComponent("drive_c").path)
-            if !prefixReady { SettingsWindowController.shared.showWindow(nil) }
+        NotificationCenter.default.addObserver(forName: Handoff.didSelectProgram, object: nil, queue: .main) { [weak self] note in
+            guard let id = note.userInfo?["program"] as? UUID,
+                  let program = Library.shared.programs.first(where: { $0.id == id }) else { return }
+            self?.mainController.selectProgram(program)
+            self?.mainController.window?.makeKeyAndOrderFront(nil)
         }
+        RoomWatcher.shared.start()
+        let urls = pendingURLs
+        pendingURLs.removeAll()
+        urls.forEach { Handoff.shared.open($0) }
         Updater.shared.checkOnLaunch()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
-    // Finder-Doppelklick und Drop aufs Dock-Symbol.
+    private var pendingURLs: [URL] = []
+
+    // LaunchServices kann URLs vor applicationDidFinishLaunching zustellen.
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard mainController != nil else {
-            // App startet gerade erst – kurz warten, bis das Fenster steht.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                urls.forEach { self?.mainController?.launchExternalFile($0) }
-            }
-            return
-        }
-        urls.forEach { mainController.launchExternalFile($0) }
+        guard mainController != nil else { pendingURLs.append(contentsOf: urls); return }
+        urls.forEach { Handoff.shared.open($0) }
     }
 
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {
-        let url = URL(fileURLWithPath: filename)
-        DispatchQueue.main.asyncAfter(deadline: .now() + (mainController == nil ? 0.4 : 0)) { [weak self] in
-            self?.mainController?.launchExternalFile(url)
-        }
+        application(sender, open: [URL(fileURLWithPath: filename)])
         return true
     }
 
@@ -75,5 +72,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() { SettingsWindowController.shared.showWindow(nil) }
     @objc private func checkForUpdates() { Updater.shared.check(interactive: true) }
-    @objc private func addFromMenu() { mainController.window?.makeKeyAndOrderFront(nil); NSApp.sendAction(Selector(("addProgram")), to: mainController, from: nil) }
+    @objc private func addFromMenu() { mainController.window?.makeKeyAndOrderFront(nil); mainController.addProgram() }
 }

@@ -82,7 +82,10 @@ set_reg "$NTKEY" CurrentMinorVersionNumber "0" REG_DWORD
 echo "==> Prüfe Registry…"
 missing=0
 for key in 'HKCU\Software\Wine' "$NTKEY"; do
-    values="$("$BIN/virtual" reg query "$key" 2>/dev/null | tr -d '\r' | awk '{ $1 = tolower($1); print }')"
+    query_log="$(mktemp "${TMPDIR:-/tmp}/winmac-reg.XXXXXX")" || fail "Temporäres Registry-Protokoll fehlt."
+    "$BIN/virtual" reg query "$key" >"$query_log" 2>/dev/null || { rm -f "$query_log"; fail "Registry nicht lesbar: $key"; }
+    values="$(tr -d '\r' <"$query_log" | awk '{ $1 = tolower($1); print }')"
+    rm -f "$query_log"
     for entry in "${EXPECTED[@]}"; do
         [ "${entry%%|*}" = "$key" ] || continue
         grep -Fqx -- "${entry#*|}" <<<"$values" && continue

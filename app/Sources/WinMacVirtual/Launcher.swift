@@ -8,6 +8,8 @@ final class Launcher {
     static let didChange = Notification.Name("WinMacVirtual.launcher.didChange")
     /// userInfo: ["programID": UUID, "line": String] – eine neue Logzeile.
     static let didLog = Notification.Name("WinMacVirtual.launcher.didLog")
+    /// userInfo: ["room": UUID] – ein Programm oder Werkzeug in diesem Raum ist beendet.
+    static let didFinishInRoom = Notification.Name("WinMacVirtual.launcher.didFinishInRoom")
 
     struct Running {
         let process: Process
@@ -20,14 +22,17 @@ final class Launcher {
     func isRunning(_ program: Program) -> Bool { running[program.id] != nil }
 
     /// Läuft gerade irgendein Windows-Programm?
-    var hasRunning: Bool { !running.isEmpty }
+    var hasRunning: Bool { !running.isEmpty || !tools.isEmpty }
 
-    func logURL(for program: Program) -> URL? { running[program.id]?.logURL }
+    private var recentLogs: [UUID: URL] = [:]
+    private var processRooms: [UUID: UUID] = [:]
 
-    /// Startet ein Programm. Wirft bei fehlender Runtime/Datei.
+    func hasRunning(in room: Room) -> Bool { processRooms.values.contains(room.id) }
+    func logURL(for program: Program) -> URL? { running[program.id]?.logURL ?? recentLogs[program.id] }
+
+    /// Startet ein Programm in seinem Raum. Wirft bei fehlender Runtime/Datei.
     func launch(_ program: Program) throws {
-        let settings = Settings.shared
-        guard settings.runtimeIsInstalled else {
+        guard Settings.shared.runtimeIsInstalled else {
             throw LaunchError.runtimeMissing
         }
         guard program.exists else {
@@ -35,57 +40,92 @@ final class Launcher {
         }
         if isRunning(program) { return }
 
+        let room = program.room
+        let arguments: [String]
+        switch URL(fileURLWithPath: program.path).pathExtension.lowercased() {
+        case "msi":
+            // Eine .msi ist kein Programm, sondern ein Paket für den Windows Installer.
+            arguments = ["msiexec", "/i", Self.windowsPath(program.path, prefix: room.prefixURL)]
+        case "lnk":
+            // Verknüpfungen löst Windows selbst auf; /wait hält den Status, bis das Programm endet.
+            arguments = ["start", "/wait", "/unix", program.path]
+        default:
+            arguments = [program.path]
+        }
+
+        let programID = program.id
+        let (process, logURL) = try start(arguments, in: room, title: program.name, id: programID, trackChildren: true) { [weak self] in
+            self?.running[programID] = nil
+        }
+        recentLogs[programID] = logURL
+        running[programID] = Running(process: process, logURL: logURL)
+        NotificationCenter.default.post(name: Launcher.didChange, object: nil)
+    }
+
+    /// Startet ein Windows-Werkzeug (Explorer, Eingabeaufforderung, Installer …) in einem Raum.
+    func runTool(_ arguments: [String], in room: Room, title: String) throws {
+        guard Settings.shared.runtimeIsInstalled else { throw LaunchError.runtimeMissing }
+        let id = UUID()
+        let (process, _) = try start(arguments, in: room, title: title, id: id) { [weak self] in
+            self?.tools[id] = nil
+        }
+        tools[id] = process
+    }
+
+    /// Werkzeuge, die gerade laufen (hält die Process-Objekte am Leben).
+    private var tools: [UUID: Process] = [:]
+
+    private func start(_ arguments: [String], in room: Room, title: String, id: UUID,
+                       trackChildren: Bool = false, ended: @escaping () -> Void) throws -> (Process, URL) {
+        let settings = Settings.shared
         try FileManager.default.createDirectory(at: settings.logsPath, withIntermediateDirectories: true)
 
         let stamp = Self.timestamp()
-        let safeName = program.name.replacingOccurrences(of: "/", with: "_")
-        let logURL = settings.logsPath.appendingPathComponent("\(safeName)-\(stamp).log")
+        let safeName = title.replacingOccurrences(of: "/", with: "_")
+        let logURL = settings.logsPath.appendingPathComponent("\(safeName)-\(stamp)-\(id.uuidString.prefix(8)).log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let handle = try FileHandle(forWritingTo: logURL)
 
-        let header = "Virtual · \(program.name)\nDatei: \(program.path)\nStart: \(Date())\nRuntime: \(settings.virtualBinary.path)\nPrefix: \(settings.prefixPath.path)\n\n"
+        let header = "Virtual · \(title)\nRaum: \(room.name)\nAufruf: \(arguments.joined(separator: " "))\nStart: \(Date())\nRuntime: \(settings.virtualBinary.path)\nPrefix: \(room.prefixPath)\n\n"
         handle.write(header.data(using: .utf8)!)
 
         let process = Process()
         process.executableURL = settings.virtualBinary
-        // Eine .msi ist kein Programm, sondern ein Paket für den Windows Installer.
-        if program.path.lowercased().hasSuffix(".msi") {
-            process.arguments = ["msiexec", "/i", Self.windowsPath(program.path, prefix: settings.prefixPath)]
+        if trackChildren, let helper = Bundle.main.url(forResource: "program-runner", withExtension: "exe") {
+            process.arguments = [helper.path] + arguments
         } else {
-            process.arguments = [program.path]
+            process.arguments = arguments
         }
-
-        var env = ProcessInfo.processInfo.environment
-        env["WINEPREFIX"] = settings.prefixPath.path
-        env["WINEDEBUG"] = env["WINEDEBUG"] ?? "-all"
-        process.environment = env
+        process.environment = RoomStore.shared.environment(for: room)
 
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
 
-        let programID = program.id
-        let output = ProgramOutput(log: handle, reader: pipe.fileHandleForReading, programID: programID)
+        let output = ProgramOutput(log: handle, reader: pipe.fileHandleForReading, programID: id)
+        let roomID = room.id
 
-        process.terminationHandler = { [weak self] proc in
+        process.terminationHandler = { proc in
             output.finish(status: proc.terminationStatus) {
                 DispatchQueue.main.async {
-                    self?.running[programID] = nil
+                    self.processRooms[id] = nil
+                    ended()
                     NotificationCenter.default.post(name: Launcher.didChange, object: nil)
+                    NotificationCenter.default.post(name: Launcher.didFinishInRoom, object: nil, userInfo: ["room": roomID])
                 }
             }
         }
 
         do {
             try process.run()
+            processRooms[id] = room.id
         } catch {
             // Ohne Start ruft Process den terminationHandler nie auf: selbst aufräumen.
             output.abort()
             try? pipe.fileHandleForWriting.close()
             throw error
         }
-        running[program.id] = Running(process: process, logURL: logURL)
-        NotificationCenter.default.post(name: Launcher.didChange, object: nil)
+        return (process, logURL)
     }
 
     /// Beendet ein laufendes Programm (sanft, dann hart).

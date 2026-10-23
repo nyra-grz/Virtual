@@ -78,16 +78,71 @@ one is not touched):
 ./scripts/smoke-test.sh      # app build, prefix, 32/64-bit programs, D3D11 via DXVK
 ```
 
-## Using the app
+## Rooms and programs
 
-- **Add:** `+` in the toolbar, drag an `.exe`/`.msi` into the window, double-click
-  it in Finder, or drop it on the app icon.
-- **Start:** select a program → "Starten" (Start), or double-click it in the list.
-- **Status & stop:** green dot = running; "Beenden" (Quit) stops it.
-- **Logs:** one log file per launch in `logs/`, shown live in the window;
-  "Log im Finder" (Show log in Finder) opens it.
-- **Settings:** runtime path, prefix, Windows version; also
-  "Windows-Umgebung jetzt einrichten" (set up Windows environment now).
+The native sidebar groups programs by **room** (an independent Wine prefix with its
+own C: drive and Windows registry). **Standard** keeps the existing `prefix/`,
+including previously added programs. Use **+ → Neuer Raum…** (New room), select it,
+and click **Raum einrichten** (Set up room); setup progress appears live. Additional
+rooms live under `rooms/`, and their metadata is saved in `rooms.json`.
+
+- **Add:** **+ → Programm hinzufügen…** (Add program) adds an `.exe` or `.msi` to
+  the selected room. Drop files directly onto a room in the sidebar, double-click
+  a file in Finder, or drop it onto the Dock icon; external files prompt for a room.
+- **Install:** the room's **Programm installieren…** (Install program) tool runs
+  an EXE installer or `msiexec /i` in that room.
+- **Discovery:** Start Menu and public Desktop shortcuts appear automatically,
+  with icons read from their Windows executables. Virtual watches shortcut folders
+  and rescans after a program or tool exits. **Apps suchen** (Find apps) rescans
+  manually. A banner identifies new apps and selects one of them.
+- **Run:** select a program and click **Starten** (Start), or double-click its row.
+  A green dot means its tracked process is running; **Beenden** (Stop) stops it.
+  Shortcuts run through Windows `start /wait /unix`.
+- **Logs:** output appears live on the program page. **Log öffnen** (Open log)
+  opens the launch log, which remains available after the process exits. Files
+  are kept under `logs/`.
+- **Tools:** each configured room offers Explorer, Command Prompt, Control Panel,
+  Registry Editor, Task Manager, Wine configuration, and its C: drive in Finder.
+- **Manage:** rooms and programs have context menus. Additional rooms can be renamed
+  or moved to the Trash; Standard cannot be deleted. Remove a program to hide its
+  library entry; this does not uninstall it. A discovered shortcut can reappear on
+  the next scan. Removing a room also removes its library entries.
+- **Settings:** choose the shared runtime and the **Standard-Raum (WINEPREFIX)**
+  path, Windows version, and update preferences.
+
+## Links, files and certificates
+
+Virtual reads each room's `system.reg` and `user.reg` for Windows protocol and file
+associations. Custom schemes such as `steam://` are registered dynamically with
+macOS after app discovery; there is no fixed scheme list in the shipped bundle.
+Existing native Mac handlers take precedence. `http`, `https`, `ftp` and `mailto`
+are excluded. When several rooms can handle a link, Virtual asks which one to use.
+An ordinary file goes to its owning room or a room that declares its extension;
+otherwise a configured room can be chosen. Virtual registers as an alternate file
+viewer, so it does not replace existing default file handlers.
+
+Certificates (`cer`, `crt`, `der`, `pem`, `p7b`, `p7c`, `pfx`, `p12`) can be opened
+with Virtual from Finder or imported with the room tool. The bundled Windows
+`certimport.exe` writes to that room's current-user stores: self-issued certificates
+to **Root**, other certificates to **CA**, and PFX certificates with private keys
+to **My**. Root imports require confirmation; PFX/P12 imports prompt for a password,
+passed on stdin. This does not change the macOS Keychain. `build-app.sh` includes
+the helper when `x86_64-w64-mingw32-gcc` is available; otherwise import is unavailable.
+
+### Room and handoff limits
+
+Rooms separate Windows state, but are **not security sandboxes**: Wine programs can
+access Mac files through mapped drives. Discovery relies on installer shortcuts;
+portable apps without shortcuts must be added manually. User Desktop symlinks to
+the Mac Desktop are skipped, as are obvious uninstall/help/documentation links.
+Some shortcut formats or PE icons may fall back to a generic icon. The bundled `program-runner.exe` tracks a launch and its descendants in a Windows
+job, so **Beenden** also stops detached shortcut children. Builds without
+mingw-w64 fall back to tracking the initial process.
+File and URL handoff depends on valid Windows associations and Wine support.
+Registered open commands are launched directly, including per-user registrations
+that Wine 11 does not resolve through HKCR. Unusual handlers using DDE or Windows
+environment placeholders may still need application-specific setup.
+Dynamic URL registration needs a writable app bundle and re-signs it ad hoc.
 
 ## Updates
 
@@ -103,7 +158,7 @@ in the settings; without a window: `"Virtual.app/Contents/MacOS/Virtual" --updat
 Publish a new version (requires the GitHub CLI `gh`):
 
 ```bash
-./scripts/release.sh 0.3.0 "What's new"
+./scripts/release.sh 0.4.0 "What's new"
 ```
 
 ## Graphics (3D)

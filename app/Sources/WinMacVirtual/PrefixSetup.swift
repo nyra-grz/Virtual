@@ -11,22 +11,27 @@ final class PrefixSetup {
     /// Hält den laufenden Prozess am Leben, bis er beendet ist.
     private var process: Process?
 
-    /// Startet die Einrichtung über das Skript scripts/init-prefix.sh (liegt neben der Runtime-Wurzel).
-    func run() {
+    /// Raum, der gerade eingerichtet wird.
+    private(set) var room: Room?
+
+    /// Richtet einen Raum über scripts/init-prefix.sh ein (liegt neben der Runtime-Wurzel).
+    func run(_ room: Room) {
         guard !isRunning else { return }
         isRunning = true
+        self.room = room
 
         let settings = Settings.shared
         let script = settings.root.appendingPathComponent("scripts/init-prefix.sh")
+        let roomID = room.id
 
         let process = Process()
         self.process = process
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [script.path, settings.windowsVersion]
+        process.arguments = [script.path, room.windowsVersion]
 
         var env = ProcessInfo.processInfo.environment
         env["WINMAC_ROOT"] = settings.root.path
-        env["WINEPREFIX"] = settings.prefixPath.path
+        env["WINEPREFIX"] = room.prefixPath
         env["WINMAC_RUNTIME"] = settings.runtimePath.path
         process.environment = env
 
@@ -38,7 +43,7 @@ final class PrefixSetup {
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: PrefixSetup.didLog, object: nil,
-                                                userInfo: ["line": text])
+                                                userInfo: ["line": text, "room": roomID])
             }
         }
 
@@ -46,9 +51,9 @@ final class PrefixSetup {
             pipe.fileHandleForReading.readabilityHandler = nil
             DispatchQueue.main.async {
                 self?.isRunning = false
-                if proc.terminationStatus == 0 { Settings.shared.didInitPrefix = true }
+                if proc.terminationStatus == 0, roomID == RoomStore.shared.defaultRoom.id { Settings.shared.didInitPrefix = true }
                 NotificationCenter.default.post(name: PrefixSetup.didFinish, object: nil,
-                                                userInfo: ["status": proc.terminationStatus])
+                                                userInfo: ["status": proc.terminationStatus, "room": roomID])
             }
         }
 
@@ -57,9 +62,9 @@ final class PrefixSetup {
         } catch {
             isRunning = false
             NotificationCenter.default.post(name: PrefixSetup.didLog, object: nil,
-                                            userInfo: ["line": "Fehler: \(error.localizedDescription)\n"])
+                                            userInfo: ["line": "Fehler: \(error.localizedDescription)\n", "room": roomID])
             NotificationCenter.default.post(name: PrefixSetup.didFinish, object: nil,
-                                            userInfo: ["status": Int32(-1)])
+                                            userInfo: ["status": Int32(-1), "room": roomID])
         }
     }
 }
