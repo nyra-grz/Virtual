@@ -95,10 +95,13 @@ for key in 'HKCU\Software\Wine' "$NTKEY"; do
 done
 [ "$missing" = 0 ] || fail "$missing Registry-Werte stimmen nicht."
 
-# .NET: nur anbieten, wenn eine Datei bereitliegt (kein Zwang, kein Download hier).
-DOTNET="${WINMAC_DOTNET:-$HOME/Downloads/dotnet-desktop.exe}"
+# .NET nur, wenn WINMAC_DOTNET ausdrücklich gesetzt ist. Kein Standardpfad in ~/Downloads:
+# Dort kann jede Webseite eine Datei mit diesem Namen ablegen, die dann still mitliefe.
+DOTNET="${WINMAC_DOTNET:-}"
 DOTNET_FAILED=0
-if [ -f "$DOTNET" ]; then
+if [ -z "$DOTNET" ]; then
+    echo "==> .NET übersprungen (zum Mitinstallieren WINMAC_DOTNET auf den Installer setzen)."
+elif [ -f "$DOTNET" ]; then
     echo "==> Installiere .NET Desktop Runtime ($DOTNET)…"
     run_logged "$BIN/virtual" "$DOTNET" /install /quiet /norestart
     status=$?
@@ -108,7 +111,6 @@ if [ -f "$DOTNET" ]; then
     fi
 else
     echo "==> .NET-Installer nicht gefunden ($DOTNET) – übersprungen."
-    echo "    (Zum Mitinstallieren dotnet-desktop.exe dorthin legen oder WINMAC_DOTNET setzen.)"
 fi
 
 # Registry auf die Platte schreiben lassen (endet der Server, speichert er sie).

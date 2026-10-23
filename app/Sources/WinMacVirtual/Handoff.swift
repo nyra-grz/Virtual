@@ -189,7 +189,8 @@ final class Handoff {
         let ready = RoomStore.shared.rooms.filter(\.isReady)
 
         if ext == "exe" || ext == "msi" {
-            guard let room = chooseRoom(RoomStore.shared.rooms, message: "„\(name)“ starten in …"),
+            guard confirmDownloaded(url),
+                  let room = chooseRoom(RoomStore.shared.rooms, message: "„\(name)“ starten in …"),
                   let program = Library.shared.add(url: url, to: room) else { return }
             NotificationCenter.default.post(name: Self.didSelectProgram, object: nil, userInfo: ["program": program.id])
             do { try Launcher.shared.launch(program) } catch { show("Start nicht möglich", error.localizedDescription) }
@@ -295,6 +296,25 @@ final class Handoff {
     }
 
     // MARK: - Hilfen
+
+    /// Gatekeeper prüft keine Windows-Programme, und Wine trennt sie nicht vom Mac (Z: ist /).
+    /// Eine Datei mit Quarantäne-Markierung startet deshalb erst nach Rückfrage.
+    private func confirmDownloaded(_ url: URL) -> Bool {
+        guard let quarantine = (try? url.resourceValues(forKeys: [.quarantinePropertiesKey]))?.quarantineProperties else {
+            return true
+        }
+        let source = (quarantine[kLSQuarantineOriginURLKey as String] as? URL)?.host
+            ?? (quarantine[kLSQuarantineDataURLKey as String] as? URL)?.host
+            ?? quarantine[kLSQuarantineAgentNameKey as String] as? String
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "„\(url.lastPathComponent)“ stammt aus dem Internet. Trotzdem starten?"
+        alert.informativeText = (source.map { "Geladen von: \($0)\n\n" } ?? "")
+            + "Windows-Programme laufen in Virtual mit deinen Rechten und können auf deine Mac-Dateien zugreifen. Starte nur Programme aus einer Quelle, der du vertraust."
+        alert.addButton(withTitle: "Abbrechen")
+        alert.addButton(withTitle: "Starten")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
 
     /// Fragt nach dem Raum, wenn mehrere in Frage kommen.
     func chooseRoom(_ rooms: [Room], message: String) -> Room? {
