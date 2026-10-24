@@ -109,6 +109,7 @@ if ! tr -d '\r' <"$cursor_query" | grep -Fxiq 'HKEY_CURRENT_USER\Control Panel\C
 REGEDIT4
 
 [HKEY_CURRENT_USER\Control Panel\Cursors]
+@="Windows Default"
 "Scheme Source"=dword:00000000
 "AppStarting"=""
 "Arrow"=""
@@ -118,6 +119,8 @@ REGEDIT4
 "IBeam"=""
 "No"=""
 "NWPen"=""
+"Person"=""
+"Pin"=""
 "SizeAll"=""
 "SizeNESW"=""
 "SizeNS"=""
@@ -130,6 +133,12 @@ REG
     cursor_status=$?
     rm -f "$cursor_reg" "$cursor_reg.log"
     [ "$cursor_status" = 0 ] || fail "Windows-Standardcursor konnten nicht eingerichtet werden."
+elif "$BIN/virtual" reg query 'HKCU\Control Panel\Cursors' /ve 2>/dev/null \
+        | grep -Eq 'REG_SZ[[:space:]]+\(value not set\)|REG_SZ[[:space:]]*$'; then
+    # Schlüssel vorhanden, aber ohne Standardwert (ältere Prefixe). Echtes Windows
+    # hat dort immer einen. Nur den Standardwert setzen; eigene Cursorpfade bleiben.
+    "$BIN/virtual" reg add 'HKCU\Control Panel\Cursors' /ve /d "Windows Default" /f >/dev/null 2>&1 \
+        || fail "Windows-Standardcursor konnten nicht eingerichtet werden."
 fi
 
 rm -f "$cursor_query"
