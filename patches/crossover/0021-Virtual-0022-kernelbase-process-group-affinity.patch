@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:48:51 +0100
+Subject: [PATCH] Virtual 0022: kernelbase-process-group-affinity
+
+GetProcessGroupAffinity was a stub that failed without setting the count.
+Windows always reports at least group 0; Wine runs every process there.
+Callers that trust the count (Qt 6 apps such as KeePassXC) read garbage.
+---
+ dlls/kernelbase/process.c | 24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index 867964e9..f4a26451 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -883,9 +883,27 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetPriorityClass( HANDLE process )
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH GetProcessGroupAffinity( HANDLE process, USHORT *count, USHORT *array )
+ {
+-    FIXME( "(%p,%p,%p): stub\n", process, count, array );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    PROCESS_BASIC_INFORMATION info;
++
++    TRACE( "(%p,%p,%p)\n", process, count, array );
++
++    if (!count)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!set_ntstatus( NtQueryInformationProcess( process, ProcessBasicInformation, &info, sizeof(info), NULL )))
++        return FALSE;
++    /* All processes run in processor group 0. */
++    if (*count < 1 || !array)
++    {
++        *count = 1;
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    *count = 1;
++    array[0] = 0;
++    return TRUE;
+ }
+ 
+ 

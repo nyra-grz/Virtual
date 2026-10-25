@@ -28,6 +28,7 @@ cannot silently ship without a required compatibility fix.
 | `0019-macdrv-dxmt-bridge.patch` | Exports the dispatch table DXMT v0.80 expects from the Mac driver (adapted to Wine 11) and gives windows a client view on demand: DirectX 10/11 via DXMT → Metal, enabled per room by `setup-graphics.sh --dxmt` (DXVK stays the default) with `winemetal` from `scripts/install-dxmt-runtime.sh` |
 | `0020-services-object-security.patch` | `QueryServiceObjectSecurity`/`SetServiceObjectSecurity` store and return a service's descriptor (Windows default DACL otherwise) instead of stubs; Epic Games' updater service works |
 | `0021-winegstreamer-fixed-caps.patch` | Media formats are only converted from fixed GStreamer caps; incomplete types stay unknown while Media Foundation negotiates instead of failing |
+| `0022` (in `crossover/`) | `GetProcessGroupAffinity` reports processor group 0 like Windows instead of failing as a stub without setting the count; Qt 6 apps such as KeePassXC crashed on the garbage |
 
 They are applied in this order on top of `WINE_TAG` (wine-11.0). Details, limits and
 tests: `winrt/README.md`.
