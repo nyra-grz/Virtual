@@ -327,6 +327,7 @@ def main():
     ap.add_argument("--winlist", default=str(ROOT / "build" / "winlist"))
     ap.add_argument("--install-timeout", type=positive_int, default=420)
     ap.add_argument("--launch-wait", type=positive_int, default=60, help="Sekunden bis zur Prüfung; Launcher mit kleinem Startfenster bekommen bis zum Dreifachen")
+    ap.add_argument("--keep-rooms", action="store_true", help="auch Räume laufender Apps behalten (sonst nur gescheiterte)")
     ap.add_argument("--guest-windows", action="store_true", help="Only query windows inside the isolated Wine instance; no macOS window capture")
     args = ap.parse_args()
     apps = list(args.apps)
@@ -533,6 +534,10 @@ def main():
             test_app(res["app"], res)
         except Exception as e:  # ein kaputter Fall soll den Lauf nicht beenden
             res["status"] = res["result"] = f"Testfehler: {e}"
+        # Installierte Apps brauchen viel Platz; nur gescheiterte Räume bleiben zur Fehlersuche.
+        room = out / "rooms" / res["app"] / "prefix"
+        if res.get("status") == "läuft" and not args.keep_rooms and room.exists():
+            shutil.rmtree(room, ignore_errors=True)
         write_results(out / "results.json", results, results_lock, (index, res))
         print(f"    {res['app']}: {res.get('status') or res.get('result')}", flush=True)
 
