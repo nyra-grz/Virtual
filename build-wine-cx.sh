@@ -5,8 +5,8 @@
 # CrossOver app or license key.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-VERSION=26.1.0
-SHA=e4ec87d5821a009dd1f1d2e36ffe2e24b8fcbae9516375ea42f95a16928ab8fa
+VERSION=26.3.0
+SHA=ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872
 URL="https://media.codeweavers.com/pub/crossover/source/crossover-sources-$VERSION.tar.gz"
 CACHE="$ROOT/thirdparty/crossover"
 PKG="$CACHE/crossover-sources-$VERSION.tar.gz"

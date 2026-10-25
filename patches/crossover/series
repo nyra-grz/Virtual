@@ -14,13 +14,12 @@
 0012-Virtual-0018-macdrv-keyboard-locale-upstream.patch
 0013-Virtual-0020-services-object-security.patch
 0014-Virtual-0021-winegstreamer-fixed-caps.patch
-0015-winebus.sys-Pass-INOTIFY_CFLAGS-libinotify-outside-t.patch
-0016-advapi32-shell32-Report-the-real-Windows-user-name.patch
+0015-advapi32-shell32-Report-the-real-Windows-user-name.patch
 
 # frozen: WinRT networking/devices for Safe Exam Browser. Carried along
 # mechanically on rebases; dropped (with their smoke probes) if they conflict.
-0017-Virtual-0003-hostname-implement.patch
-0018-Virtual-0004-connectivity-implement.patch
-0019-Virtual-0005-enumeration-upstream-fixes.patch
-0020-Virtual-0006-devices-implement.patch
-0021-Virtual-0014-wlanapi-wifi.patch
+0016-Virtual-0003-hostname-implement.patch
+0017-Virtual-0004-connectivity-implement.patch
+0018-Virtual-0005-enumeration-upstream-fixes.patch
+0019-Virtual-0006-devices-implement.patch
+0020-Virtual-0014-wlanapi-wifi.patch

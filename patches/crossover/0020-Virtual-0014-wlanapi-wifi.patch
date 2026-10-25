@@ -2044,10 +2044,10 @@ index 45d83c80..d713bc1d 100644
 +# Wine extension for Windows.Devices.WiFi
 +@ stdcall -private __wine_wlan_query(ptr long)
 diff --git a/include/Makefile.in b/include/Makefile.in
-index e0987cea..648fcf6b 100644
+index 516c03f3..ceba28e5 100644
 --- a/include/Makefile.in
 +++ b/include/Makefile.in
-@@ -887,6 +887,7 @@ SOURCES = \
+@@ -888,6 +888,7 @@ SOURCES = \
  	windows.devices.power.idl \
  	windows.devices.radios.idl \
  	windows.devices.usb.idl \
@@ -2055,7 +2055,7 @@ index e0987cea..648fcf6b 100644
  	windows.foundation.collections.idl \
  	windows.foundation.idl \
  	windows.foundation.metadata.idl \
-@@ -996,6 +997,7 @@ SOURCES = \
+@@ -997,6 +998,7 @@ SOURCES = \
  	wine/vulkan.h \
  	wine/vulkan_driver.h \
  	wine/wgl.h \
