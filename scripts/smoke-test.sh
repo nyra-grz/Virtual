@@ -460,6 +460,15 @@ for probe in keyboard change; do
         show_log "$probe.err"
     fi
 done
+# Echtes Rendern mit D3D9 und D3D11 (Shader per D3DCompile) samt Rücklesen des Bildes.
+if x86_64-w64-mingw32-gcc "$ROOT/winrt/tests/d3d.c" -o d3d.exe -ld3d9 -ld3d11 -ld3dcompiler -luser32 >compile-d3d.log 2>&1 &&
+   "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/d3d.exe" >d3d.out 2>d3d.err; then
+    report ok "Integration: Direct3D 9/11 rendern" "$(tr -d '\r' <d3d.out | tail -1)"
+else
+    report FEHLER "Integration: Direct3D 9/11 rendern"
+    show_log compile-d3d.log
+    show_log d3d.out
+fi
 # Windows-System-ICU (icu.dll + Weiterleitungen), 64 und 32 Bit; der Test ist mit -licu
 # gelinkt und startet ohne icu.dll gar nicht.
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
