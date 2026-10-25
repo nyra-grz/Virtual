@@ -454,7 +454,7 @@ for probe in projection network devices wifi; do
 done
 # Upstream integration regressions: activate the native Mac layout, observe an
 # actual async file notification, and decode an H.264 frame through Media Foundation.
-for probe in keyboard change; do
+for probe in keyboard change sync; do
     if x86_64-w64-mingw32-gcc "$ROOT/winrt/tests/$probe.c" -o "$probe.exe" -luser32 >"compile-$probe.log" 2>&1 &&
        "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/$probe.exe" >"$probe.out" 2>"$probe.err"; then
         report ok "Integration: $probe" "$(tr -d '\r' <"$probe.out" | tail -1)"

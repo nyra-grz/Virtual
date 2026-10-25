@@ -1,6 +1,6 @@
 # Generated runtime & user data — never committed, never deployed
 /runtime/
-/runtime-cx/
+/runtime-*/
 *.dxvk-cache
 /prefix/
 /logs/

@@ -18,6 +18,10 @@ export WINEPREFIX="${WINEPREFIX:-$HOME/WinMac_Virtual/prefix}"
 # Keep the existing Wine identity and profile paths when upgrading Virtual rooms.
 export CX_REPORT_REAL_USERNAME=1
 export WINEDEBUG="${WINEDEBUG:-fixme-all}"
+# CrossOver's msync: Windows sync objects over Mach semaphores instead of a wineserver
+# round trip (winrt/tests/sync.c: mutex/semaphore ~23x, thread ping-pong ~3x faster).
+# Off for a room or test with WINEMSYNC=0.
+export WINEMSYNC="${WINEMSYNC:-1}"
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES-}"
 export DXVK_ASYNC="${DXVK_ASYNC:-1}" DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
 if [ -f "$WINEPREFIX/.virtual/graphics-env.sh" ]; then
