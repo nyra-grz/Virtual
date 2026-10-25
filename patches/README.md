@@ -27,9 +27,20 @@ cannot silently ship without a required compatibility fix.
 | `0018-macdrv-keyboard-locale-upstream.patch` | Upstream Wine fix (3b1ab640): keyboard layouts keep the current user locale, so activating a layout no longer fails with "Changing user locale is not supported"; layout comparison parenthesized |
 | `0019-macdrv-dxmt-bridge.patch` | Exports the dispatch table DXMT v0.80 expects from the Mac driver (adapted to Wine 11) and gives windows a client view on demand: DirectX 10/11 via DXMT → Metal, enabled per room by `setup-graphics.sh --dxmt` (DXVK stays the default) with `winemetal` from `scripts/install-dxmt-runtime.sh` |
 | `0020-services-object-security.patch` | `QueryServiceObjectSecurity`/`SetServiceObjectSecurity` store and return a service's descriptor (Windows default DACL otherwise) instead of stubs; Epic Games' updater service works |
+| `0021-winegstreamer-fixed-caps.patch` | Media formats are only converted from fixed GStreamer caps; incomplete types stay unknown while Media Foundation negotiates instead of failing |
 
 They are applied in this order on top of `WINE_TAG` (wine-11.0). Details, limits and
 tests: `winrt/README.md`.
+
+## CrossOver base (the runtime that ships)
+
+Since 0.7.0 the runtime is built from CodeWeavers' open-source CrossOver sources
+(Wine 11.0 plus their Mac work: msync, D3DMetal/DXMT bridge, controller support)
+instead of plain Wine 11.0. `build-wine-cx.sh` downloads the source archive, checks
+its SHA-256 and applies `crossover/0001-virtual-compatibility.patch`, which is the
+patch series above ported onto that base (0019 is replaced by CrossOver's own
+Mac-driver bridge) plus two CrossOver-specific changes: the real Windows user name
+instead of CrossOver's fixed "crossover", and libinotify flags for winebus.
 
 ## Renaming: what actually happens (honestly)
 

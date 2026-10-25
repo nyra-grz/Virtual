@@ -16,6 +16,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.mainController.window?.makeKeyAndOrderFront(nil)
         }
         RoomWatcher.shared.start()
+        let logs = Settings.shared.logsPath
+        DispatchQueue.global(qos: .utility).async { Settings.pruneLogs(in: logs, olderThan: 14) }
         _ = OverlayController.shared   // Tastenkombination für Kiosk-Apps, solange Programme laufen
         let urls = pendingURLs
         pendingURLs.removeAll()

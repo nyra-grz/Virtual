@@ -161,6 +161,22 @@ final class ImportAndLaunchTests: XCTestCase {
         XCTAssertEqual(apps.first?.path, exe.path)
     }
 
+    func testOnlyOldProgramLogsArePruned() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("logs \(UUID())")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let old = folder.appendingPathComponent("Steam-old.log"), fresh = folder.appendingPathComponent("Steam-new.log")
+        let report = folder.appendingPathComponent("compat-run/report.log")
+        for file in [old, fresh, report] { try write("log", to: file) }
+        let past = Date().addingTimeInterval(-20 * 86_400)
+        for file in [old, report.deletingLastPathComponent(), report] {
+            try FileManager.default.setAttributes([.modificationDate: past], ofItemAtPath: file.path)
+        }
+        Settings.pruneLogs(in: folder, olderThan: 14)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: report.path))
+    }
+
     func testSquirrelInstallationIsFoundThroughItsUninstallEntry() throws {
         let room = room()
         let base = room.driveC.appendingPathComponent("users/Test/AppData/Local/Discord")

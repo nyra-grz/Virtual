@@ -69,6 +69,20 @@ final class Settings {
 
     var logsPath: URL { root.appendingPathComponent("logs") }
 
+    /// Löscht Programm-Protokolle (*.log direkt im Ordner), die älter als `days` Tage sind.
+    /// Unterordner wie Testberichte bleiben unberührt.
+    static func pruneLogs(in folder: URL, olderThan days: Int) {
+        let fm = FileManager.default
+        let limit = Date().addingTimeInterval(-Double(days) * 86_400)
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
+        guard let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys) else { return }
+        for file in files where file.pathExtension.lowercased() == "log" {
+            guard let values = try? file.resourceValues(forKeys: Set(keys)), values.isRegularFile == true,
+                  let date = values.contentModificationDate, date < limit else { continue }
+            try? fm.removeItem(at: file)
+        }
+    }
+
     /// Vorgegebene Windows-Version (für Erststart-Einrichtung).
     var windowsVersion: String {
         get { defaults.string(forKey: Key.windowsVersion) ?? "win10" }

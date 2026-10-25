@@ -54,6 +54,11 @@ Microsoft .NET Framework 4.8 remains available in the room's Windows tools for
 applications that need it instead of Wine Mono. Wine still cannot run every app.
 On Apple Silicon, the x64 Wine engine also requires Rosetta 2.
 
+**First start (Gatekeeper):** Virtual is free and only ad-hoc signed, without a
+paid Apple Developer ID, so macOS blocks it the first time. Open it once, then go
+to System Settings → Privacy & Security and click **Open Anyway**. Alternatively,
+in Terminal: `xattr -dr com.apple.quarantine /Applications/Virtual.app`.
+
 For development, the source checkout is expected at `~/WinMac_Virtual`:
 
 ```bash
@@ -301,9 +306,12 @@ uv run scripts/compat-test.py                      # default list of popular app
 uv run scripts/compat-test.py Mozilla.Firefox 7zip.7zip --out logs/compat-x
 ```
 Downloads installers from the public winget manifests (checksums verified), installs
-each app silently in its own clone of a freshly set up room, starts it and records
-whether a window appears or it crashes, with a screenshot per window
-(`report.md`, `results.json`). The apps' windows briefly appear on screen.
+each app silently in its own clone of a freshly set up room and starts it, using the
+engine inside `build/Virtual.app` (what ships) unless `--engine` says otherwise.
+An app only counts as running when its main window is still open after 60 s (small
+splash/updater windows get up to three times as long), is not an error dialog and is
+not a single-coloured (blank) window. `report.md`/`results.json` also list DLLs that
+are really missing. The apps' windows briefly appear on screen.
 
 ## Limits (honest, not worked around)
 
