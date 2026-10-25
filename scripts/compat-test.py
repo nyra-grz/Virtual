@@ -15,6 +15,7 @@ Ohne IDs wird die Standardliste getestet. Ergebnis: ORDNER/report.md + results.j
 Die Fenster der getesteten Apps erscheinen kurz auf dem Bildschirm.
 """
 import argparse, hashlib, json, os, re, shlex, shutil, subprocess, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
@@ -93,8 +94,15 @@ def download(url, sha, dest):
     return hashlib.sha256(dest.read_bytes()).hexdigest().lower() == sha.lower()
 
 
-def windows(winlist, virtual=None, env=None):
-    """On-screen windows of Wine processes: {id: (title, w, h)}."""
+def pid_in_room(pid, room):
+    """Gehört der Prozess zu diesem Raum? Wine-Prozesse arbeiten in ihrem drive_c bzw. halten
+    Dateien darin offen (bei parallelen Tests laufen mehrere Räume gleichzeitig)."""
+    paths = run(["lsof", "-a", "-p", pid, "-d", "cwd,txt,0-64", "-Fn"]).stdout
+    return any(line[1:].startswith(str(room) + "/") for line in paths.splitlines() if line.startswith("n/"))
+
+
+def windows(winlist, virtual=None, env=None, room=None):
+    """On-screen windows of Wine processes: {id: (title, w, h)}; with room only that room's."""
     out = {}
     if virtual is not None:
         for line in run([str(virtual), str(winlist)], env=env, timeout=30).stdout.splitlines():
@@ -105,10 +113,14 @@ def windows(winlist, virtual=None, env=None):
                 except ValueError:
                     pass
         return out
+    owners = {}
     for line in run([str(winlist), "wine"]).stdout.splitlines():
         m = re.match(r"(\d+) (\d+) wine \| (.*) \| (\d+) x (\d+) (on|off)$", line)
         if m and m.group(6) == "on" and int(m.group(4)) >= 120 and int(m.group(5)) >= 80:
-            out[m.group(1)] = (m.group(3), int(m.group(4)), int(m.group(5)))
+            if room is not None and m.group(2) not in owners:
+                owners[m.group(2)] = pid_in_room(m.group(2), room)
+            if room is None or owners[m.group(2)]:
+                out[m.group(1)] = (m.group(3), int(m.group(4)), int(m.group(5)))
     return out
 
 
@@ -208,6 +220,47 @@ def missing_dlls(prefix, *logs):
     return sorted(found)
 
 
+STUB = re.compile(r"fixme:(\w+):(\w+) .*?\b(stub|not implemented|semi-stub)", re.I)
+CRASH = re.compile(r"Unhandled (page fault on \w+ access to [0-9A-Fa-f]+|exception [0-9a-fx]+) at address ([0-9A-Fa-f]+)")
+LOADED = re.compile(r'Loaded L"([^"]+)" at ([0-9A-Fa-f]+): (\w+)')
+
+
+def cause(res, *logs):
+    """Kurze Ursache für die Triage: wo es abstürzt, was fehlt, welche Wine-Stubs zuletzt
+    aufgerufen wurden. Gleiche Ursachen bei vielen Apps sind die lohnendsten Fixes."""
+    text = "\n".join(log.read_text(errors="replace") for log in logs if log.exists())
+    stubs = []
+    crash = CRASH.search(text)
+    for m in STUB.finditer(text[:crash.start()] if crash else text):
+        name = f"{m.group(1)}:{m.group(2)}"
+        if name in stubs:
+            stubs.remove(name)
+        stubs.append(name)
+    res["last_stubs"] = stubs[-6:]
+    status = res.get("status", "")
+    if crash:
+        addr = int(crash.group(2), 16)
+        mods = [(int(a, 16), n.rsplit("\\", 1)[-1], kind) for n, a, kind in LOADED.findall(text)]
+        below = [m for m in mods if m[0] <= addr]
+        where = max(below) if below else None
+        res["crash_in"] = f"{where[1]} ({where[2]}) +0x{addr - where[0]:x}" if where else crash.group(2)
+        return f"Absturz in {where[1].lower()}" if where else "Absturz (Modul unbekannt)"
+    if res.get("missing_dlls"):
+        return "fehlt: " + ", ".join(res["missing_dlls"])
+    titles = " ".join(w.get("title") or "" for w in res.get("windows", []))
+    if "gecko" in titles.lower():
+        return "braucht Wine Gecko (IE/HTML-Engine)"
+    if status == "nicht installiert":
+        return f"Installer endet mit {res.get('install_exit')}"
+    if status.startswith("Fehlerdialog"):
+        return status
+    if status == "Fenster einfarbig":
+        return "leeres Fenster (Rendering)"
+    if status in ("kein Fenster", "Fenster wieder zu", "nur Startfenster"):
+        return status + (f" nach Stub {stubs[-1]}" if stubs else "")
+    return ""
+
+
 def isolate_user_folders(prefix):
     """Keep test installers out of the host's Documents/Downloads directories."""
     users = prefix / "drive_c" / "users"
@@ -225,6 +278,8 @@ def isolate_user_folders(prefix):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("apps", nargs="*")
+    ap.add_argument("--list", help="Datei mit winget-IDs (eine pro Zeile, # leitet Kommentare ein)")
+    ap.add_argument("--jobs", type=int, default=1, help="so viele Apps gleichzeitig testen (eigene Räume)")
     ap.add_argument("--out", default=str(ROOT / "logs" / f"compat-{time.strftime('%Y%m%d-%H%M')}"))
     # Standard: die Engine im App-Bundle – genau das, was ausgeliefert wird.
     ap.add_argument("--engine", default=str(ENGINE if ENGINE.exists() else ROOT),
@@ -234,7 +289,10 @@ def main():
     ap.add_argument("--launch-wait", type=int, default=60, help="Sekunden bis zur Prüfung; Launcher mit kleinem Startfenster bekommen bis zum Dreifachen")
     ap.add_argument("--guest-windows", action="store_true", help="Only query windows inside the isolated Wine instance; no macOS window capture")
     args = ap.parse_args()
-    apps = args.apps or DEFAULT_APPS
+    apps = list(args.apps)
+    if args.list:
+        apps += [line.split("#")[0].strip() for line in Path(args.list).read_text().splitlines() if line.split("#")[0].strip()]
+    apps = list(dict.fromkeys(apps or DEFAULT_APPS))
     out = Path(args.out).resolve(); out.mkdir(parents=True, exist_ok=True)
     engine = Path(args.engine).resolve()
     runtime = engine / "runtime"; virtual = runtime / "bin" / "virtual"; server = runtime / "bin" / "virtualserver"
@@ -275,24 +333,20 @@ def main():
     base_links = {p.relative_to(base) for p in shortcuts(base)}
     base_apps = set(registered_apps(base))
 
-    results = []
-    for app in apps:
-        res = {"app": app}
-        results.append(res)
-        print(f"==> {app}", flush=True)
+    def test_app(app, res):
         try:
             version, m = manifest(app)
         except Exception as e:
             res["result"] = f"Manifest-Fehler: {e}"
-            continue
+            return
         if not m:
             res["result"] = "kein winget-Manifest"
-            continue
+            return
         res["version"] = version
         inst, kind, switches = pick_installer(m)
         if not inst:
             res["result"] = f"kein passender Installer ({kind})"
-            continue
+            return
         res["type"] = kind
         url = inst["InstallerUrl"]
         name = re.sub(r"[^A-Za-z0-9._-]", "_", url.split("?")[0].rsplit("/", 1)[-1]) or "installer"
@@ -304,17 +358,17 @@ def main():
         try:
             if not download(url, inst["InstallerSha256"], dl):
                 res["result"] = "Prüfsumme des Downloads stimmt nicht"
-                continue
+                return
         except Exception as e:
             res["result"] = f"Download-Fehler: {e}"
-            continue
+            return
 
         room = out / "rooms" / app / "prefix"
         if room.parent.exists():
             shutil.rmtree(room.parent)
         room.parent.mkdir(parents=True)
         run(["cp", "-cR", str(base), str(room)])
-        env = {**os.environ, "WINEPREFIX": str(room), "WINEDEBUG": "err+all,fixme-all",
+        env = {**os.environ, "WINEPREFIX": str(room), "WINEDEBUG": "err+all,fixme+all,+loaddll",
                "WINEDLLOVERRIDES": "winedbg.exe=d", "MVK_CONFIG_LOG_LEVEL": "0"}
         log = out / "rooms" / app / "install.log"
         if kind in ("msi", "wix"):
@@ -349,10 +403,11 @@ def main():
             res["status"] = "nicht installiert"
             res["result"] = "installiert? keine Verknüpfung, kein Uninstall-Eintrag"
             res["missing_dlls"] = missing_dlls(room, log)
-            continue
+            res["cause"] = cause(res, log)
+            return
         res["shortcut"] = target.stem
         guest = virtual if args.guest_windows else None
-        before = windows(winlist, guest, env)
+        before = windows(winlist, guest, env, room)
         launch_log = out / "rooms" / app / "launch.log"
         with open(launch_log, "w") as f:
             launch = [str(virtual), "start", "/wait", "/unix", str(target)]
@@ -365,14 +420,14 @@ def main():
             # (Steam, Epic, GIMP …), bis zum Dreifachen auf das Hauptfenster warten.
             while time.time() - t0 < args.launch_wait * 3:
                 time.sleep(3)
-                now = {wid: info for wid, info in windows(winlist, guest, env).items() if wid not in before}
+                now = {wid: info for wid, info in windows(winlist, guest, env, room).items() if wid not in before}
                 seen.update(now)
                 if time.time() - t0 < args.launch_wait:
-                    continue
+                    return
                 if not now or max(w * h for _, w, h in now.values()) >= MAIN_WINDOW_AREA:
                     break
         # Gezählt wird, was am Ende noch offen ist – nicht, was zwischendurch kurz aufging.
-        final = {wid: info for wid, info in windows(winlist, guest, env).items() if wid not in before}
+        final = {wid: info for wid, info in windows(winlist, guest, env, room).items() if wid not in before}
         res["seconds"] = round(time.time() - t0)
         shots = []
         for wid, (title, w, h) in sorted(final.items(), key=lambda kv: -kv[1][1] * kv[1][2])[:3]:
@@ -403,20 +458,52 @@ def main():
         else:
             res["status"] = "läuft"
         res["result"] = res["status"]
+        if res["status"] != "läuft":
+            res["cause"] = cause(res, launch_log)
         run([str(server), "-k"], env=env)
         proc.kill()
         time.sleep(2)
+
+
+    results = [{"app": app} for app in apps]
+
+    def guarded(res):
+        print(f"==> {res['app']}", flush=True)
+        try:
+            test_app(res["app"], res)
+        except Exception as e:  # ein kaputter Fall soll den Lauf nicht beenden
+            res["status"] = res["result"] = f"Testfehler: {e}"
         (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
+        print(f"    {res['app']}: {res.get('status') or res.get('result')}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        list(pool.map(guarded, results))
 
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     ok = sum(1 for r in results if r.get("status") == "läuft")
     lines = [f"# Kompatibilitätstest {time.strftime('%Y-%m-%d %H:%M')}", "", f"Engine: `{engine}`", "",
              f"{ok} von {len(results)} Apps laufen (Hauptfenster nach {args.launch_wait} s noch offen, kein Fehlerdialog, nicht einfarbig).", "",
-             "| App | Version | Installer | Ergebnis | Fenster | Fehlende DLLs |", "|---|---|---|---|---|---|"]
+             "| App | Version | Installer | Ergebnis | Ursache | Fenster | Fehlende DLLs |", "|---|---|---|---|---|---|---|"]
     for r in results:
         wins = ", ".join(f"[{w['title'] or 'ohne Titel'} {w['size']}]({w['file']})" if w['file'] else f"{w['title'] or 'ohne Titel'} {w['size']}" for w in r.get("windows", []))
-        lines.append(f"| {r['app']} | {r.get('version', '')} | {r.get('type', '')} | {r.get('result', '')} | {wins} | {', '.join(r.get('missing_dlls', []))} |")
+        lines.append(f"| {r['app']} | {r.get('version', '')} | {r.get('type', '')} | {r.get('result', '')} | {r.get('cause', '')} | {wins} | {', '.join(r.get('missing_dlls', []))} |")
     (out / "report.md").write_text("\n".join(lines) + "\n")
+    # Für die Triage: Fehlschläge nach Ursache, Stubs nach Häufigkeit bei gescheiterten Apps
+    groups, stub_hits = {}, {}
+    for r in results:
+        if r.get("status") == "läuft":
+            continue
+        groups.setdefault(r.get("cause") or r.get("result") or "?", []).append(r["app"])
+        for stub in r.get("last_stubs", []):
+            stub_hits.setdefault(stub, []).append(r["app"])
+    causes = [f"# Ursachen {time.strftime('%Y-%m-%d %H:%M')}", "", f"{len(results) - ok} von {len(results)} Apps laufen nicht.", "",
+              "| Ursache | Apps | Anzahl |", "|---|---|---|"]
+    for c, names in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        causes.append(f"| {c} | {', '.join(names)} | {len(names)} |")
+    causes += ["", "## Zuletzt aufgerufene Wine-Stubs bei gescheiterten Apps", "", "| Stub | Apps | Anzahl |", "|---|---|---|"]
+    for stub, names in sorted(stub_hits.items(), key=lambda kv: -len(kv[1]))[:40]:
+        causes.append(f"| {stub} | {', '.join(names)} | {len(names)} |")
+    (out / "causes.md").write_text("\n".join(causes) + "\n")
     print(f"==> Fertig: {ok}/{len(results)} – {out / 'report.md'}")
 
 
