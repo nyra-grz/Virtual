@@ -5,6 +5,7 @@ Unlike a fixed old desktop-runtime recipe, this uses the current patch release
 in the required major/minor channel and verifies Microsoft's published SHA-512.
 https://github.com/dotnet/core/tree/main/release-notes
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 from urllib.parse import urlparse
 
 
@@ -59,16 +61,22 @@ def install(component):
             return False
         with path.open("rb") as stream:
             return hashlib.file_digest(stream, "sha512").hexdigest() == digest
-    if not verified(target):
-        temporary = target.with_suffix(".part")
-        print(f"==> Lade {framework} {release[package]['version']} ({arch}) von Microsoft…", flush=True)
-        try:
-            curl(asset["url"], temporary)
-            if not verified(temporary):
-                raise RuntimeError(".NET-Download hat eine falsche Prüfsumme")
-            temporary.replace(target)
-        finally:
-            temporary.unlink(missing_ok=True)
+    # Rooms are set up in parallel but share this cache: one download per file under
+    # a lock, into a temporary file of its own, renamed only after the checksum.
+    with open(cache / (target.name + ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not verified(target):
+            handle, name = tempfile.mkstemp(prefix=target.name + ".", suffix=".part", dir=cache)
+            os.close(handle)
+            temporary = Path(name)
+            print(f"==> Lade {framework} {release[package]['version']} ({arch}) von Microsoft…", flush=True)
+            try:
+                curl(asset["url"], temporary)
+                if not verified(temporary):
+                    raise RuntimeError(".NET-Download hat eine falsche Prüfsumme")
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
     runtime = Path(os.environ["WINMAC_RUNTIME"])
     result = subprocess.run([str(runtime / "bin/virtual"), str(target), "/install", "/quiet", "/norestart"], timeout=900)
     if result.returncode not in (0, 105, 194):

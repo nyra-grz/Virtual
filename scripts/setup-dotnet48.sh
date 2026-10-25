@@ -57,13 +57,32 @@ ensure_reg() { # $1 Schlüssel, $2 Name, $3 Wert, [$4 Typ] – nur setzen, wenn 
     return 0
 }
 
+checksum_ok() { [ -f "$1" ] && [ "$(shasum -a 256 "$1" | cut -d' ' -f1)" = "$2" ]; }
+download() { # $1 Ziel, $2 URL, $3 SHA-256 – eigene Temporärdatei, erst geprüft umbenannt
+    local part status=1
+    checksum_ok "$1" "$3" && return 0
+    echo "    lade ${1##*/}…"
+    part="$(mktemp "$1.XXXXXX")" || return 1
+    if ! curl -fL --retry 3 --connect-timeout 20 -o "$part" "$2"; then
+        :
+    elif ! checksum_ok "$part" "$3"; then
+        echo "    Prüfsumme falsch: ${1##*/}"
+    else
+        mv -f "$part" "$1" && status=0
+    fi
+    rm -f "$part"
+    return "$status"
+}
+export -f checksum_ok download
 fetch() { # $1 URL, $2 SHA-256, $3 Dateiname
     local file="$CACHE/$3"
-    if [ -f "$file" ] && [ "$(shasum -a 256 "$file" | cut -d' ' -f1)" = "$2" ]; then return 0; fi
-    echo "    lade $3…"
-    curl -fL --retry 3 --connect-timeout 20 -o "$file.part" "$1" || { rm -f "$file.part"; return 1; }
-    [ "$(shasum -a 256 "$file.part" | cut -d' ' -f1)" = "$2" ] || { rm -f "$file.part"; echo "    Prüfsumme falsch: $3"; return 1; }
-    mv "$file.part" "$file"
+    checksum_ok "$file" "$2" && return 0
+    # Räume werden parallel eingerichtet, der Cache ist gemeinsam: pro Datei sperren.
+    if [ -x /usr/bin/lockf ]; then
+        /usr/bin/lockf -k "$file.lock" /bin/bash -c 'download "$@"' download "$file" "$1" "$2"
+    else
+        download "$file" "$1" "$2"
+    fi
 }
 
 # Der NGen-Arbeitsprozess (mscorsvw) dreht unter Wine endlos mit voller CPU und hält den
