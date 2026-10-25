@@ -241,10 +241,18 @@ final class Launcher {
                                         userInfo: ["programID": id, "title": title, "message": error.localizedDescription])
     }
 
-    private func reportExit(_ status: Int32, id: UUID, title: String) {
+    /// Die eigentliche .exe hinter einem Programm (bei Verknüpfungen deren Ziel).
+    private static func executableURL(_ program: Program) -> URL? {
+        let url = URL(fileURLWithPath: program.path)
+        guard url.pathExtension.lowercased() == "lnk" else { return url }
+        return WindowsIcon.shortcutTarget(url).flatMap { WindowsIcon.unixPath($0, in: program.room) }
+    }
+
+    private func reportExit(_ status: Int32, id: UUID, title: String, program: Program? = nil) {
         let log = recentLogs[id]
         let text = log.map(Self.logTail) ?? ""
-        let detail = LaunchDiagnostics.message(status: status, output: text)
+        let detail = LaunchDiagnostics.message(status: status, output: text,
+                                               antiCheat: program.flatMap(Self.executableURL).flatMap(LaunchDiagnostics.kernelAntiCheat))
         reportFailure(PrefixSetup.SetupError(detail + (log.map { "\n\nProtokoll: \($0.path)" } ?? "")), id: id, title: title)
     }
 
@@ -254,7 +262,7 @@ final class Launcher {
             !FileManager.default.fileExists(atPath: program.room.prefixURL.appendingPathComponent(".virtual/components/\($0)").path)
         }
         guard !missing.isEmpty, repaired.insert(program.id).inserted else {
-            reportExit(status, id: program.id, title: program.name)
+            reportExit(status, id: program.id, title: program.name, program: program)
             return
         }
         preparing[program.id] = program

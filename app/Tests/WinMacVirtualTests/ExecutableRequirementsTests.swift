@@ -90,4 +90,22 @@ final class ExecutableRequirementsTests: XCTestCase {
         XCTAssertEqual(LaunchDiagnostics.missingComponents(output: output), ["vcrun2026"])
         XCTAssertEqual(LaunchDiagnostics.missingComponents(output: "Please install VCRUNTIME140.dll"), [])
     }
+
+    func testMissingForwardTargetIsNamed() {
+        let output = "0124:err:module:find_forwarded_export function not found for forward 'icu.ucnv_open' used by L\"C:\\\\Program Files\\\\Audacity\\\\icuuc.dll\". If you are using builtin L\"icuuc.dll\", try using the native one instead."
+        XCTAssertTrue(LaunchDiagnostics.message(status: 1, output: output).contains("icu.dll"))
+    }
+
+    func testKernelAntiCheatIsFoundInTheGameFolder() throws {
+        let game = directory.appendingPathComponent("Game")
+        let exe = game.appendingPathComponent("Binaries/Win64/Game-Win64-Shipping.exe")
+        try FileManager.default.createDirectory(at: exe.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: exe)
+        XCTAssertNil(LaunchDiagnostics.kernelAntiCheat(near: exe))
+        let setup = game.appendingPathComponent("EasyAntiCheat/EasyAntiCheat_EOS_Setup.exe")
+        try FileManager.default.createDirectory(at: setup.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: setup)
+        XCTAssertEqual(LaunchDiagnostics.kernelAntiCheat(near: exe), "Easy Anti-Cheat")
+        XCTAssertTrue(LaunchDiagnostics.message(status: 1, output: "", antiCheat: "Easy Anti-Cheat").contains("Kerneltreiber"))
+    }
 }

@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    # Only the launcher and the scripts are checked here; the Wine runtime is built
+    # and tested locally (it needs Rosetta and takes far longer than a CI run).
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts parse
+        run: for f in *.sh scripts/*.sh; do bash -n "$f" || exit 1; done
+      - name: Python scripts compile
+        run: python3 -m py_compile scripts/*.py winrt/sspi/*.py
+      - name: Launcher tests
+        working-directory: app
+        run: swift test
