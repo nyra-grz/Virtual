@@ -69,10 +69,16 @@ enum AppScanner {
             func finish() {
                 let appPath = section.contains("\\currentversion\\app paths\\")
                 let uninstall = section.contains("\\currentversion\\uninstall\\")
-                guard appPath || uninstall, var path = appPath ? values[""] : values["displayicon"] else { return }
-                path = path.trimmingCharacters(in: .whitespaces)
+                guard appPath || uninstall else { return }
+                var path = ((appPath ? values[""] : values["displayicon"]) ?? "").trimmingCharacters(in: .whitespaces)
                 if path.hasPrefix("\""), let end = path.dropFirst().firstIndex(of: "\"") { path = String(path[path.index(after: path.startIndex)..<end]) }
                 else if let suffix = path.range(of: #",-?\d+$"#, options: .regularExpression) { path.removeSubrange(suffix) }
+                // Squirrel (Discord, Slack …) registers an .ico as DisplayIcon; its launcher
+                // stubs sit next to Update.exe in InstallLocation.
+                if uninstall, !path.lowercased().hasSuffix(".exe"), let location = values["installlocation"],
+                   let stub = launcherStub(in: location, named: values["displayname"] ?? "", room: room) {
+                    path = stub
+                }
                 guard path.lowercased().hasSuffix(".exe"), let url = WindowsIcon.unixPath(path, in: room),
                       FileManager.default.fileExists(atPath: url.path),
                       !url.path.lowercased().hasPrefix(room.driveC.appendingPathComponent("windows").path.lowercased() + "/") else { return }
@@ -102,6 +108,24 @@ enum AppScanner {
             finish()
         }
         return found
+    }
+
+    /// Squirrel-Starter im Installationsordner: die .exe neben Update.exe, deren Name zum
+    /// Anzeigenamen passt („GitHub Desktop“ → GitHubDesktop.exe), sonst die einzige.
+    private static func launcherStub(in location: String, named displayName: String, room: Room) -> String? {
+        guard let directory = WindowsIcon.unixPath(location, in: room),
+              let files = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return nil }
+        let lower = Set(files.map { $0.lowercased() })
+        guard lower.contains("update.exe") else { return nil }
+        let stubs = files.filter {
+            let name = $0.lowercased()
+            return name.hasSuffix(".exe") && !["update.exe", "squirrel.exe"].contains(name)
+                && !isAuxiliaryName(String($0.dropLast(4)))
+        }
+        func key(_ s: String) -> String { String(s.lowercased().filter { $0.isLetter || $0.isNumber }) }
+        let match = stubs.first { key(String($0.dropLast(4))) == key(displayName) } ?? (stubs.count == 1 ? stubs[0] : nil)
+        guard let match else { return nil }
+        return location.trimmingCharacters(in: CharacterSet(charactersIn: "\\ ")) + "\\" + match
     }
 
     /// Sucht neu und meldet gefundene Programme (z. B. nach einer Installation).

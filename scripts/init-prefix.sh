@@ -99,6 +99,13 @@ done
 # Programme selbst über die Verknüpfungen im Raum.
 "$BIN/virtual" reg add 'HKCU\Software\Wine\DllOverrides' /v winemenubuilder.exe /t REG_SZ /d "" /f >/dev/null 2>&1 ||
     echo "    winemenubuilder konnte nicht abgeschaltet werden."
+# Infobereich-Zustand wie unter Windows (leere Liste). Ältere Squirrel-Installer
+# (Discord, Slack …) lesen IconStreams ohne Null-Prüfung und brechen sonst ab.
+TRAY='HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify'
+if ! "$BIN/virtual" reg query "$TRAY" /v IconStreams >/dev/null 2>&1; then
+    "$BIN/virtual" reg add "$TRAY" /v IconStreams /t REG_BINARY /d 1400000007000000010001000000000014000000 /f >/dev/null 2>&1 ||
+        echo "    TrayNotify konnte nicht angelegt werden."
+fi
 
 echo "==> Setze Version und Fingerprint-Registry (Windows 10 Pro / Build 19045)…"
 EXPECTED=()   # "Schlüssel|name Typ Wert", so wie reg query es (normalisiert) ausgibt

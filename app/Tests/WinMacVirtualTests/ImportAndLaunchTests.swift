@@ -161,6 +161,47 @@ final class ImportAndLaunchTests: XCTestCase {
         XCTAssertEqual(apps.first?.path, exe.path)
     }
 
+    func testSquirrelInstallationIsFoundThroughItsUninstallEntry() throws {
+        let room = room()
+        let base = room.driveC.appendingPathComponent("users/Test/AppData/Local/Discord")
+        let exe = base.appendingPathComponent("Discord.exe")
+        try write("stub", to: exe)
+        try write("icon", to: base.appendingPathComponent("app.ico"))
+        try write("updater", to: base.appendingPathComponent("Update.exe"))
+        func encoded(_ s: String) throws -> String { String(decoding: try JSONEncoder().encode(s), as: UTF8.self) }
+        let reg = """
+        [Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\Discord]
+        "DisplayIcon"=\(try encoded("C:\\users\\Test\\AppData\\Local\\Discord\\app.ico"))
+        "DisplayName"="Discord"
+        "InstallLocation"=\(try encoded("C:\\users\\Test\\AppData\\Local\\Discord"))
+        "UninstallString"=\(try encoded("C:\\users\\Test\\AppData\\Local\\Discord\\Update.exe --uninstall"))
+
+        """
+        try write(reg, to: room.prefixURL.appendingPathComponent("user.reg"))
+        let apps = AppScanner.scan(room)
+        XCTAssertEqual(apps.map(\.name), ["Discord"])
+        XCTAssertEqual(apps.first?.path, exe.path)
+    }
+
+    func testSquirrelStubIsMatchedWhenTheExeNameDiffersFromTheDisplayName() throws {
+        let room = room()
+        let base = room.driveC.appendingPathComponent("users/Test/AppData/Local/GitHubDesktop")
+        let exe = base.appendingPathComponent("GitHubDesktop.exe")
+        try write("stub", to: exe)
+        try write("updater", to: base.appendingPathComponent("Update.exe"))
+        try write("helper", to: base.appendingPathComponent("squirrel.exe"))
+        func encoded(_ s: String) throws -> String { String(decoding: try JSONEncoder().encode(s), as: UTF8.self) }
+        let reg = """
+        [Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\GitHubDesktop]
+        "DisplayIcon"=\(try encoded("C:\\users\\Test\\AppData\\Local\\GitHubDesktop\\app.ico"))
+        "DisplayName"="GitHub Desktop"
+        "InstallLocation"=\(try encoded("C:\\users\\Test\\AppData\\Local\\GitHubDesktop"))
+
+        """
+        try write(reg, to: room.prefixURL.appendingPathComponent("user.reg"))
+        XCTAssertEqual(AppScanner.scan(room).first?.path, exe.path)
+    }
+
     func testDetectedSamePathCanBelongToDifferentRooms() throws {
         let a = room(), b = room()
         let found = [(name: "Shared shortcut", path: root.appendingPathComponent("shared.lnk").path)]

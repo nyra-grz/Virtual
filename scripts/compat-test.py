@@ -27,8 +27,13 @@ DEFAULT_APPS = [
     "GIMP.GIMP.3", "KeePassXCTeam.KeePassXC", "TheDocumentFoundation.LibreOffice",
     "OBSProject.OBSStudio", "GOG.Galaxy", "ElectronicArts.EADesktop", "Ubisoft.Connect",
     "Python.Python.3.13", "Git.Git", "Zoom.Zoom", "Obsidian.Obsidian", "Spotify.Spotify",
-    "qBittorrent.qBittorrent", "FileZilla.FileZilla", "Blizzard.BattleNet",
+    "qBittorrent.qBittorrent", "TimKosse.FileZilla.Client", "Blizzard.BattleNet",
 ]
+ENGINE = ROOT / "build" / "Virtual.app" / "Contents" / "Resources" / "Engine"
+# Fehlerdialoge zählen nicht als „läuft“; kleine Fenster sind meist Start-/Update-Fenster.
+ERROR_TITLE = re.compile(r"\b(error|fehler|exception|not found|nicht gefunden|winedbg|crash|failed|fatal)\b", re.I)
+MAIN_WINDOW_AREA = 640 * 400
+MISSING_DLL = re.compile(r"import_dll Library (\S+)|find_forwarded_export .*?forward '([^']+)'")
 SILENT = {
     "nullsoft": ["/S"],
     "inno": ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"],
@@ -119,6 +124,90 @@ def shortcuts(prefix):
     return found
 
 
+def unix_path(prefix, win):
+    win = win.strip().strip('"')
+    if len(win) < 3 or win[1:3] != ":\\":
+        return None
+    return prefix / f"drive_{win[0].lower()}" / win[3:].replace("\\", "/")
+
+
+def registered_apps(prefix):
+    """Startprogramme aus Uninstall-Einträgen (wie AppScanner in der App): {Name: Pfad}."""
+    found = {}
+    for file in ("system.reg", "user.reg"):
+        path = prefix / file
+        if not path.exists():
+            continue
+        section, values = "", {}
+
+        def finish():
+            if "\\currentversion\\uninstall\\" not in section:
+                return
+            icon = re.sub(r",-?\d+$", "", values.get("displayicon", "").strip().strip('"'))
+            exe = unix_path(prefix, icon) if icon.lower().endswith(".exe") else None
+            location = unix_path(prefix, values.get("installlocation", ""))
+            if exe is None and location and (location / "Update.exe").exists():
+                # Squirrel: Starter neben Update.exe, Name passend zum Anzeigenamen
+                key = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+                stubs = [p for p in location.glob("*.exe") if p.name.lower() not in ("update.exe", "squirrel.exe")]
+                exe = next((p for p in stubs if key(p.stem) == key(values.get("displayname", ""))),
+                           stubs[0] if len(stubs) == 1 else None)
+            if exe and exe.exists() and not NOT_MAIN.search(exe.stem):
+                found[values.get("displayname") or exe.stem] = exe
+
+        for raw in path.read_text(errors="replace").splitlines():
+            line = raw.strip()
+            if line.startswith("[") and "]" in line:
+                finish()
+                section, values = line[1:line.index("]")].replace("\\\\", "\\").lower(), {}
+            elif line.startswith('"') and '"="' in line:
+                name, _, value = line.partition("=")
+                try:
+                    values[json.loads(name).lower()] = json.loads(value)
+                except ValueError:
+                    pass
+        finish()
+    return found
+
+
+def uniform(png):
+    """True, wenn der Fensterinhalt praktisch einfarbig ist (schwarzes/weißes Fenster)."""
+    bmp = png.with_suffix(".bmp")
+    if run(["sips", "-s", "format", "bmp", str(png), "--out", str(bmp)]).returncode or not bmp.exists():
+        return False
+    data = bmp.read_bytes()
+    bmp.unlink()
+    off = int.from_bytes(data[10:14], "little")
+    w, h = int.from_bytes(data[18:22], "little", signed=True), abs(int.from_bytes(data[22:26], "little", signed=True))
+    step = int.from_bytes(data[28:30], "little") // 8
+    row = (w * step + 3) & ~3
+    counts = {}
+    # Titelleisten oben (bzw. unten bei Bottom-up-BMPs) auslassen
+    for y in range(h // 8, h - h // 8, 4):
+        for x in range(0, w, 4):
+            i = off + y * row + x * step
+            px = bytes(c >> 4 for c in data[i:i + 3])
+            counts[px] = counts.get(px, 0) + 1
+    total = sum(counts.values())
+    # 7-Zip mit leerer Dateiliste liegt bei 99,3 %, ein leeres Electron-Fenster bei 100 %.
+    return total > 0 and max(counts.values()) / total > 0.998
+
+
+def missing_dlls(prefix, *logs):
+    """Wirklich fehlende DLLs: nicht ladbare, die es im Raum nicht gibt (DLLs, die nur an
+    einer fehlenden Abhängigkeit scheitern, zählen nicht), und Ziele von Weiterleitungen."""
+    present = {f.lower() for _, _, files in os.walk(prefix / "drive_c") for f in files if f.lower().endswith(".dll")}
+    found = set()
+    for log in logs:
+        if log.exists():
+            for m in MISSING_DLL.finditer(log.read_text(errors="replace")):
+                if m.group(1) and m.group(1).lower() not in present:
+                    found.add(m.group(1))
+                elif m.group(2):
+                    found.add(m.group(2).split(".")[0] + ".dll (Weiterleitung)")
+    return sorted(found)
+
+
 def isolate_user_folders(prefix):
     """Keep test installers out of the host's Documents/Downloads directories."""
     users = prefix / "drive_c" / "users"
@@ -137,15 +226,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("apps", nargs="*")
     ap.add_argument("--out", default=str(ROOT / "logs" / f"compat-{time.strftime('%Y%m%d-%H%M')}"))
-    ap.add_argument("--runtime", default=str(ROOT / "runtime"))
+    # Standard: die Engine im App-Bundle – genau das, was ausgeliefert wird.
+    ap.add_argument("--engine", default=str(ENGINE if ENGINE.exists() else ROOT),
+                    help="Ordner mit runtime/ und scripts/ (App-Engine oder Projektordner)")
     ap.add_argument("--winlist", default=str(ROOT / "build" / "winlist"))
     ap.add_argument("--install-timeout", type=int, default=420)
-    ap.add_argument("--launch-wait", type=int, default=45)
+    ap.add_argument("--launch-wait", type=int, default=60, help="Sekunden bis zur Prüfung; Launcher mit kleinem Startfenster bekommen bis zum Dreifachen")
     ap.add_argument("--guest-windows", action="store_true", help="Only query windows inside the isolated Wine instance; no macOS window capture")
     args = ap.parse_args()
     apps = args.apps or DEFAULT_APPS
     out = Path(args.out).resolve(); out.mkdir(parents=True, exist_ok=True)
-    runtime = Path(args.runtime).resolve(); virtual = runtime / "bin" / "virtual"; server = runtime / "bin" / "virtualserver"
+    engine = Path(args.engine).resolve()
+    runtime = engine / "runtime"; virtual = runtime / "bin" / "virtual"; server = runtime / "bin" / "virtualserver"
+    print(f"==> Engine: {engine}", flush=True)
     cache = ROOT / "thirdparty" / "compat-cache"; cache.mkdir(parents=True, exist_ok=True)
     winlist = Path(args.winlist)
     if args.guest_windows:
@@ -170,8 +263,9 @@ def main():
     if not (base / "drive_c/windows/system32").exists():
         print("==> Lege Vorlagen-Raum an …", flush=True)
         base.parent.mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, "WINEPREFIX": str(base), "WINMAC_ROOT": str(ROOT), "WINMAC_RUNTIME": str(runtime)}
-        r = run(["bash", str(ROOT / "scripts/init-prefix.sh"), "win10"], env=env)
+        env = {**os.environ, "WINEPREFIX": str(base), "WINMAC_ROOT": str(ROOT), "WINMAC_RUNTIME": str(runtime),
+               "WINMAC_ASSETS_ROOT": str(engine)}
+        r = run(["bash", str(engine / "scripts/init-prefix.sh"), "win10"], env=env)
         (out / "base-room.log").write_text(r.stdout + r.stderr)
         if r.returncode:
             sys.exit("Vorlagen-Raum gescheitert, siehe base-room.log")
@@ -179,6 +273,7 @@ def main():
         run([str(server), "-w"], env=env)
     isolate_user_folders(base)
     base_links = {p.relative_to(base) for p in shortcuts(base)}
+    base_apps = set(registered_apps(base))
 
     results = []
     for app in apps:
@@ -245,54 +340,82 @@ def main():
         time.sleep(2)
 
         links = [p for p in shortcuts(room) if p.relative_to(room) not in base_links and not NOT_MAIN.search(p.stem)]
-        if not links:
-            res["result"] = "installiert? keine Verknüpfung gefunden"
+        registered = {k: v for k, v in registered_apps(room).items() if k not in base_apps}
+        if links:
+            target = sorted(links, key=lambda p: (len(p.parts), len(p.stem)))[0]
+        elif registered:
+            target = sorted(registered.values(), key=lambda p: len(p.parts))[0]
+        else:
+            res["status"] = "nicht installiert"
+            res["result"] = "installiert? keine Verknüpfung, kein Uninstall-Eintrag"
+            res["missing_dlls"] = missing_dlls(room, log)
             continue
-        link = sorted(links, key=lambda p: (len(p.parts), len(p.stem)))[0]
-        res["shortcut"] = link.stem
-        before = windows(winlist, virtual if args.guest_windows else None, env)
+        res["shortcut"] = target.stem
+        guest = virtual if args.guest_windows else None
+        before = windows(winlist, guest, env)
         launch_log = out / "rooms" / app / "launch.log"
         with open(launch_log, "w") as f:
-            launch = [str(virtual), "start", "/wait", "/unix", str(link)]
+            launch = [str(virtual), "start", "/wait", "/unix", str(target)]
             if runner is not None:
                 launch.insert(1, str(runner))
             proc = subprocess.Popen(launch, env=env, stdout=f, stderr=subprocess.STDOUT)
-            deadline = time.time() + args.launch_wait
+            t0 = time.time()
             seen = {}
-            while time.time() < deadline:
+            # Bis zur Prüfzeit warten; zeigt sich bis dahin nur ein kleines Start-/Update-Fenster
+            # (Steam, Epic, GIMP …), bis zum Dreifachen auf das Hauptfenster warten.
+            while time.time() - t0 < args.launch_wait * 3:
                 time.sleep(3)
-                now = windows(winlist, virtual if args.guest_windows else None, env)
-                for wid, info in now.items():
-                    if wid not in before:
-                        seen[wid] = info
-                if seen and time.time() > deadline - args.launch_wait / 2:
+                now = {wid: info for wid, info in windows(winlist, guest, env).items() if wid not in before}
+                seen.update(now)
+                if time.time() - t0 < args.launch_wait:
+                    continue
+                if not now or max(w * h for _, w, h in now.values()) >= MAIN_WINDOW_AREA:
                     break
+        # Gezählt wird, was am Ende noch offen ist – nicht, was zwischendurch kurz aufging.
+        final = {wid: info for wid, info in windows(winlist, guest, env).items() if wid not in before}
+        res["seconds"] = round(time.time() - t0)
         shots = []
-        for wid, (title, w, h) in list(seen.items())[:3]:
-            if args.guest_windows:
-                shots.append({"title": title, "size": f"{w}x{h}", "file": ""})
-                continue
-            shot = out / "rooms" / app / f"window-{wid}.png"
-            if run(["screencapture", "-x", "-o", "-l", wid, str(shot)]).returncode == 0 and shot.exists():
-                shots.append({"title": title, "size": f"{w}x{h}", "file": str(shot.relative_to(out))})
+        for wid, (title, w, h) in sorted(final.items(), key=lambda kv: -kv[1][1] * kv[1][2])[:3]:
+            entry = {"title": title, "size": f"{w}x{h}", "file": ""}
+            if not args.guest_windows:
+                shot = out / "rooms" / app / f"window-{wid}.png"
+                if run(["screencapture", "-x", "-o", "-l", wid, str(shot)]).returncode == 0 and shot.exists():
+                    entry["file"] = str(shot.relative_to(out))
+                    entry["uniform"] = uniform(shot)
+            shots.append(entry)
         text = launch_log.read_text(errors="replace")
         crashed = bool(re.search(r"Unhandled (page fault|exception)|wine: Unhandled|unhandled exception", text, re.I))
         res["windows"] = shots
         res["crash"] = crashed
-        res["result"] = "läuft (Fenster offen)" if shots and not crashed else ("Absturz" if crashed else "kein Fenster")
+        res["missing_dlls"] = missing_dlls(room, log, launch_log)
+        errors = [w["title"] for w in shots if ERROR_TITLE.search(w["title"] or "")]
+        main = shots[0] if shots else None
+        if crashed:
+            res["status"] = "Absturz"
+        elif not shots:
+            res["status"] = "Fenster wieder zu" if seen else "kein Fenster"
+        elif errors:
+            res["status"] = f"Fehlerdialog: {errors[0]}"
+        elif max(w * h for _, w, h in final.values()) < MAIN_WINDOW_AREA:
+            res["status"] = "nur Startfenster"
+        elif main.get("uniform"):
+            res["status"] = "Fenster einfarbig"
+        else:
+            res["status"] = "läuft"
+        res["result"] = res["status"]
         run([str(server), "-k"], env=env)
         proc.kill()
         time.sleep(2)
         (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
 
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
-    ok = sum(1 for r in results if r.get("result", "").startswith("läuft"))
-    lines = [f"# Kompatibilitätstest {time.strftime('%Y-%m-%d %H:%M')}", "",
-             f"{ok} von {len(results)} Apps installiert und mit Fenster gestartet.", "",
-             "| App | Version | Installer | Ergebnis | Fenster |", "|---|---|---|---|---|"]
+    ok = sum(1 for r in results if r.get("status") == "läuft")
+    lines = [f"# Kompatibilitätstest {time.strftime('%Y-%m-%d %H:%M')}", "", f"Engine: `{engine}`", "",
+             f"{ok} von {len(results)} Apps laufen (Hauptfenster nach {args.launch_wait} s noch offen, kein Fehlerdialog, nicht einfarbig).", "",
+             "| App | Version | Installer | Ergebnis | Fenster | Fehlende DLLs |", "|---|---|---|---|---|---|"]
     for r in results:
-        wins = ", ".join(f"[{w['title'] or 'ohne Titel'}]({w['file']})" if w['file'] else (w['title'] or 'ohne Titel') for w in r.get("windows", []))
-        lines.append(f"| {r['app']} | {r.get('version', '')} | {r.get('type', '')} | {r.get('result', '')} | {wins} |")
+        wins = ", ".join(f"[{w['title'] or 'ohne Titel'} {w['size']}]({w['file']})" if w['file'] else f"{w['title'] or 'ohne Titel'} {w['size']}" for w in r.get("windows", []))
+        lines.append(f"| {r['app']} | {r.get('version', '')} | {r.get('type', '')} | {r.get('result', '')} | {wins} | {', '.join(r.get('missing_dlls', []))} |")
     (out / "report.md").write_text("\n".join(lines) + "\n")
     print(f"==> Fertig: {ok}/{len(results)} – {out / 'report.md'}")
 
