@@ -85,6 +85,21 @@ if [ "${#ADDED64[@]}" -gt 0 ] || [ "${#ADDED32[@]}" -gt 0 ]; then
     wait_server 30
 fi
 
+# Windows-Desktop wie bei CrossOver: eigener Ordner im Raum, der Mac-Schreibtisch nur als
+# „My Mac Desktop“ darin. Ältere Räume zeigen direkt auf ~/Desktop – dort landeten sonst
+# die .lnk-Verknüpfungen jedes Installers. Vorhandene Dateien bleiben, wo sie sind.
+for desktop in "$WINEPREFIX"/drive_c/users/*/Desktop; do
+    [ -L "$desktop" ] || continue
+    target="$(readlink "$desktop")"
+    case "$target" in "$WINEPREFIX"/*) continue ;; esac
+    rm "$desktop" && mkdir "$desktop" && ln -s "$target" "$desktop/My Mac Desktop"
+    echo "==> Desktop eigenständig: ${desktop#"$WINEPREFIX"/}"
+done
+# winemenubuilder legt Linux-.desktop-Dateien auf den Mac-Schreibtisch; Virtual findet
+# Programme selbst über die Verknüpfungen im Raum.
+"$BIN/virtual" reg add 'HKCU\Software\Wine\DllOverrides' /v winemenubuilder.exe /t REG_SZ /d "" /f >/dev/null 2>&1 ||
+    echo "    winemenubuilder konnte nicht abgeschaltet werden."
+
 echo "==> Setze Version und Fingerprint-Registry (Windows 10 Pro / Build 19045)…"
 EXPECTED=()   # "Schlüssel|name Typ Wert", so wie reg query es (normalisiert) ausgibt
 set_reg() { # $1 Schlüssel, $2 Name, $3 Wert, $4 Typ
