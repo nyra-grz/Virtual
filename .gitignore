@@ -17,3 +17,5 @@ graphify-out/
 /rooms.json
 /rooms/
 __pycache__/
+/runtime.*/
+/.claude/
