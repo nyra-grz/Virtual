@@ -664,7 +664,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         alert.addButton(withTitle: "Installieren")
         alert.addButton(withTitle: "Abbrechen")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Launcher.shared.stopAll(in: [targetRoom]) { [weak self] in self?.runSetup(.dotnet48, in: targetRoom) }
+        Launcher.shared.stopAll(in: [targetRoom]) { [weak self] unconfirmed in
+            guard unconfirmed.isEmpty else {
+                self?.showError(Launcher.stopFailureMessage(unconfirmed) + " .NET wird erst danach installiert.")
+                return
+            }
+            self?.runSetup(.dotnet48, in: targetRoom)
+        }
     }
     @objc private func installProgram() {
         let targetRoom = room
@@ -694,7 +700,10 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         alert.addButton(withTitle: "Beenden")
         alert.addButton(withTitle: "Abbrechen")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Launcher.shared.stopAll(in: [targetRoom])
+        Launcher.shared.stopAll(in: [targetRoom]) { [weak self] unconfirmed in
+            guard !unconfirmed.isEmpty else { return }
+            self?.showError(Launcher.stopFailureMessage(unconfirmed))
+        }
     }
     @objc private func hideSetupLog() {
         setupLogs[room.id] = nil

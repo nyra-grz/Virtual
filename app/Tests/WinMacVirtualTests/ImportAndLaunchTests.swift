@@ -274,6 +274,67 @@ final class ImportAndLaunchTests: XCTestCase {
         XCTAssertFalse(Launcher.shared.isRunning(app))
     }
 
+    /// Fake-`virtualserver`: protokolliert Aufrufe; Marker im Prefix lassen `-w` hängen
+    /// oder melden bei `-k`, dass kein Server lief (Status 1).
+    private func fakeServer() throws {
+        try write("""
+        #!/bin/bash
+        printf '%s\\n' "$1" >> "$WINEPREFIX/server-calls"
+        if [ "$1" = -w ] && [ -f "$WINEPREFIX/server-hangs" ]; then exec sleep 30; fi
+        if [ "$1" = -k ] && [ -f "$WINEPREFIX/server-idle" ]; then exit 1; fi
+        exit 0
+        """, to: Settings.shared.virtualServer, executable: true)
+    }
+    private func stopAll(_ rooms: [Room], timeout: TimeInterval = 15) -> [UUID] {
+        let done = expectation(description: "stopAll")
+        var unconfirmed: [UUID] = []
+        Launcher.shared.stopAll(in: rooms, timeout: timeout) { unconfirmed = $0.map(\.id); done.fulfill() }
+        wait(for: [done], timeout: timeout + 5)
+        return unconfirmed
+    }
+
+    func testStopAllConfirmsEndAfterKillAndWait() throws {
+        try fakeServer()
+        let running = room(), idle = room()
+        for room in [running, idle] { try FileManager.default.createDirectory(at: room.prefixURL, withIntermediateDirectories: true) }
+        try write("", to: idle.prefixURL.appendingPathComponent("server-idle"))
+        XCTAssertEqual(stopAll([running, idle]), [])
+        for room in [running, idle] {
+            XCTAssertEqual(try String(contentsOf: room.prefixURL.appendingPathComponent("server-calls")), "-k\n-w\n")
+        }
+    }
+
+    func testStopAllReportsRoomWhoseServerDoesNotEnd() throws {
+        try fakeServer()
+        let stuck = room(), fine = room()
+        for room in [stuck, fine] { try FileManager.default.createDirectory(at: room.prefixURL, withIntermediateDirectories: true) }
+        try write("", to: stuck.prefixURL.appendingPathComponent("server-hangs"))
+        let start = Date()
+        XCTAssertEqual(stopAll([stuck, fine], timeout: 1), [stuck.id])
+        XCTAssertLessThan(Date().timeIntervalSince(start), 5)
+        XCTAssertTrue(Launcher.stopFailureMessage([stuck]).contains("„\(stuck.name)“"))
+    }
+
+    func testStopAllWaitsForTheRoomsOwnPrograms() throws {
+        try fakeServer()
+        try write("""
+        #!/bin/bash
+        exec sleep 30
+        """, to: Settings.shared.virtualBinary, executable: true)
+        let room = room(), app = try program(in: room)
+        let started = expectation(for: NSPredicate { _, _ in Launcher.shared.hasRunningProcesses(in: room) }, evaluatedWith: nil)
+        try Launcher.shared.launch(app)
+        wait(for: [started], timeout: 5)
+        // Der Fake-Server beendet nichts: Das Programm läuft weiter, also kein bestätigtes Ende.
+        XCTAssertEqual(stopAll([room], timeout: 1), [room.id])
+        var failures = 0
+        tokens.append(NotificationCenter.default.addObserver(forName: Launcher.didFail, object: nil, queue: .main) { _ in failures += 1 })
+        let ended = observe(Launcher.didFinishInRoom)
+        Launcher.shared.stop(app)
+        wait(for: [ended], timeout: 5)
+        XCTAssertEqual(failures, 0)
+    }
+
     func testParallelAppsInstallDependencyUnionBeforeEitherStarts() throws {
         let room = room()
         let first = try program(in: room, filename: "Needs VC.exe")

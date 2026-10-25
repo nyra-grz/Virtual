@@ -141,7 +141,8 @@ rooms live under `rooms/`, and their metadata is saved in `rooms.json`.
 A room's page shows its state (ready, running, not set up), its apps as tiles with a
 start/stop button, and the Windows tools grouped into **Dateien** (files) and
 **System**. **Alles beenden** (Stop everything) appears while something runs and ends
-every program and Wine service of that room.
+every program and Wine service of that room. Virtual waits until the room's Wine
+server is confirmed gone (`wineserver -k`, then `-w`) and says so if it is not.
 
 - **Add:** **+ → Programm hinzufügen…** (Add program) adds an `.exe` or `.msi` to
   the selected room. Drop files directly onto a room in the sidebar, double-click
@@ -167,8 +168,9 @@ every program and Wine service of that room.
   the next scan. Removing a room also removes its library entries.
 - **Settings:** choose the shared runtime and the **Standard-Raum (WINEPREFIX)**
   path, Windows version, and update preferences.
-- **Quit:** closing Virtual ends Wine in every room (`wineserver -k`), so no Wine
-  processes stay in the background. If programs are still running, Virtual asks first.
+- **Quit:** closing Virtual ends Wine in every room (`wineserver -k`, then `-w`), so no
+  Wine processes stay in the background. If programs are still running, Virtual asks
+  first; if an end cannot be confirmed, it asks again before quitting.
 - **Sound:** programs can read and change the device volume (`IAudioEndpointVolume`);
   it is shared by all programs of a room and kept across restarts. Program, session and
   channel volume work on macOS and never change the Mac's own volume (patch 0012).

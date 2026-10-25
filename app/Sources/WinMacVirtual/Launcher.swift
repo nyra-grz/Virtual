@@ -135,33 +135,77 @@ final class Launcher {
     private var toolTitles: [UUID: String] = [:]
 
     /// Beendet Wine in diesen Räumen vollständig – Programme, Werkzeuge und Hintergrunddienste
-    /// (`wineserver -k`). Startet nichts neu, wo nichts läuft. `completion` kommt auf dem
-    /// Main-Thread, spätestens nach `timeout` Sekunden.
-    func stopAll(in rooms: [Room], timeout: TimeInterval = 6, completion: (() -> Void)? = nil) {
+    /// (`wineserver -k`, dann `-w`). Startet nichts neu, wo nichts läuft. `completion` kommt auf dem
+    /// Main-Thread, spätestens nach `timeout` Sekunden, mit den Räumen, deren Ende nicht bestätigt
+    /// ist (leer = alles beendet). `-k` eskaliert selbst nach etwa 10 s zu SIGKILL.
+    func stopAll(in rooms: [Room], timeout: TimeInterval = 15, completion: (([Room]) -> Void)? = nil) {
         let ids = Set(rooms.map(\.id))
         preparing = preparing.filter { !ids.contains($0.value.room.id) }
         for (id, roomID) in pendingTools where ids.contains(roomID) { pendingTools[id] = nil; toolTitles[id] = nil }
         stopping.formUnion(processRooms.filter { ids.contains($0.value) }.keys)
         for room in rooms { PrefixSetup.current(in: room)?.cancel() }
         let server = Settings.shared.virtualServer
-        let group = DispatchGroup()
-        if FileManager.default.isExecutableFile(atPath: server.path) {
-            for room in rooms where FileManager.default.fileExists(atPath: room.prefixPath) {
-                let process = Process()
-                process.executableURL = server
-                process.arguments = ["-k"]
-                process.environment = RoomStore.shared.environment(for: room)
-                process.standardOutput = FileHandle.nullDevice
-                process.standardError = FileHandle.nullDevice
-                group.enter()
-                process.terminationHandler = { _ in group.leave() }
-                do { try process.run() } catch { group.leave() }
+        let deadline = Date() + timeout
+        // Ein abgebrochenes Einrichtungsskript kann beim Aufräumen noch Wine starten: erst danach -k.
+        Self.wait(until: deadline, for: { rooms.allSatisfy { PrefixSetup.current(in: $0) == nil } }) { [self] in
+            let targets = rooms.filter { FileManager.default.fileExists(atPath: $0.prefixPath) }
+                .map { ($0.id, RoomStore.shared.environment(for: $0)) }
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                let lock = NSLock()
+                var failed = Set<UUID>()
+                DispatchQueue.concurrentPerform(iterations: targets.count) { index in
+                    guard !Self.stopServer(server, environment: targets[index].1, deadline: deadline) else { return }
+                    lock.lock(); failed.insert(targets[index].0); lock.unlock()
+                }
+                DispatchQueue.main.async { [self] in
+                    // Ohne Server enden auch die Programme; bestätigt erst, wenn ihre Prozesse weg sind.
+                    Self.wait(until: deadline, for: { !self.processRooms.values.contains(where: ids.contains) }) { [self] in
+                        completion?(rooms.filter {
+                            failed.contains($0.id) || PrefixSetup.current(in: $0) != nil || processRooms.values.contains($0.id)
+                        })
+                    }
+                }
             }
         }
-        DispatchQueue.global(qos: .userInitiated).async {
-            _ = group.wait(timeout: .now() + timeout)
-            DispatchQueue.main.async { completion?() }
+    }
+
+    /// Meldung für Räume, deren Ende `stopAll` nicht bestätigen konnte.
+    static func stopFailureMessage(_ rooms: [Room]) -> String {
+        let names = rooms.map { "„\($0.name)“" }.joined(separator: ", ")
+        return "In \(names) ließ sich nicht bestätigen, dass alle Windows-Programme und Hintergrunddienste beendet sind; einige laufen möglicherweise weiter. Versuche es in einem Moment erneut mit „Alles beenden“."
+    }
+
+    /// `-k` beendet den Wine-Server des Raums (Status 1 heißt nur: es lief keiner), `-w` bestätigt,
+    /// dass er wirklich weg ist. Ohne Server-Programm konnte im Raum nichts laufen.
+    private static func stopServer(_ server: URL, environment: [String: String], deadline: Date) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: server.path) else { return true }
+        return run(server, ["-k"], environment: environment, until: deadline) != nil
+            && run(server, ["-w"], environment: environment, until: deadline) == 0
+    }
+
+    /// Wartet auf einen Hilfsbefehl; nil, wenn er nicht startet oder die Frist überschreitet
+    /// (dann wird er beendet, damit kein hängendes `-w` zurückbleibt).
+    private static func run(_ executable: URL, _ arguments: [String], environment: [String: String], until deadline: Date) -> Int32? {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.environment = environment
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let ended = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in ended.signal() }
+        do { try process.run() } catch { return nil }
+        guard ended.wait(timeout: .now() + max(0, deadline.timeIntervalSinceNow)) == .success else {
+            process.terminate()
+            return nil
         }
+        return process.terminationStatus
+    }
+
+    /// Prüft `condition` auf dem Main-Thread alle 0,1 s, bis sie gilt oder die Frist abläuft.
+    private static func wait(until deadline: Date, for condition: @escaping () -> Bool, then done: @escaping () -> Void) {
+        if condition() || Date() >= deadline { done(); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { wait(until: deadline, for: condition, then: done) }
     }
 
     private func start(_ arguments: [String], in room: Room, title: String, id: UUID, directory: URL? = nil,

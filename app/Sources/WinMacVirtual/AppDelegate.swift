@@ -53,8 +53,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         isShuttingDown = true
-        Launcher.shared.stopAll(in: RoomStore.shared.rooms) {
-            NSApp.reply(toApplicationShouldTerminate: true)
+        Launcher.shared.stopAll(in: RoomStore.shared.rooms) { [self] unconfirmed in
+            guard !unconfirmed.isEmpty else { NSApp.reply(toApplicationShouldTerminate: true); return }
+            let alert = NSAlert()
+            alert.messageText = "Nicht alles ist beendet"
+            alert.informativeText = Launcher.stopFailureMessage(unconfirmed)
+            alert.addButton(withTitle: "Trotzdem beenden")
+            alert.addButton(withTitle: "Abbrechen")
+            let quit = alert.runModal() == .alertFirstButtonReturn
+            if !quit { isShuttingDown = false }
+            NSApp.reply(toApplicationShouldTerminate: quit)
         }
         return .terminateLater
     }
