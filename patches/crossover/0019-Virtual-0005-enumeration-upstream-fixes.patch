@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:23:47 +0100
+Subject: [PATCH] Virtual 0005: enumeration-upstream-fixes
+
+Four pending upstream fixes for windows.devices.enumeration (Wine merge
+request !11997, original commit messages kept)
+---
+ dlls/windows.devices.enumeration/aqs.c  |  2 +-
+ dlls/windows.devices.enumeration/main.c | 11 ++++++++---
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/windows.devices.enumeration/aqs.c b/dlls/windows.devices.enumeration/aqs.c
+index 5c818038..85c73321 100644
+--- a/dlls/windows.devices.enumeration/aqs.c
++++ b/dlls/windows.devices.enumeration/aqs.c
+@@ -34,7 +34,7 @@ WINE_DEFAULT_DEBUG_CHANNEL( aqs );
+ 
+ static BOOL is_idchar( WCHAR chr )
+ {
+-    static const WCHAR legal[] = { 5, '#', '-', '.', '_', '{', '}' };
++    static const WCHAR legal[] = { '#', '-', '.', '_', '{', '}' };
+     int i;
+ 
+     if (iswdigit( chr ) || iswalpha( chr ) || (chr >= 125 && chr <= 255)) return TRUE;
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index 081260da..c19a29b8 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -292,8 +292,10 @@ static HRESULT WINAPI device_watcher_get_Status( IDeviceWatcher *iface, DeviceWa
+ 
+ static const char *debugstr_DEV_QUERY_RESULT_ACTION_DATA( const DEV_QUERY_RESULT_ACTION_DATA *data )
+ {
+-    const DEV_OBJECT *obj = &data->Data.DeviceObject;
++    const DEV_OBJECT *obj;
++
+     if (!data) return wine_dbg_sprintf( "(null)" );
++    obj = &data->Data.DeviceObject;
+     if (data->Action == DevQueryResultStateChange)
+         return wine_dbg_sprintf( "{%d {%d}}", data->Action, data->Data.State );
+     return wine_dbg_sprintf( "{%d {{%d %s %lu %p}}}", data->Action, obj->ObjectType, debugstr_w( obj->pszObjectId ), obj->cPropertyCount, obj->pProperties );
+@@ -391,7 +393,6 @@ static HRESULT WINAPI device_watcher_Start( IDeviceWatcher *iface )
+         const DEVPROP_FILTER_EXPRESSION *filters = NULL;
+         ULONG filters_len = 0;
+         IWeakReference *weak;
+-        HRESULT hr;
+ 
+         if (query_params->expr)
+         {
+@@ -513,7 +514,11 @@ static HRESULT WINAPI devpropcompkeys_append_names( DEVPROPCOMPKEY **ret_keys, U
+     *ret_keys = NULL;
+     *ret_keys_len = 0;
+ 
+-    if (FAILED(hr = IIterable_HSTRING_First( names_iterable, &names ))) return hr;
++    if (FAILED(hr = IIterable_HSTRING_First( names_iterable, &names )))
++    {
++        free( keys );
++        return hr;
++    }
+     for (hr = IIterator_HSTRING_get_HasCurrent( names, &valid ); SUCCEEDED( hr ) && valid; hr = IIterator_HSTRING_MoveNext( names, &valid ))
+     {
+         DEVPROPCOMPKEY key = {0};

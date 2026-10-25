@@ -1,0 +1,1048 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:23:47 +0100
+Subject: [PATCH] Virtual 0012: mmdevapi-endpoint-volume
+
+Full IAudioEndpointVolume (real channel count, master/channel levels
+with balance, mute, steps, notifications, shared by all programs of a
+room and saved). On macOS session/stream/channel volume and mute now
+actually work: applied to the samples, the Mac volume stays untouched
+(test: 73 checks, 0 failures)
+---
+ dlls/mmdevapi/audiovolume.c        | 544 ++++++++++++++++++++++++++---
+ dlls/mmdevapi/client.c             |  38 +-
+ dlls/mmdevapi/mmdevapi_private.h   |   8 +
+ dlls/winecoreaudio.drv/coreaudio.c | 108 ++++--
+ 4 files changed, 623 insertions(+), 75 deletions(-)
+
+diff --git a/dlls/mmdevapi/audiovolume.c b/dlls/mmdevapi/audiovolume.c
+index 61efcc89..3feb405e 100644
+--- a/dlls/mmdevapi/audiovolume.c
++++ b/dlls/mmdevapi/audiovolume.c
+@@ -19,6 +19,7 @@
+ #define COBJMACROS
+ 
+ #include <stdarg.h>
++#include <math.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -39,13 +40,352 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
+ 
++#define MAX_ENDPOINT_CHANNELS 32
++#define VOLUME_MIN_DB -100.0f
++#define VOLUME_MAX_DB 0.0f
++#define VOLUME_INC_DB 1.0f
++/* Windows' volume keys move the endpoint volume in steps of 2%. */
++#define VOLUME_STEPS 50
++
++struct endpoint_volume_values {
++    UINT channels;
++    BOOL mute;
++    float levels[MAX_ENDPOINT_CHANNELS]; /* dB; the master level is the loudest channel */
++    GUID context;
++};
++
++/* Lives in a named section, so like on Windows every process of the prefix
++ * sees and changes the same endpoint volume. */
++struct endpoint_volume_state {
++    LONG init;    /* 0 = new, 1 = initializing, 2 = ready */
++    LONG lock;    /* held by a writer */
++    LONG version; /* odd while a write is in progress */
++    struct endpoint_volume_values values;
++};
++
++struct endpoint_volume_entry {
++    struct list entry;
++    GUID guid;
++    HANDLE mapping;
++    struct endpoint_volume_state *state;
++};
++
++struct volume_notify {
++    struct list entry;
++    struct AEVImpl *owner;
++    struct endpoint_volume_state *state;
++    IAudioEndpointVolumeCallback *callback;
++    LONG version;
++};
++
++static struct list endpoint_states = LIST_INIT(endpoint_states);
++static struct list notifications = LIST_INIT(notifications);
++static HANDLE notify_thread;
++
++static CRITICAL_SECTION endpoint_cs;
++static CRITICAL_SECTION_DEBUG endpoint_cs_debug =
++{
++    0, 0, &endpoint_cs,
++    { &endpoint_cs_debug.ProcessLocksList, &endpoint_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": endpoint_cs") }
++};
++static CRITICAL_SECTION endpoint_cs = { &endpoint_cs_debug, -1, 0, 0, 0, 0 };
++
++static CRITICAL_SECTION notify_cs;
++static CRITICAL_SECTION_DEBUG notify_cs_debug =
++{
++    0, 0, &notify_cs,
++    { &notify_cs_debug.ProcessLocksList, &notify_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": notify_cs") }
++};
++static CRITICAL_SECTION notify_cs = { &notify_cs_debug, -1, 0, 0, 0, 0 };
++
++static const WCHAR volume_keyW[] = L"Software\\Wine\\MMDevAPI\\EndpointVolume";
++
++static float db_to_scalar(float db)
++{
++    return db <= VOLUME_MIN_DB ? 0.0f : powf(10.0f, db / 20.0f);
++}
++
++static float scalar_to_db(float scalar)
++{
++    return scalar <= 0.0f ? VOLUME_MIN_DB : max(VOLUME_MIN_DB, 20.0f * log10f(scalar));
++}
++
++static float master_level(const struct endpoint_volume_values *values)
++{
++    float level = VOLUME_MIN_DB;
++    UINT i;
++
++    for (i = 0; i < values->channels; i++)
++        level = max(level, values->levels[i]);
++    return level;
++}
++
++static UINT device_channel_count(const GUID *guid, IMMDevice *device)
++{
++    IAudioClient *client;
++    WAVEFORMATEX *fmt;
++    UINT channels = 2;
++
++    if (SUCCEEDED(AudioClient_Create((GUID *)guid, device, &client))) {
++        if (SUCCEEDED(IAudioClient_GetMixFormat(client, &fmt))) {
++            channels = fmt->nChannels;
++            CoTaskMemFree(fmt);
++        }
++        IAudioClient_Release(client);
++    }
++    return min(max(channels, 1), MAX_ENDPOINT_CHANNELS);
++}
++
++struct saved_volume {
++    UINT channels;
++    BOOL mute;
++    float levels[MAX_ENDPOINT_CHANNELS];
++};
++
++static void load_values(const GUID *guid, struct endpoint_volume_values *values)
++{
++    struct saved_volume saved;
++    DWORD size = sizeof(saved), type;
++    WCHAR name[39];
++    HKEY key;
++    UINT i;
++
++    StringFromGUID2(guid, name, ARRAY_SIZE(name));
++    if (RegOpenKeyExW(HKEY_CURRENT_USER, volume_keyW, 0, KEY_READ, &key))
++        return;
++    if (!RegQueryValueExW(key, name, NULL, &type, (BYTE *)&saved, &size) && type == REG_BINARY &&
++        size >= offsetof(struct saved_volume, levels) && saved.channels == values->channels &&
++        size == offsetof(struct saved_volume, levels[saved.channels])) {
++        values->mute = !!saved.mute;
++        for (i = 0; i < saved.channels; i++)
++            values->levels[i] = min(max(saved.levels[i], VOLUME_MIN_DB), VOLUME_MAX_DB);
++    }
++    RegCloseKey(key);
++}
++
++static void save_values(const GUID *guid, const struct endpoint_volume_values *values)
++{
++    struct saved_volume saved;
++    WCHAR name[39];
++    HKEY key;
++
++    saved.channels = values->channels;
++    saved.mute = values->mute;
++    memcpy(saved.levels, values->levels, values->channels * sizeof(float));
++    StringFromGUID2(guid, name, ARRAY_SIZE(name));
++    if (RegCreateKeyExW(HKEY_CURRENT_USER, volume_keyW, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL))
++        return;
++    RegSetValueExW(key, name, 0, REG_BINARY, (BYTE *)&saved, offsetof(struct saved_volume, levels[saved.channels]));
++    RegCloseKey(key);
++}
++
++/* Returns the shared volume of a device, creating it with the device's real
++ * channel count and the last saved levels if no process has it yet. */
++struct endpoint_volume_state *endpoint_volume_open(const GUID *guid, IMMDevice *device)
++{
++    struct endpoint_volume_entry *entry;
++    struct endpoint_volume_state *state = NULL;
++    WCHAR name[64];
++    HANDLE mapping;
++    UINT i;
++
++    EnterCriticalSection(&endpoint_cs);
++
++    LIST_FOR_EACH_ENTRY(entry, &endpoint_states, struct endpoint_volume_entry, entry) {
++        if (IsEqualGUID(&entry->guid, guid)) {
++            state = entry->state;
++            goto done;
++        }
++    }
++
++    wcscpy(name, L"WineMMDevEndpointVolume_");
++    StringFromGUID2(guid, name + wcslen(name), 39);
++    if (!(mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(*state), name)))
++        goto done;
++    if (!(state = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(*state))) ||
++        !(entry = malloc(sizeof(*entry)))) {
++        if (state) UnmapViewOfFile(state);
++        CloseHandle(mapping);
++        state = NULL;
++        goto done;
++    }
++
++    if (!InterlockedCompareExchange(&state->init, 1, 0)) {
++        state->values.channels = device_channel_count(guid, device);
++        for (i = 0; i < state->values.channels; i++)
++            state->values.levels[i] = VOLUME_MAX_DB;
++        load_values(guid, &state->values);
++        InterlockedExchange(&state->init, 2);
++    } else {
++        /* Another process is setting it up right now; don't wait forever if it died. */
++        for (i = 0; i < 2000 && ReadAcquire(&state->init) != 2; i++)
++            Sleep(1);
++    }
++
++    entry->guid = *guid;
++    entry->mapping = mapping;
++    entry->state = state;
++    list_add_tail(&endpoint_states, &entry->entry);
++
++done:
++    LeaveCriticalSection(&endpoint_cs);
++    return state;
++}
++
++static LONG read_values(const struct endpoint_volume_state *state, struct endpoint_volume_values *values)
++{
++    LONG version;
++
++    for (;;) {
++        version = ReadAcquire(&state->version);
++        if (!(version & 1)) {
++            *values = state->values;
++            MemoryBarrier();
++            if (ReadAcquire(&state->version) == version)
++                return version;
++        }
++        YieldProcessor();
++    }
++}
++
++LONG endpoint_volume_version(const struct endpoint_volume_state *state)
++{
++    return ReadAcquire(&state->version);
++}
++
++/* Linear gain per stream channel; a mono stream follows the master level. */
++LONG endpoint_volume_gains(const struct endpoint_volume_state *state, UINT count, float *gains)
++{
++    struct endpoint_volume_values values;
++    LONG version = read_values(state, &values);
++    float master = db_to_scalar(master_level(&values));
++    UINT i;
++
++    for (i = 0; i < count; i++) {
++        if (values.mute)
++            gains[i] = 0.0f;
++        else if (count > 1 && i < values.channels)
++            gains[i] = db_to_scalar(values.levels[i]);
++        else
++            gains[i] = master;
++    }
++    return version;
++}
++
+ typedef struct AEVImpl {
+     IAudioEndpointVolumeEx IAudioEndpointVolumeEx_iface;
+     LONG ref;
+-    float master_vol;
+-    BOOL mute;
++    GUID guid;
++    struct endpoint_volume_state *state;
+ } AEVImpl;
+ 
++enum volume_change {
++    CHANGE_MASTER,
++    CHANGE_CHANNEL,
++    CHANGE_MUTE,
++};
++
++/* Applies a change under the writer lock; S_FALSE if nothing changed. */
++static HRESULT change_volume(AEVImpl *This, enum volume_change change, UINT chan, float value, const GUID *ctx)
++{
++    struct endpoint_volume_state *state = This->state;
++    struct endpoint_volume_values values;
++    BOOL changed;
++    float delta;
++    UINT i;
++
++    while (InterlockedCompareExchange(&state->lock, 1, 0))
++        YieldProcessor();
++
++    values = state->values;
++    switch (change) {
++    case CHANGE_MASTER:
++        /* Moves all channels together, so the balance stays as it was. */
++        delta = value - master_level(&values);
++        for (i = 0; i < values.channels; i++)
++            values.levels[i] = min(max(values.levels[i] + delta, VOLUME_MIN_DB), VOLUME_MAX_DB);
++        break;
++    case CHANGE_CHANNEL:
++        values.levels[chan] = value;
++        break;
++    case CHANGE_MUTE:
++        values.mute = value != 0.0f;
++        break;
++    }
++
++    changed = memcmp(&values, &state->values, offsetof(struct endpoint_volume_values, context)) != 0;
++    if (changed) {
++        if (ctx)
++            values.context = *ctx;
++        else
++            memset(&values.context, 0, sizeof(values.context));
++        InterlockedIncrement(&state->version);
++        state->values = values;
++        InterlockedIncrement(&state->version);
++    }
++    InterlockedExchange(&state->lock, 0);
++
++    if (!changed)
++        return S_FALSE;
++    save_values(&This->guid, &values);
++    return S_OK;
++}
++
++static void dispatch_notification(struct volume_notify *notify)
++{
++    struct endpoint_volume_values values;
++    AUDIO_VOLUME_NOTIFICATION_DATA *data;
++    UINT i;
++
++    notify->version = read_values(notify->state, &values);
++    if (!(data = malloc(offsetof(AUDIO_VOLUME_NOTIFICATION_DATA, afChannelVolumes[values.channels]))))
++        return;
++    data->guidEventContext = values.context;
++    data->bMuted = values.mute;
++    data->fMasterVolume = db_to_scalar(master_level(&values));
++    data->nChannels = values.channels;
++    for (i = 0; i < values.channels; i++)
++        data->afChannelVolumes[i] = db_to_scalar(values.levels[i]);
++    IAudioEndpointVolumeCallback_OnNotify(notify->callback, data);
++    free(data);
++}
++
++/* Like on Windows, callbacks arrive on their own thread, also for changes
++ * made by other processes of the prefix. */
++static DWORD WINAPI notify_proc(void *arg)
++{
++    HMODULE module = arg;
++    struct volume_notify *notify;
++    BOOL dispatched;
++
++    SetThreadDescription(GetCurrentThread(), L"wine_mmdevapi_volume_notify");
++    for (;;) {
++        Sleep(20);
++        EnterCriticalSection(&notify_cs);
++        if (list_empty(&notifications)) {
++            CloseHandle(notify_thread);
++            notify_thread = NULL;
++            LeaveCriticalSection(&notify_cs);
++            break;
++        }
++        /* A callback may unregister, so start over after each one. */
++        do {
++            dispatched = FALSE;
++            LIST_FOR_EACH_ENTRY(notify, &notifications, struct volume_notify, entry) {
++                if (endpoint_volume_version(notify->state) != notify->version) {
++                    dispatch_notification(notify);
++                    dispatched = TRUE;
++                    break;
++                }
++            }
++        } while (dispatched);
++        LeaveCriticalSection(&notify_cs);
++    }
++    FreeLibraryAndExitThread(module, 0);
++}
++
+ static inline AEVImpl *impl_from_IAudioEndpointVolumeEx(IAudioEndpointVolumeEx *iface)
+ {
+     return CONTAINING_RECORD(iface, AEVImpl, IAudioEndpointVolumeEx_iface);
+@@ -53,6 +393,17 @@ static inline AEVImpl *impl_from_IAudioEndpointVolumeEx(IAudioEndpointVolumeEx *
+ 
+ static void AudioEndpointVolume_Destroy(AEVImpl *This)
+ {
++    struct volume_notify *notify, *next;
++
++    EnterCriticalSection(&notify_cs);
++    LIST_FOR_EACH_ENTRY_SAFE(notify, next, &notifications, struct volume_notify, entry) {
++        if (notify->owner != This)
++            continue;
++        list_remove(&notify->entry);
++        IAudioEndpointVolumeCallback_Release(notify->callback);
++        free(notify);
++    }
++    LeaveCriticalSection(&notify_cs);
+     free(This);
+ }
+ 
+@@ -94,29 +445,71 @@ static ULONG WINAPI AEV_Release(IAudioEndpointVolumeEx *iface)
+ 
+ static HRESULT WINAPI AEV_RegisterControlChangeNotify(IAudioEndpointVolumeEx *iface, IAudioEndpointVolumeCallback *notify)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    struct volume_notify *entry;
++    HMODULE module;
++    HRESULT hr = S_OK;
++
+     TRACE("(%p)->(%p)\n", iface, notify);
+     if (!notify)
+         return E_POINTER;
+-    FIXME("stub\n");
+-    return S_OK;
++    if (!(entry = malloc(sizeof(*entry))))
++        return E_OUTOFMEMORY;
++
++    entry->owner = This;
++    entry->state = This->state;
++    entry->callback = notify;
++    entry->version = endpoint_volume_version(This->state);
++    IAudioEndpointVolumeCallback_AddRef(notify);
++
++    EnterCriticalSection(&notify_cs);
++    list_add_tail(&notifications, &entry->entry);
++    if (!notify_thread) {
++        /* The thread keeps the module loaded until it is done. */
++        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)notify_proc, &module);
++        if (!(notify_thread = CreateThread(NULL, 0, notify_proc, module, 0, NULL))) {
++            FreeLibrary(module);
++            list_remove(&entry->entry);
++            IAudioEndpointVolumeCallback_Release(notify);
++            free(entry);
++            hr = E_OUTOFMEMORY;
++        }
++    }
++    LeaveCriticalSection(&notify_cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI AEV_UnregisterControlChangeNotify(IAudioEndpointVolumeEx *iface, IAudioEndpointVolumeCallback *notify)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    struct volume_notify *entry;
++
+     TRACE("(%p)->(%p)\n", iface, notify);
+     if (!notify)
+         return E_POINTER;
+-    FIXME("stub\n");
++
++    EnterCriticalSection(&notify_cs);
++    LIST_FOR_EACH_ENTRY(entry, &notifications, struct volume_notify, entry) {
++        if (entry->owner == This && entry->callback == notify) {
++            list_remove(&entry->entry);
++            IAudioEndpointVolumeCallback_Release(entry->callback);
++            free(entry);
++            break;
++        }
++    }
++    LeaveCriticalSection(&notify_cs);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_GetChannelCount(IAudioEndpointVolumeEx *iface, UINT *count)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++
+     TRACE("(%p)->(%p)\n", iface, count);
+     if (!count)
+         return E_POINTER;
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    *count = This->state->values.channels;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_SetMasterVolumeLevel(IAudioEndpointVolumeEx *iface, float leveldb, const GUID *ctx)
+@@ -125,126 +518,170 @@ static HRESULT WINAPI AEV_SetMasterVolumeLevel(IAudioEndpointVolumeEx *iface, fl
+ 
+     TRACE("(%p)->(%f,%s)\n", iface, leveldb, debugstr_guid(ctx));
+ 
+-    if(leveldb < -100.f || leveldb > 0.f)
++    if (!(leveldb >= VOLUME_MIN_DB && leveldb <= VOLUME_MAX_DB))
+         return E_INVALIDARG;
+-
+-    This->master_vol = leveldb;
+-
++    change_volume(This, CHANGE_MASTER, 0, leveldb, ctx);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_SetMasterVolumeLevelScalar(IAudioEndpointVolumeEx *iface, float level, const GUID *ctx)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++
+     TRACE("(%p)->(%f,%s)\n", iface, level, debugstr_guid(ctx));
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++
++    if (!(level >= 0.0f && level <= 1.0f))
++        return E_INVALIDARG;
++    change_volume(This, CHANGE_MASTER, 0, scalar_to_db(level), ctx);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_GetMasterVolumeLevel(IAudioEndpointVolumeEx *iface, float *leveldb)
+ {
+     AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    struct endpoint_volume_values values;
+ 
+     TRACE("(%p)->(%p)\n", iface, leveldb);
+ 
+     if (!leveldb)
+         return E_POINTER;
+-
+-    *leveldb = This->master_vol;
+-
++    read_values(This->state, &values);
++    *leveldb = master_level(&values);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_GetMasterVolumeLevelScalar(IAudioEndpointVolumeEx *iface, float *level)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    struct endpoint_volume_values values;
++
+     TRACE("(%p)->(%p)\n", iface, level);
++
+     if (!level)
+         return E_POINTER;
+-    FIXME("stub\n");
+-    *level = 1.0;
++    read_values(This->state, &values);
++    *level = db_to_scalar(master_level(&values));
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_SetChannelVolumeLevel(IAudioEndpointVolumeEx *iface, UINT chan, float leveldb, const GUID *ctx)
+ {
+-    TRACE("(%p)->(%f,%s)\n", iface, leveldb, debugstr_guid(ctx));
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++
++    TRACE("(%p)->(%u,%f,%s)\n", iface, chan, leveldb, debugstr_guid(ctx));
++
++    if (chan >= This->state->values.channels || !(leveldb >= VOLUME_MIN_DB && leveldb <= VOLUME_MAX_DB))
++        return E_INVALIDARG;
++    change_volume(This, CHANGE_CHANNEL, chan, leveldb, ctx);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_SetChannelVolumeLevelScalar(IAudioEndpointVolumeEx *iface, UINT chan, float level, const GUID *ctx)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++
+     TRACE("(%p)->(%u,%f,%s)\n", iface, chan, level, debugstr_guid(ctx));
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++
++    if (chan >= This->state->values.channels || !(level >= 0.0f && level <= 1.0f))
++        return E_INVALIDARG;
++    change_volume(This, CHANGE_CHANNEL, chan, scalar_to_db(level), ctx);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_GetChannelVolumeLevel(IAudioEndpointVolumeEx *iface, UINT chan, float *leveldb)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    struct endpoint_volume_values values;
++
+     TRACE("(%p)->(%u,%p)\n", iface, chan, leveldb);
+     if (!leveldb)
+         return E_POINTER;
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    read_values(This->state, &values);
++    if (chan >= values.channels)
++        return E_INVALIDARG;
++    *leveldb = values.levels[chan];
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_GetChannelVolumeLevelScalar(IAudioEndpointVolumeEx *iface, UINT chan, float *level)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    struct endpoint_volume_values values;
++
+     TRACE("(%p)->(%u,%p)\n", iface, chan, level);
+     if (!level)
+         return E_POINTER;
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    read_values(This->state, &values);
++    if (chan >= values.channels)
++        return E_INVALIDARG;
++    *level = db_to_scalar(values.levels[chan]);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_SetMute(IAudioEndpointVolumeEx *iface, BOOL mute, const GUID *ctx)
+ {
+     AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
+-    HRESULT ret;
+ 
+     TRACE("(%p)->(%u,%s)\n", iface, mute, debugstr_guid(ctx));
+ 
+-    ret = This->mute == mute ? S_FALSE : S_OK;
+-
+-    This->mute = mute;
+-
+-    return ret;
++    return change_volume(This, CHANGE_MUTE, 0, mute ? 1.0f : 0.0f, ctx);
+ }
+ 
+ static HRESULT WINAPI AEV_GetMute(IAudioEndpointVolumeEx *iface, BOOL *mute)
+ {
+     AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    struct endpoint_volume_values values;
+ 
+     TRACE("(%p)->(%p)\n", iface, mute);
+ 
+     if (!mute)
+         return E_POINTER;
++    read_values(This->state, &values);
++    *mute = values.mute;
++    return S_OK;
++}
+ 
+-    *mute = This->mute;
++static UINT current_step(AEVImpl *This)
++{
++    struct endpoint_volume_values values;
+ 
+-    return S_OK;
++    read_values(This->state, &values);
++    return lroundf(db_to_scalar(master_level(&values)) * VOLUME_STEPS);
+ }
+ 
+ static HRESULT WINAPI AEV_GetVolumeStepInfo(IAudioEndpointVolumeEx *iface, UINT *stepsize, UINT *stepcount)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++
+     TRACE("(%p)->(%p,%p)\n", iface, stepsize, stepcount);
+     if (!stepsize && !stepcount)
+         return E_POINTER;
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    if (stepsize)
++        *stepsize = current_step(This);
++    if (stepcount)
++        *stepcount = VOLUME_STEPS + 1;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_VolumeStepUp(IAudioEndpointVolumeEx *iface, const GUID *ctx)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    UINT step = min(current_step(This) + 1, VOLUME_STEPS);
++
+     TRACE("(%p)->(%s)\n", iface, debugstr_guid(ctx));
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    change_volume(This, CHANGE_MASTER, 0, scalar_to_db((float)step / VOLUME_STEPS), ctx);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_VolumeStepDown(IAudioEndpointVolumeEx *iface, const GUID *ctx)
+ {
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++    UINT step = current_step(This);
++
+     TRACE("(%p)->(%s)\n", iface, debugstr_guid(ctx));
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    step = step ? step - 1 : 0;
++    change_volume(This, CHANGE_MASTER, 0, scalar_to_db((float)step / VOLUME_STEPS), ctx);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_QueryHardwareSupport(IAudioEndpointVolumeEx *iface, DWORD *mask)
+@@ -252,8 +689,9 @@ static HRESULT WINAPI AEV_QueryHardwareSupport(IAudioEndpointVolumeEx *iface, DW
+     TRACE("(%p)->(%p)\n", iface, mask);
+     if (!mask)
+         return E_POINTER;
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    /* Volume and mute are applied in software; the Mac keeps its own device volume. */
++    *mask = 0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_GetVolumeRange(IAudioEndpointVolumeEx *iface, float *mindb, float *maxdb, float *inc)
+@@ -263,20 +701,23 @@ static HRESULT WINAPI AEV_GetVolumeRange(IAudioEndpointVolumeEx *iface, float *m
+     if (!mindb || !maxdb || !inc)
+         return E_POINTER;
+ 
+-    *mindb = -100.f;
+-    *maxdb = 0.f;
+-    *inc = 1.f;
++    *mindb = VOLUME_MIN_DB;
++    *maxdb = VOLUME_MAX_DB;
++    *inc = VOLUME_INC_DB;
+ 
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI AEV_GetVolumeRangeChannel(IAudioEndpointVolumeEx *iface, UINT chan, float *mindb, float *maxdb, float *inc)
+ {
+-    TRACE("(%p)->(%p,%p,%p)\n", iface, mindb, maxdb, inc);
++    AEVImpl *This = impl_from_IAudioEndpointVolumeEx(iface);
++
++    TRACE("(%p)->(%u,%p,%p,%p)\n", iface, chan, mindb, maxdb, inc);
+     if (!mindb || !maxdb || !inc)
+         return E_POINTER;
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    if (chan >= This->state->values.channels)
++        return E_INVALIDARG;
++    return AEV_GetVolumeRange(iface, mindb, maxdb, inc);
+ }
+ 
+ static const IAudioEndpointVolumeExVtbl AEVImpl_Vtbl = {
+@@ -314,6 +755,11 @@ HRESULT AudioEndpointVolume_Create(MMDevice *parent, IAudioEndpointVolumeEx **pp
+         return E_OUTOFMEMORY;
+     This->IAudioEndpointVolumeEx_iface.lpVtbl = &AEVImpl_Vtbl;
+     This->ref = 1;
++    This->guid = parent->devguid;
++    if (!(This->state = endpoint_volume_open(&parent->devguid, &parent->IMMDevice_iface))) {
++        free(This);
++        return E_OUTOFMEMORY;
++    }
+ 
+     *ppv = &This->IAudioEndpointVolumeEx_iface;
+     return S_OK;
+diff --git a/dlls/mmdevapi/client.c b/dlls/mmdevapi/client.c
+index 4538eca9..e59cdaf4 100644
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -63,15 +63,34 @@ void main_loop_stop(void)
+ void set_stream_volumes(struct audio_client *This)
+ {
+     struct set_volumes_params params;
++    UINT32 i;
+ 
+     params.stream          = This->stream;
+     params.master_volume   = (This->session->mute ? 0.0f : This->session->master_vol);
+     params.volumes         = This->vols;
+     params.session_volumes = This->session->channel_vols;
+ 
++    if (This->endpoint_volume && This->mixed_vols) {
++        This->endpoint_version = endpoint_volume_gains(This->endpoint_volume, This->channel_count, This->mixed_vols);
++        for (i = 0; i < This->channel_count; i++)
++            This->mixed_vols[i] *= This->vols[i];
++        params.volumes = This->mixed_vols;
++    }
++
+     wine_unix_call(set_volumes, &params);
+ }
+ 
++/* Picks up endpoint volume changes, also those made by other processes. */
++static void update_endpoint_volume(struct audio_client *This)
++{
++    if (!This->endpoint_volume || endpoint_volume_version(This->endpoint_volume) == This->endpoint_version)
++        return;
++    sessions_lock();
++    if (This->stream)
++        set_stream_volumes(This);
++    sessions_unlock();
++}
++
+ static inline struct audio_client *impl_from_IAudioCaptureClient(IAudioCaptureClient *iface)
+ {
+     return CONTAINING_RECORD(iface, struct audio_client, IAudioCaptureClient_iface);
+@@ -525,6 +544,10 @@ static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_
+     if (hr != S_OK)
+         return hr;
+ 
++    /* Loopback captures what is played, after the endpoint volume. */
++    if (!(flags & AUDCLNT_STREAMFLAGS_LOOPBACK) && !client->endpoint_volume)
++        client->endpoint_volume = endpoint_volume_open(&client->device_guid, client->parent);
++
+     sessions_lock();
+ 
+     if (client->stream) {
+@@ -594,7 +617,8 @@ static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_
+         return params.result;
+     }
+ 
+-    if (!(client->vols = malloc(channel_count * sizeof(*client->vols)))) {
++    if (!(client->vols = malloc(channel_count * sizeof(*client->vols))) ||
++        !(client->mixed_vols = malloc(channel_count * sizeof(*client->mixed_vols)))) {
+         params.result = E_OUTOFMEMORY;
+         goto exit;
+     }
+@@ -609,6 +633,8 @@ exit:
+         stream_release(stream, NULL);
+         free(client->vols);
+         client->vols = NULL;
++        free(client->mixed_vols);
++        client->mixed_vols = NULL;
+     } else {
+         list_add_tail(&client->session->clients, &client->entry);
+         client->stream = stream;
+@@ -698,6 +724,8 @@ static HRESULT WINAPI capture_ReleaseBuffer(IAudioCaptureClient *iface, UINT32 d
+     if (!This->stream)
+         return AUDCLNT_E_NOT_INITIALIZED;
+ 
++    update_endpoint_volume(This);
++
+     params.stream = This->stream;
+     params.done   = done;
+ 
+@@ -792,6 +820,7 @@ static ULONG WINAPI client_Release(IAudioClient3 *iface)
+         }
+ 
+         free(This->vols);
++        free(This->mixed_vols);
+ 
+         if (This->stream)
+             stream_release(This->stream, This->timer_thread);
+@@ -1546,6 +1575,8 @@ static HRESULT WINAPI render_ReleaseBuffer(IAudioRenderClient *iface, UINT32 wri
+     if (!This->stream)
+         return AUDCLNT_E_NOT_INITIALIZED;
+ 
++    update_endpoint_volume(This);
++
+     params.stream         = This->stream;
+     params.written_frames = written_frames;
+     params.flags          = flags;
+@@ -1762,8 +1793,9 @@ HRESULT AudioClient_Create(GUID *guid, IMMDevice *device, IAudioClient **out)
+     This->IAudioRenderClient_iface.lpVtbl    = &AudioRenderClient_Vtbl;
+     This->IAudioStreamVolume_iface.lpVtbl    = &AudioStreamVolume_Vtbl;
+ 
+-    This->dataflow = dataflow;
+-    This->parent   = device;
++    This->dataflow    = dataflow;
++    This->parent      = device;
++    This->device_guid = *guid;
+ 
+     hr = CoCreateFreeThreadedMarshaler((IUnknown *)&This->IAudioClient3_iface, &This->marshal);
+     if (FAILED(hr)) {
+diff --git a/dlls/mmdevapi/mmdevapi_private.h b/dlls/mmdevapi/mmdevapi_private.h
+index 672d901b..3efa5aa6 100644
+--- a/dlls/mmdevapi/mmdevapi_private.h
++++ b/dlls/mmdevapi/mmdevapi_private.h
+@@ -82,6 +82,11 @@ struct audio_client {
+ 
+     struct list entry;
+     char *device_name;
++
++    GUID device_guid;
++    struct endpoint_volume_state *endpoint_volume;
++    LONG endpoint_version;
++    float *mixed_vols; /* stream volumes times endpoint volume */
+ };
+ 
+ extern HRESULT MMDevEnum_Create(REFIID riid, void **ppv);
+@@ -122,6 +127,9 @@ static inline void wine_unix_call(const unsigned int code, void *args)
+ 
+ extern HRESULT AudioClient_Create(GUID *guid, IMMDevice *device, IAudioClient **out);
+ extern HRESULT AudioEndpointVolume_Create(MMDevice *parent, IAudioEndpointVolumeEx **ppv);
++extern struct endpoint_volume_state *endpoint_volume_open(const GUID *guid, IMMDevice *device);
++extern LONG endpoint_volume_version(const struct endpoint_volume_state *state);
++extern LONG endpoint_volume_gains(const struct endpoint_volume_state *state, UINT count, float *gains);
+ extern HRESULT AudioSessionManager_Create(IMMDevice *device, IAudioSessionManager2 **ppv);
+ extern HRESULT SpatialAudioClient_Create(IMMDevice *device, ISpatialAudioClient **out);
+ 
+diff --git a/dlls/winecoreaudio.drv/coreaudio.c b/dlls/winecoreaudio.drv/coreaudio.c
+index 3199887b..39b30a72 100644
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -102,6 +102,7 @@ struct coreaudio_stream
+     INT32 getbuf_last;
+     WAVEFORMATEX *fmt;
+     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
++    float *vols; /* combined session, stream and endpoint volume per channel */
+ };
+ 
+ static const REFERENCE_TIME def_period = 100000;
+@@ -390,6 +391,71 @@ static void silence_buffer(struct coreaudio_stream *stream, BYTE *buffer, UINT32
+         memset(buffer, 0, frames * stream->fmt->nBlockAlign);
+ }
+ 
++/* CoreAudio has no per-stream volume and the device volume belongs to the
++ * Mac, so session, stream and endpoint volumes are applied to the samples. */
++static void adjust_buffer_volume(struct coreaudio_stream *stream, BYTE *buf, UINT32 frames)
++{
++    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)stream->fmt;
++    const UINT32 channels = stream->fmt->nChannels, align = stream->fmt->nBlockAlign;
++    BYTE *frame, *end = buf + frames * align;
++    BOOL adjust = FALSE, mute = TRUE, is_float;
++    UINT32 i;
++
++    if(!stream->vols || !frames)
++        return;
++    for(i = 0; i < channels; i++){
++        adjust |= stream->vols[i] != 1.0f;
++        mute &= stream->vols[i] == 0.0f;
++    }
++    if(!adjust)
++        return;
++    if(mute){
++        silence_buffer(stream, buf, frames);
++        return;
++    }
++
++    is_float = stream->fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
++               (stream->fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
++                IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
++
++#define PROCESS_BUFFER(type) \
++    for(frame = buf; frame < end; frame += align) \
++        for(i = 0; i < channels; i++) \
++            ((type *)frame)[i] = ((type *)frame)[i] * (double)stream->vols[i]
++
++    if(is_float){
++        if(stream->fmt->wBitsPerSample == 32) PROCESS_BUFFER(float);
++        else if(stream->fmt->wBitsPerSample == 64) PROCESS_BUFFER(double);
++        return;
++    }
++
++    switch(stream->fmt->wBitsPerSample){
++    case 8:
++        for(frame = buf; frame < end; frame += align)
++            for(i = 0; i < channels; i++)
++                frame[i] = (int)((frame[i] - 128) * stream->vols[i]) + 128;
++        break;
++    case 16:
++        PROCESS_BUFFER(INT16);
++        break;
++    case 24:
++        for(frame = buf; frame < end; frame += align)
++            for(i = 0; i < channels; i++){
++                BYTE *p = frame + i * 3;
++                INT32 v = (INT32)((UINT32)p[0] << 8 | (UINT32)p[1] << 16 | (UINT32)p[2] << 24);
++                v = v * (double)stream->vols[i];
++                p[0] = v >> 8;
++                p[1] = v >> 16;
++                p[2] = v >> 24;
++            }
++        break;
++    case 32:
++        PROCESS_BUFFER(INT32);
++        break;
++    }
++#undef PROCESS_BUFFER
++}
++
+ /* CA is pulling data from us */
+ static OSStatus ca_render_cb(void *user, AudioUnitRenderActionFlags *flags,
+         const AudioTimeStamp *ts, UInt32 bus, UInt32 nframes,
+@@ -413,6 +479,8 @@ static OSStatus ca_render_cb(void *user, AudioUnitRenderActionFlags *flags,
+         }else
+             memcpy(data->mBuffers[0].mData, stream->local_buffer + lcl_offs_bytes, to_copy_bytes);
+ 
++        adjust_buffer_volume(stream, data->mBuffers[0].mData, to_copy_frames);
++
+         stream->lcl_offs_frames += to_copy_frames;
+         stream->lcl_offs_frames %= stream->bufsize_frames;
+         stream->held_frames -= to_copy_frames;
+@@ -728,6 +796,7 @@ static NTSTATUS unix_create_stream(void *args)
+     AURenderCallbackStruct input;
+     OSStatus sc;
+     SIZE_T size;
++    UINT32 i;
+ 
+     params->result = S_OK;
+ 
+@@ -742,6 +811,13 @@ static NTSTATUS unix_create_stream(void *args)
+         goto end;
+     }
+ 
++    if(!(stream->vols = malloc(stream->fmt->nChannels * sizeof(*stream->vols)))){
++        params->result = E_OUTOFMEMORY;
++        goto end;
++    }
++    for(i = 0; i < stream->fmt->nChannels; i++)
++        stream->vols[i] = 1.0f;
++
+     stream->period = params->period;
+     stream->period_frames = muldiv(params->period, stream->fmt->nSamplesPerSec, 10000000);
+     stream->dev_id = dev_id_from_device(params->device);
+@@ -827,6 +903,7 @@ end:
+     if(FAILED(params->result)){
+         if(stream->converter) AudioConverterDispose(stream->converter);
+         if(stream->unit) AudioComponentInstanceDispose(stream->unit);
++        free(stream->vols);
+         free(stream->fmt);
+         free(stream);
+     } else {
+@@ -868,6 +945,7 @@ static NTSTATUS unix_release_stream( void *args )
+         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer,
+                             &size, MEM_RELEASE);
+     }
++    free(stream->vols);
+     free(stream->fmt);
+     free(stream);
+     params->result = S_OK;
+@@ -1237,6 +1315,8 @@ static void capture_resample(struct coreaudio_stream *stream)
+             break;
+         }
+ 
++        adjust_buffer_volume(stream, stream->resamp_buffer, wanted_frames);
++
+         ca_wrap_buffer(stream->local_buffer,
+                        stream->wri_offs_frames * stream->fmt->nBlockAlign,
+                        stream->bufsize_frames * stream->fmt->nBlockAlign,
+@@ -1746,31 +1826,13 @@ static NTSTATUS unix_set_volumes(void *args)
+ {
+     struct set_volumes_params *params = args;
+     struct coreaudio_stream *stream = handle_get_stream(params->stream);
+-    Float32 level = params->master_volume;
+-    OSStatus sc;
+     UINT32 i;
+-    AudioObjectPropertyAddress prop_addr = {
+-        kAudioDevicePropertyVolumeScalar,
+-        kAudioObjectPropertyScopeGlobal,
+-        kAudioObjectPropertyElementMain
+-    };
+-
+-    sc = AudioObjectSetPropertyData(stream->dev_id, &prop_addr, 0, NULL, sizeof(float), &level);
+-    if (sc == noErr)
+-        level = 1.0f;
+-    else
+-        WARN("Couldn't set master volume, applying it directly to the channels: %x\n", (int)sc);
+-
+-    for (i = 1; i <= stream->fmt->nChannels; ++i) {
+-        const float vol = level * params->session_volumes[i - 1] * params->volumes[i - 1];
+-
+-        prop_addr.mElement = i;
+ 
+-        sc = AudioObjectSetPropertyData(stream->dev_id, &prop_addr, 0, NULL, sizeof(float), &vol);
+-        if (sc != noErr) {
+-            WARN("Couldn't set channel #%u volume: %x\n", i, (int)sc);
+-        }
+-    }
++    /* Applied in adjust_buffer_volume(); the Mac's own device volume stays untouched. */
++    os_unfair_lock_lock(&stream->lock);
++    for(i = 0; i < stream->fmt->nChannels; i++)
++        stream->vols[i] = params->master_volume * params->session_volumes[i] * params->volumes[i];
++    os_unfair_lock_unlock(&stream->lock);
+ 
+     return STATUS_SUCCESS;
+ }

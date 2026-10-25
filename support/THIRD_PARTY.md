@@ -4,7 +4,7 @@ Versioned download URLs and SHA checksums are in `components.lock.json`.
 
 - Wine / CrossOver FOSS 26.1.0 (Wine 11.0 base), LGPL-2.1-or-later:
   https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.1.0.tar.gz
-  Virtual's complete port is in `patches/crossover/0001-virtual-compatibility.patch`.
+  Virtual's changes are the patch series in `patches/crossover/` (order in `series`).
   Wine's normal username and profile expansion are retained so existing Virtual
   rooms continue to use their original AppData and installed application data.
 - Wine keyboard fix by Rémi Bernon, LGPL-2.1-or-later:

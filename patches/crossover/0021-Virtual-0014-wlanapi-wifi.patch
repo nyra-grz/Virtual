@@ -1,0 +1,2447 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:23:48 +0100
+Subject: [PATCH] Virtual 0014: wlanapi-wifi
+
+Real macOS CoreWLAN adapter and scan data through WlanAPI and
+Windows.Devices.WiFi; the same adapter appears in DeviceInformation and
+opens through FromIdAsync
+---
+ dlls/windows.devices.enumeration/Makefile.in  |   1 +
+ dlls/windows.devices.enumeration/audio.c      |   4 +-
+ dlls/windows.devices.enumeration/main.c       |   3 +
+ dlls/windows.devices.enumeration/network.c    |  87 ++
+ dlls/windows.devices.enumeration/private.h    |   3 +
+ .../Makefile.in                               |   3 +-
+ dlls/windows.networking.connectivity/async.c  |  50 +-
+ .../classes.idl                               |   6 +
+ dlls/windows.networking.connectivity/main.c   |   6 +
+ .../network_information.c                     |  28 +
+ .../windows.networking.connectivity/objects.c |  55 --
+ .../windows.networking.connectivity/private.h |  62 ++
+ dlls/windows.networking.connectivity/wifi.c   | 841 ++++++++++++++++++
+ dlls/wlanapi/Makefile.in                      |   5 +-
+ dlls/wlanapi/main.c                           | 258 +++++-
+ dlls/wlanapi/unixlib.c                        | 283 ++++++
+ dlls/wlanapi/unixlib.h                        |  29 +
+ dlls/wlanapi/wlanapi.spec                     |   3 +
+ include/Makefile.in                           |   2 +
+ include/windows.devices.wifi.idl              | 238 +++++
+ include/wine/wifi.h                           |  70 ++
+ include/wlanapi.h                             |  44 +
+ 22 files changed, 2012 insertions(+), 69 deletions(-)
+ create mode 100644 dlls/windows.devices.enumeration/network.c
+ create mode 100644 dlls/windows.networking.connectivity/wifi.c
+ create mode 100644 dlls/wlanapi/unixlib.c
+ create mode 100644 dlls/wlanapi/unixlib.h
+ create mode 100644 include/windows.devices.wifi.idl
+ create mode 100644 include/wine/wifi.h
+
+diff --git a/dlls/windows.devices.enumeration/Makefile.in b/dlls/windows.devices.enumeration/Makefile.in
+index 88b2d325..10d09ab3 100644
+--- a/dlls/windows.devices.enumeration/Makefile.in
++++ b/dlls/windows.devices.enumeration/Makefile.in
+@@ -11,5 +11,6 @@ SOURCES = \
+ 	event_handlers.c \
+ 	information.c \
+ 	main.c \
++	network.c \
+ 	vector.c \
+ 	weakref.c
+diff --git a/dlls/windows.devices.enumeration/audio.c b/dlls/windows.devices.enumeration/audio.c
+index 9385c07f..e4983d9a 100644
+--- a/dlls/windows.devices.enumeration/audio.c
++++ b/dlls/windows.devices.enumeration/audio.c
+@@ -41,7 +41,7 @@ static CRITICAL_SECTION_DEBUG audio_cs_debug =
+ static CRITICAL_SECTION audio_cs = { &audio_cs_debug, -1, 0, 0, 0, 0 };
+ 
+ /* setupapi treats an interface as enabled when <interface key>\#\Control has Linked = 1. */
+-static void set_interface_linked( HDEVINFO set, SP_DEVICE_INTERFACE_DATA *iface, BOOL linked )
++void device_interface_set_linked( HDEVINFO set, SP_DEVICE_INTERFACE_DATA *iface, BOOL linked )
+ {
+     WCHAR buffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) / sizeof(WCHAR) + 512], path[1024], guid[39];
+     SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)buffer;
+@@ -110,7 +110,7 @@ static void register_endpoint( HDEVINFO set, IMMDevice *device )
+     }
+ 
+     /* Only endpoints that are currently plugged in and enabled count as enabled interfaces. */
+-    set_interface_linked( set, &iface, state == DEVICE_STATE_ACTIVE );
++    device_interface_set_linked( set, &iface, state == DEVICE_STATE_ACTIVE );
+     TRACE( "registered %s, state %#lx.\n", debugstr_w(instance), state );
+ 
+ done:
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index cc733133..4f992f0e 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -426,6 +426,7 @@ static HRESULT WINAPI device_watcher_Start( IDeviceWatcher *iface )
+         }
+ 
+         audio_endpoints_sync();
++        network_interfaces_sync();
+         IWeakReferenceSource_GetWeakReference( &impl->weak_reference_source.IWeakReferenceSource_iface, &weak );
+         hr = DevCreateObjectQuery( query_params->type, DevQueryFlagAsyncClose, query_params->prop_keys_len, query_params->prop_keys, filters_len, filters,
+                                    device_object_query_callback, weak, &impl->query );
+@@ -778,6 +779,7 @@ static HRESULT create_from_id_async( IUnknown *invoker, IUnknown *param, PROPVAR
+ 
+     params = impl_from_IUnknown( param );
+     audio_endpoints_sync();
++    network_interfaces_sync();
+     if (FAILED(hr = DevGetObjects( params->type, DevQueryFlagNone, params->prop_keys_len, params->prop_keys, 0, NULL, &len, &objects ))) return hr;
+     for (i = 0; i < len; i++)
+     {
+@@ -874,6 +876,7 @@ static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *
+     }
+     if (FAILED(hr = vector_create( &iids, (void *)&vector ))) return hr;
+     audio_endpoints_sync();
++    network_interfaces_sync();
+     hr = DevGetObjects( params->type, DevQueryFlagNone, params->prop_keys_len, params->prop_keys, filters_len, filters, &len, &objects );
+     if (FAILED(hr))
+     {
+diff --git a/dlls/windows.devices.enumeration/network.c b/dlls/windows.devices.enumeration/network.c
+new file mode 100644
+index 00000000..c0b5389f
+--- /dev/null
++++ b/dlls/windows.devices.enumeration/network.c
+@@ -0,0 +1,87 @@
++/* Audio endpoints as device interfaces
++ *
++ * Copyright (C) 2026 Daniel Özdek
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "setupapi.h"
++#include "devpkey.h"
++#include "wine/wifi.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(enumeration);
++
++static const GUID network_class = {0x4d36e972, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
++static const GUID network_interface = {0xcac88484, 0x7515, 0x4c03, {0x82, 0xe6, 0x71, 0xa8, 0x7a, 0xba, 0xc3, 0x61}};
++static SRWLOCK network_lock = SRWLOCK_INIT;
++
++/* Publish the same real host interface that WiFiAdapter.FindAllAdaptersAsync returns.
++ * SetupAPI generates its symbolic link from VIRTUAL\\WIFI\\<MAC>, matching FromIdAsync.
++ * Do not invent an interface when the host has none. */
++void network_interfaces_sync( void )
++{
++    SP_DEVICE_INTERFACE_DATA iface = {.cbSize = sizeof(iface)};
++    SP_DEVINFO_DATA dev = {.cbSize = sizeof(dev)};
++    struct wifi_info_params *info;
++    wine_wlan_query_func query;
++    WCHAR instance[128], name[64], old_instance[256];
++    HMODULE module;
++    HDEVINFO set;
++    DWORD index;
++
++    if (!(module = LoadLibraryW( L"wlanapi.dll" ))) return;
++    query = (wine_wlan_query_func)GetProcAddress( module, "__wine_wlan_query" );
++    if (!(info = calloc( 1, sizeof(*info) ))) goto done;
++    if (!query || query( info, FALSE )) goto free_info;
++
++    AcquireSRWLockExclusive( &network_lock );
++    if ((set = SetupDiGetClassDevsW( &network_interface, NULL, NULL, DIGCF_DEVICEINTERFACE )) == INVALID_HANDLE_VALUE)
++        goto unlock;
++    /* Previous adapters may have disappeared or changed. Mark only our devices inactive. */
++    for (index = 0; SetupDiEnumDeviceInterfaces( set, NULL, &network_interface, index, &iface ); index++)
++    {
++        if (SetupDiGetDeviceInterfaceDetailW( set, &iface, NULL, 0, NULL, &dev ) || GetLastError() == ERROR_INSUFFICIENT_BUFFER)
++            if (SetupDiGetDeviceInstanceIdW( set, &dev, old_instance, ARRAY_SIZE(old_instance), NULL ) &&
++                !wcsnicmp( old_instance, L"VIRTUAL\\WIFI\\", 13 ))
++                device_interface_set_linked( set, &iface, FALSE );
++    }
++    if (!info->present) goto destroy;
++
++    swprintf( instance, ARRAY_SIZE(instance), L"VIRTUAL\\WIFI\\%02X%02X%02X%02X%02X%02X",
++              info->mac[0], info->mac[1], info->mac[2], info->mac[3], info->mac[4], info->mac[5] );
++    if (!SetupDiOpenDeviceInfoW( set, instance, NULL, 0, &dev ) &&
++        (!SetupDiCreateDeviceInfoW( set, instance, &network_class, NULL, NULL, 0, &dev ) ||
++         !SetupDiRegisterDeviceInfo( set, &dev, 0, NULL, NULL, NULL ))) goto destroy;
++    if (!SetupDiCreateDeviceInterfaceW( set, &dev, &network_interface, NULL, 0, &iface )) goto destroy;
++    swprintf( name, ARRAY_SIZE(name), L"Wi-Fi (%hs)", info->name );
++    SetupDiSetDevicePropertyW( set, &dev, &DEVPKEY_Device_FriendlyName, DEVPROP_TYPE_STRING,
++                               (BYTE *)name, (wcslen(name) + 1) * sizeof(WCHAR), 0 );
++    SetupDiSetDeviceInterfacePropertyW( set, &iface, &DEVPKEY_DeviceInterface_FriendlyName, DEVPROP_TYPE_STRING,
++                                        (BYTE *)name, (wcslen(name) + 1) * sizeof(WCHAR), 0 );
++    /* Radio power and interface availability are separate; an off radio still has an adapter. */
++    device_interface_set_linked( set, &iface, TRUE );
++    TRACE( "registered host Wi-Fi interface %s.\n", debugstr_w(instance) );
++
++destroy:
++    SetupDiDestroyDeviceInfoList( set );
++unlock:
++    ReleaseSRWLockExclusive( &network_lock );
++free_info:
++    free( info );
++done:
++    FreeLibrary( module );
++}
+diff --git a/dlls/windows.devices.enumeration/private.h b/dlls/windows.devices.enumeration/private.h
+index 5699276c..817eab1a 100644
+--- a/dlls/windows.devices.enumeration/private.h
++++ b/dlls/windows.devices.enumeration/private.h
+@@ -32,6 +32,7 @@
+ #include "devfiltertypes.h"
+ #include "devquerydef.h"
+ #include "propsys.h"
++#include "setupapi.h"
+ 
+ #include "activation.h"
+ 
+@@ -69,6 +70,8 @@ extern HRESULT vector_create( const struct vector_iids *iids, void **out );
+ extern HRESULT device_information_create( const DEV_OBJECT *obj, IDeviceInformation **info );
+ extern HRESULT device_information_update_create( const DEV_OBJECT *obj, IDeviceInformationUpdate **out );
+ extern void audio_endpoints_sync( void );
++extern void network_interfaces_sync( void );
++extern void device_interface_set_linked( HDEVINFO set, SP_DEVICE_INTERFACE_DATA *iface, BOOL linked );
+ extern BOOL audio_endpoint_is_default( const WCHAR *interface_id );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+diff --git a/dlls/windows.networking.connectivity/Makefile.in b/dlls/windows.networking.connectivity/Makefile.in
+index ffd5dd35..8adb99a6 100644
+--- a/dlls/windows.networking.connectivity/Makefile.in
++++ b/dlls/windows.networking.connectivity/Makefile.in
+@@ -8,4 +8,5 @@ SOURCES = \
+ 	main.c \
+ 	network_information.c \
+ 	objects.c \
+-	vector.c
++	vector.c \
++	wifi.c
+diff --git a/dlls/windows.networking.connectivity/async.c b/dlls/windows.networking.connectivity/async.c
+index 2d9246c2..b9c0dd7d 100644
+--- a/dlls/windows.networking.connectivity/async.c
++++ b/dlls/windows.networking.connectivity/async.c
+@@ -498,15 +498,63 @@ static const struct IAsyncOperation_IInspectableVtbl async_inspectable_vtbl =
+     async_inspectable_GetResults,
+ };
+ 
++static HRESULT WINAPI async_int32_GetResults( IAsyncOperation_IInspectable *iface, IInspectable **results )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    INT32 *value = (INT32 *)results;
++    PROPVARIANT result;
++    HRESULT hr;
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    PropVariantInit( &result );
++    if (SUCCEEDED(hr = IAsyncInfoImpl_get_Result( impl->IAsyncInfoImpl_inner, &result )))
++    {
++        *value = result.lVal;
++        PropVariantClear( &result );
++    }
++
++    return hr;
++}
++
++/* Same layout as IAsyncOperation<IInspectable *>, only GetResults returns an INT32. */
++static const struct IAsyncOperation_IInspectableVtbl async_int32_vtbl =
++{
++    async_inspectable_QueryInterface,
++    async_inspectable_AddRef,
++    async_inspectable_Release,
++    async_inspectable_GetIids,
++    async_inspectable_GetRuntimeClassName,
++    async_inspectable_GetTrustLevel,
++    async_inspectable_put_Completed,
++    async_inspectable_get_Completed,
++    async_int32_GetResults,
++};
++
++static HRESULT async_operation_create( const struct IAsyncOperation_IInspectableVtbl *vtbl, const GUID *iid, IUnknown *invoker,
++                                       IUnknown *param, async_operation_callback callback, IAsyncOperation_IInspectable **out );
++
++HRESULT async_operation_int32_create( const GUID *iid, IUnknown *invoker, IUnknown *param, async_operation_callback callback,
++                                      IAsyncOperation_IInspectable **out )
++{
++    return async_operation_create( &async_int32_vtbl, iid, invoker, param, callback, out );
++}
++
+ HRESULT async_operation_inspectable_create( const GUID *iid, IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+                                             IAsyncOperation_IInspectable **out )
++{
++    return async_operation_create( &async_inspectable_vtbl, iid, invoker, param, callback, out );
++}
++
++static HRESULT async_operation_create( const struct IAsyncOperation_IInspectableVtbl *vtbl, const GUID *iid, IUnknown *invoker,
++                                       IUnknown *param, async_operation_callback callback, IAsyncOperation_IInspectable **out )
+ {
+     struct async_inspectable *impl;
+     HRESULT hr;
+ 
+     *out = NULL;
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+-    impl->IAsyncOperation_IInspectable_iface.lpVtbl = &async_inspectable_vtbl;
++    impl->IAsyncOperation_IInspectable_iface.lpVtbl = vtbl;
+     impl->ref = 1;
+     impl->iid = iid;
+ 
+diff --git a/dlls/windows.networking.connectivity/classes.idl b/dlls/windows.networking.connectivity/classes.idl
+index 1cc3c38a..bfa8165a 100644
+--- a/dlls/windows.networking.connectivity/classes.idl
++++ b/dlls/windows.networking.connectivity/classes.idl
+@@ -22,7 +22,13 @@
+ #pragma winrt ns_prefix
+ 
+ import "windows.networking.connectivity.idl";
++import "windows.devices.wifi.idl";
+ 
+ namespace Windows.Networking.Connectivity {
+     runtimeclass NetworkInformation;
+ }
++
++/* Hosted here because it needs this module's NetworkAdapter and security settings. */
++namespace Windows.Devices.WiFi {
++    runtimeclass WiFiAdapter;
++}
+diff --git a/dlls/windows.networking.connectivity/main.c b/dlls/windows.networking.connectivity/main.c
+index 607dd50c..169be0d5 100644
+--- a/dlls/windows.networking.connectivity/main.c
++++ b/dlls/windows.networking.connectivity/main.c
+@@ -20,8 +20,12 @@
+ #include "initguid.h"
+ #include "private.h"
+ 
++#define WIDL_using_Windows_Devices_WiFi
++#include "windows.devices.wifi.h"
++
+ WINE_DEFAULT_DEBUG_CHANNEL(connectivity);
+ 
++
+ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
+ {
+     FIXME( "clsid %s, riid %s, out %p stub!\n", debugstr_guid( clsid ), debugstr_guid( riid ), out );
+@@ -38,6 +42,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( buffer, RuntimeClass_Windows_Networking_Connectivity_NetworkInformation ))
+         IActivationFactory_QueryInterface( network_information_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_WiFi_WiFiAdapter ))
++        IActivationFactory_QueryInterface( wifi_adapter_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.networking.connectivity/network_information.c b/dlls/windows.networking.connectivity/network_information.c
+index f5d796ba..3f556792 100644
+--- a/dlls/windows.networking.connectivity/network_information.c
++++ b/dlls/windows.networking.connectivity/network_information.c
+@@ -130,6 +130,34 @@ static BOOL get_internet_adapter( struct adapter_info *info )
+     return found;
+ }
+ 
++/* The NetworkAdapter of a Wi-Fi interface: the one with the host's interface name,
++ * otherwise the first IEEE 802.11 adapter. */
++HRESULT network_adapter_for_interface( const char *name, INetworkAdapter **out )
++{
++    IP_ADAPTER_ADDRESSES *buf, *aa, *found = NULL;
++    struct adapter_info info, internet;
++    WCHAR nameW[64];
++    HRESULT hr;
++
++    *out = NULL;
++    MultiByteToWideChar( CP_UTF8, 0, name, -1, nameW, ARRAY_SIZE(nameW) );
++    if (!(buf = get_adapters())) return S_OK;
++    for (aa = buf; aa; aa = aa->Next)
++    {
++        if (aa->IfType != IF_TYPE_IEEE80211) continue;
++        if (!found || (aa->FriendlyName && !wcscmp( aa->FriendlyName, nameW ))) found = aa;
++    }
++    if (!found)
++    {
++        free( buf );
++        return S_OK;
++    }
++    fill_adapter_info( found, &info );
++    free( buf );
++    hr = network_adapter_create( &info, get_internet_adapter( &internet ) && internet.if_index == info.if_index, out );
++    return hr;
++}
++
+ /* Windows names unnamed networks after their medium; the Wi-Fi SSID is not available to Wine on macOS. */
+ static const WCHAR *profile_name( const struct adapter_info *adapter )
+ {
+diff --git a/dlls/windows.networking.connectivity/objects.c b/dlls/windows.networking.connectivity/objects.c
+index 1de3a382..75ecdc87 100644
+--- a/dlls/windows.networking.connectivity/objects.c
++++ b/dlls/windows.networking.connectivity/objects.c
+@@ -22,61 +22,6 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(connectivity);
+ 
+ /* IUnknown and IInspectable for objects that expose a single interface, stored in their "iface" member. */
+-#define DEFINE_SIMPLE_INSPECTABLE( pfx, iface_type, impl_type, class_name )                           \
+-    static inline impl_type *pfx##_from_iface( iface_type *iface )                                     \
+-    {                                                                                                  \
+-        return CONTAINING_RECORD( iface, impl_type, iface );                                           \
+-    }                                                                                                  \
+-    static void pfx##_destroy( impl_type *impl );                                                      \
+-    static HRESULT WINAPI pfx##_QueryInterface( iface_type *iface, REFIID iid, void **out )            \
+-    {                                                                                                  \
+-        TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );                      \
+-        if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||              \
+-            IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_##iface_type ))            \
+-        {                                                                                              \
+-            *out = iface;                                                                              \
+-            IInspectable_AddRef( (IInspectable *)*out );                                               \
+-            return S_OK;                                                                               \
+-        }                                                                                              \
+-        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );              \
+-        *out = NULL;                                                                                   \
+-        return E_NOINTERFACE;                                                                          \
+-    }                                                                                                  \
+-    static ULONG WINAPI pfx##_AddRef( iface_type *iface )                                              \
+-    {                                                                                                  \
+-        impl_type *impl = pfx##_from_iface( iface );                                                   \
+-        ULONG ref = InterlockedIncrement( &impl->ref );                                                \
+-        TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );                                 \
+-        return ref;                                                                                    \
+-    }                                                                                                  \
+-    static ULONG WINAPI pfx##_Release( iface_type *iface )                                             \
+-    {                                                                                                  \
+-        impl_type *impl = pfx##_from_iface( iface );                                                   \
+-        ULONG ref = InterlockedDecrement( &impl->ref );                                                \
+-        TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );                                 \
+-        if (!ref) pfx##_destroy( impl );                                                               \
+-        return ref;                                                                                    \
+-    }                                                                                                  \
+-    static HRESULT WINAPI pfx##_GetIids( iface_type *iface, ULONG *iid_count, IID **iids )             \
+-    {                                                                                                  \
+-        FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );                    \
+-        return E_NOTIMPL;                                                                              \
+-    }                                                                                                  \
+-    static HRESULT WINAPI pfx##_GetRuntimeClassName( iface_type *iface, HSTRING *value )               \
+-    {                                                                                                  \
+-        TRACE( "iface %p, value %p.\n", iface, value );                                                \
+-        return WindowsCreateString( class_name, wcslen( class_name ), value );                         \
+-    }                                                                                                  \
+-    static HRESULT WINAPI pfx##_GetTrustLevel( iface_type *iface, TrustLevel *trust_level )            \
+-    {                                                                                                  \
+-        TRACE( "iface %p, trust_level %p.\n", iface, trust_level );                                    \
+-        *trust_level = BaseTrust;                                                                      \
+-        return S_OK;                                                                                   \
+-    }
+-
+-#define SIMPLE_INSPECTABLE_METHODS( pfx ) \
+-    pfx##_QueryInterface, pfx##_AddRef, pfx##_Release, pfx##_GetIids, pfx##_GetRuntimeClassName, pfx##_GetTrustLevel
+-
+ /* ConnectionCost */
+ 
+ struct connection_cost
+diff --git a/dlls/windows.networking.connectivity/private.h b/dlls/windows.networking.connectivity/private.h
+index 3d5e4fff..5b2407a6 100644
+--- a/dlls/windows.networking.connectivity/private.h
++++ b/dlls/windows.networking.connectivity/private.h
+@@ -44,6 +44,63 @@
+ #include "async_private.h"
+ 
+ extern IActivationFactory *network_information_factory;
++extern IActivationFactory *wifi_adapter_factory;
++
++#define DEFINE_SIMPLE_INSPECTABLE( pfx, iface_type, impl_type, class_name )                           \
++    static inline impl_type *pfx##_from_iface( iface_type *iface )                                     \
++    {                                                                                                  \
++        return CONTAINING_RECORD( iface, impl_type, iface );                                           \
++    }                                                                                                  \
++    static void pfx##_destroy( impl_type *impl );                                                      \
++    static HRESULT WINAPI pfx##_QueryInterface( iface_type *iface, REFIID iid, void **out )            \
++    {                                                                                                  \
++        TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );                      \
++        if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||              \
++            IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_##iface_type ))            \
++        {                                                                                              \
++            *out = iface;                                                                              \
++            IInspectable_AddRef( (IInspectable *)*out );                                               \
++            return S_OK;                                                                               \
++        }                                                                                              \
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );              \
++        *out = NULL;                                                                                   \
++        return E_NOINTERFACE;                                                                          \
++    }                                                                                                  \
++    static ULONG WINAPI pfx##_AddRef( iface_type *iface )                                              \
++    {                                                                                                  \
++        impl_type *impl = pfx##_from_iface( iface );                                                   \
++        ULONG ref = InterlockedIncrement( &impl->ref );                                                \
++        TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );                                 \
++        return ref;                                                                                    \
++    }                                                                                                  \
++    static ULONG WINAPI pfx##_Release( iface_type *iface )                                             \
++    {                                                                                                  \
++        impl_type *impl = pfx##_from_iface( iface );                                                   \
++        ULONG ref = InterlockedDecrement( &impl->ref );                                                \
++        TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );                                 \
++        if (!ref) pfx##_destroy( impl );                                                               \
++        return ref;                                                                                    \
++    }                                                                                                  \
++    static HRESULT WINAPI pfx##_GetIids( iface_type *iface, ULONG *iid_count, IID **iids )             \
++    {                                                                                                  \
++        FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );                    \
++        return E_NOTIMPL;                                                                              \
++    }                                                                                                  \
++    static HRESULT WINAPI pfx##_GetRuntimeClassName( iface_type *iface, HSTRING *value )               \
++    {                                                                                                  \
++        TRACE( "iface %p, value %p.\n", iface, value );                                                \
++        return WindowsCreateString( class_name, wcslen( class_name ), value );                         \
++    }                                                                                                  \
++    static HRESULT WINAPI pfx##_GetTrustLevel( iface_type *iface, TrustLevel *trust_level )            \
++    {                                                                                                  \
++        TRACE( "iface %p, trust_level %p.\n", iface, trust_level );                                    \
++        *trust_level = BaseTrust;                                                                      \
++        return S_OK;                                                                                   \
++    }
++
++#define SIMPLE_INSPECTABLE_METHODS( pfx ) \
++    pfx##_QueryInterface, pfx##_AddRef, pfx##_Release, pfx##_GetIids, pfx##_GetRuntimeClassName, pfx##_GetTrustLevel
++
+ 
+ struct vector_iids
+ {
+@@ -59,6 +116,10 @@ HRESULT vector_inspectable_create( const struct vector_iids *iids, IVector_IInsp
+ 
+ HRESULT async_operation_inspectable_create( const GUID *iid, IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+                                             IAsyncOperation_IInspectable **out );
++/* For IAsyncOperation<T> with an enum or INT32 result (VT_I4). */
++HRESULT async_operation_int32_create( const GUID *iid, IUnknown *invoker, IUnknown *param, async_operation_callback callback,
++                                      IAsyncOperation_IInspectable **out );
++HRESULT async_action_create( IUnknown *invoker, async_operation_callback callback, IAsyncAction **out );
+ 
+ /* What windows.networking.connectivity knows about one network adapter (from GetAdaptersAddresses). */
+ struct adapter_info
+@@ -78,6 +139,7 @@ HRESULT connection_cost_create( NetworkCostType type, BOOL roaming, BOOL over_li
+ HRESULT data_plan_status_create( IDataPlanStatus **out );
+ HRESULT network_item_create( const GUID *network_id, NetworkTypes types, INetworkItem **out );
+ HRESULT network_security_settings_create( NetworkAuthenticationType auth, NetworkEncryptionType encryption, INetworkSecuritySettings **out );
++HRESULT network_adapter_for_interface( const char *name, INetworkAdapter **out );
+ HRESULT data_usage_create( UINT64 sent, UINT64 received, IDataUsage **out );
+ HRESULT wlan_details_create( IWlanConnectionProfileDetails **out );
+ HRESULT proxy_configuration_create( IVectorView_Uri *uris, BOOL direct, IProxyConfiguration **out );
+diff --git a/dlls/windows.networking.connectivity/wifi.c b/dlls/windows.networking.connectivity/wifi.c
+new file mode 100644
+index 00000000..8e44c91a
+--- /dev/null
++++ b/dlls/windows.networking.connectivity/wifi.c
+@@ -0,0 +1,841 @@
++/*
++ * Windows.Devices.WiFi with the host's Wi-Fi interface
++ *
++ * Copyright 2026 Daniel Özdek
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "wine/wifi.h"
++
++#define WIDL_using_Windows_Devices_WiFi
++#include "windows.devices.wifi.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(connectivity);
++
++/* Device interfaces of network adapters (GUID_DEVINTERFACE_NET). */
++static const WCHAR device_selector[] =
++    L"System.Devices.InterfaceClassGuid:=\"{CAC88484-7515-4C03-82E6-71A87ABAC361}\" AND "
++    L"System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
++
++/* Like Windows, Windows.Devices.WiFi sits on top of wlanapi.dll. */
++static HRESULT query_wifi( BOOL scan, struct wifi_info_params **out )
++{
++    static wine_wlan_query_func query;
++    struct wifi_info_params *params;
++    HMODULE wlanapi;
++    DWORD err;
++
++    *out = NULL;
++    if (!query && (wlanapi = LoadLibraryW( L"wlanapi.dll" )))
++        query = (wine_wlan_query_func)GetProcAddress( wlanapi, "__wine_wlan_query" );
++    if (!(params = calloc( 1, sizeof(*params) ))) return E_OUTOFMEMORY;
++    if (!query) WARN( "wlanapi has no Wi-Fi data, reporting no adapter.\n" );
++    else if ((err = query( params, scan ))) WARN( "Wi-Fi query failed, error %lu.\n", err );
++    *out = params;
++    return S_OK;
++}
++
++static void adapter_id( const struct wifi_info_params *info, WCHAR *buffer, size_t size )
++{
++    swprintf( buffer, size, L"\\\\?\\VIRTUAL#WIFI#%02X%02X%02X%02X%02X%02X#{cac88484-7515-4c03-82e6-71a87abac361}",
++              info->mac[0], info->mac[1], info->mac[2], info->mac[3], info->mac[4], info->mac[5] );
++}
++
++/* WiFiConnectionResult */
++
++struct connection_result
++{
++    IWiFiConnectionResult iface;
++    LONG ref;
++    WiFiConnectionStatus status;
++};
++
++DEFINE_SIMPLE_INSPECTABLE( connection_result, IWiFiConnectionResult, struct connection_result,
++                           L"Windows.Devices.WiFi.WiFiConnectionResult" )
++
++static void connection_result_destroy( struct connection_result *impl ) { free( impl ); }
++
++static HRESULT WINAPI connection_result_get_ConnectionStatus( IWiFiConnectionResult *iface, WiFiConnectionStatus *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = connection_result_from_iface( iface )->status;
++    return S_OK;
++}
++
++static const struct IWiFiConnectionResultVtbl connection_result_vtbl =
++{
++    SIMPLE_INSPECTABLE_METHODS( connection_result ),
++    connection_result_get_ConnectionStatus,
++};
++
++static HRESULT connection_result_create( WiFiConnectionStatus status, IWiFiConnectionResult **out )
++{
++    struct connection_result *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->iface.lpVtbl = &connection_result_vtbl;
++    impl->ref = 1;
++    impl->status = status;
++    *out = &impl->iface;
++    return S_OK;
++}
++
++/* WiFiAvailableNetwork */
++
++struct available_network
++{
++    IWiFiAvailableNetwork iface;
++    LONG ref;
++    struct wifi_network net;
++};
++
++DEFINE_SIMPLE_INSPECTABLE( available_network, IWiFiAvailableNetwork, struct available_network,
++                           L"Windows.Devices.WiFi.WiFiAvailableNetwork" )
++
++static void available_network_destroy( struct available_network *impl ) { free( impl ); }
++
++static HRESULT WINAPI available_network_get_Uptime( IWiFiAvailableNetwork *iface, TimeSpan *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    value->Duration = 0; /* the host does not report how long a network has been up */
++    return S_OK;
++}
++
++static HRESULT WINAPI available_network_get_Ssid( IWiFiAvailableNetwork *iface, HSTRING *value )
++{
++    struct available_network *impl = available_network_from_iface( iface );
++    WCHAR ssid[ARRAY_SIZE(impl->net.ssid)];
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    MultiByteToWideChar( CP_UTF8, 0, impl->net.ssid, -1, ssid, ARRAY_SIZE(ssid) );
++    return WindowsCreateString( ssid, wcslen( ssid ), value );
++}
++
++static HRESULT WINAPI available_network_get_Bssid( IWiFiAvailableNetwork *iface, HSTRING *value )
++{
++    struct available_network *impl = available_network_from_iface( iface );
++    const BYTE *b = impl->net.bssid;
++    WCHAR bssid[18];
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    if (!impl->net.has_bssid) return WindowsCreateString( NULL, 0, value );
++    swprintf( bssid, ARRAY_SIZE(bssid), L"%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5] );
++    return WindowsCreateString( bssid, wcslen( bssid ), value );
++}
++
++static HRESULT WINAPI available_network_get_ChannelCenterFrequencyInKilohertz( IWiFiAvailableNetwork *iface, INT32 *value )
++{
++    struct available_network *impl = available_network_from_iface( iface );
++    INT32 channel = impl->net.channel;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    switch (impl->net.band)
++    {
++    case 1: *value = (channel == 14 ? 2484 : 2407 + 5 * channel) * 1000; break;
++    case 2: *value = (5000 + 5 * channel) * 1000; break;
++    case 3: *value = (5950 + 5 * channel) * 1000; break;
++    default: *value = 0; break;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI available_network_get_NetworkRssiInDecibelMilliwatts( IWiFiAvailableNetwork *iface, DOUBLE *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = available_network_from_iface( iface )->net.rssi;
++    return S_OK;
++}
++
++static HRESULT WINAPI available_network_get_SignalBars( IWiFiAvailableNetwork *iface, BYTE *value )
++{
++    INT32 rssi = available_network_from_iface( iface )->net.rssi;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    /* The four bars of the Windows network icon. */
++    if (rssi >= -60) *value = 4;
++    else if (rssi >= -67) *value = 3;
++    else if (rssi >= -75) *value = 2;
++    else if (rssi >= -85) *value = 1;
++    else *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI available_network_get_NetworkKind( IWiFiAvailableNetwork *iface, WiFiNetworkKind *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = available_network_from_iface( iface )->net.adhoc ? WiFiNetworkKind_Adhoc : WiFiNetworkKind_Infrastructure;
++    return S_OK;
++}
++
++static HRESULT WINAPI available_network_get_PhyKind( IWiFiAvailableNetwork *iface, WiFiPhyKind *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = available_network_from_iface( iface )->net.phy;
++    return S_OK;
++}
++
++static HRESULT WINAPI available_network_get_SecuritySettings( IWiFiAvailableNetwork *iface, INetworkSecuritySettings **value )
++{
++    /* Values past Ihv (Wpa3Sae 11, Owe 12, Wpa3Enterprise 13; Gcmp 10) exist since Windows 10 2004. */
++    static const struct { int auth, encryption; } map[] =
++    {
++        [WIFI_SECURITY_UNKNOWN]         = { NetworkAuthenticationType_Unknown, NetworkEncryptionType_Unknown },
++        [WIFI_SECURITY_OPEN]            = { NetworkAuthenticationType_Open80211, NetworkEncryptionType_None },
++        [WIFI_SECURITY_WEP]             = { NetworkAuthenticationType_SharedKey80211, NetworkEncryptionType_Wep },
++        [WIFI_SECURITY_WPA_PERSONAL]    = { NetworkAuthenticationType_WpaPsk, NetworkEncryptionType_Tkip },
++        [WIFI_SECURITY_WPA2_PERSONAL]   = { NetworkAuthenticationType_RsnaPsk, NetworkEncryptionType_Ccmp },
++        [WIFI_SECURITY_WPA3_PERSONAL]   = { 11, NetworkEncryptionType_Ccmp },
++        [WIFI_SECURITY_WPA_ENTERPRISE]  = { NetworkAuthenticationType_Wpa, NetworkEncryptionType_Tkip },
++        [WIFI_SECURITY_WPA2_ENTERPRISE] = { NetworkAuthenticationType_Rsna, NetworkEncryptionType_Ccmp },
++        [WIFI_SECURITY_WPA3_ENTERPRISE] = { 13, 10 },
++        [WIFI_SECURITY_OWE]             = { 12, NetworkEncryptionType_Ccmp },
++    };
++    INT32 security = available_network_from_iface( iface )->net.security;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    if (security < 0 || security >= ARRAY_SIZE(map)) security = WIFI_SECURITY_UNKNOWN;
++    return network_security_settings_create( map[security].auth, map[security].encryption, value );
++}
++
++static HRESULT WINAPI available_network_get_BeaconInterval( IWiFiAvailableNetwork *iface, TimeSpan *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    value->Duration = (INT64)available_network_from_iface( iface )->net.beacon_ms * 10000;
++    return S_OK;
++}
++
++static HRESULT WINAPI available_network_get_IsWiFiDirect( IWiFiAvailableNetwork *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++
++static const struct IWiFiAvailableNetworkVtbl available_network_vtbl =
++{
++    SIMPLE_INSPECTABLE_METHODS( available_network ),
++    available_network_get_Uptime,
++    available_network_get_Ssid,
++    available_network_get_Bssid,
++    available_network_get_ChannelCenterFrequencyInKilohertz,
++    available_network_get_NetworkRssiInDecibelMilliwatts,
++    available_network_get_SignalBars,
++    available_network_get_NetworkKind,
++    available_network_get_PhyKind,
++    available_network_get_SecuritySettings,
++    available_network_get_BeaconInterval,
++    available_network_get_IsWiFiDirect,
++};
++
++static HRESULT available_network_create( const struct wifi_network *net, IWiFiAvailableNetwork **out )
++{
++    struct available_network *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->iface.lpVtbl = &available_network_vtbl;
++    impl->ref = 1;
++    impl->net = *net;
++    *out = &impl->iface;
++    return S_OK;
++}
++
++/* WiFiNetworkReport */
++
++struct network_report
++{
++    IWiFiNetworkReport iface;
++    LONG ref;
++    DateTime timestamp;
++    IVectorView_WiFiAvailableNetwork *networks;
++};
++
++DEFINE_SIMPLE_INSPECTABLE( network_report, IWiFiNetworkReport, struct network_report,
++                           L"Windows.Devices.WiFi.WiFiNetworkReport" )
++
++static void network_report_destroy( struct network_report *impl )
++{
++    IVectorView_WiFiAvailableNetwork_Release( impl->networks );
++    free( impl );
++}
++
++static HRESULT WINAPI network_report_get_Timestamp( IWiFiNetworkReport *iface, DateTime *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = network_report_from_iface( iface )->timestamp;
++    return S_OK;
++}
++
++static HRESULT WINAPI network_report_get_AvailableNetworks( IWiFiNetworkReport *iface, IVectorView_WiFiAvailableNetwork **value )
++{
++    struct network_report *impl = network_report_from_iface( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    IVectorView_WiFiAvailableNetwork_AddRef( (*value = impl->networks) );
++    return S_OK;
++}
++
++static const struct IWiFiNetworkReportVtbl network_report_vtbl =
++{
++    SIMPLE_INSPECTABLE_METHODS( network_report ),
++    network_report_get_Timestamp,
++    network_report_get_AvailableNetworks,
++};
++
++static HRESULT network_report_create( const struct wifi_info_params *info, IWiFiNetworkReport **out )
++{
++    static const struct vector_iids iids =
++    {
++        .iterable = &IID_IIterable_WiFiAvailableNetwork,
++        .iterator = &IID_IIterator_WiFiAvailableNetwork,
++        .vector = &IID_IVector_WiFiAvailableNetwork,
++        .view = &IID_IVectorView_WiFiAvailableNetwork,
++    };
++    struct network_report *impl;
++    IWiFiAvailableNetwork *network;
++    IVector_IInspectable *vector;
++    FILETIME now;
++    HRESULT hr;
++    UINT32 i;
++
++    if (FAILED(hr = vector_inspectable_create( &iids, &vector ))) return hr;
++    for (i = 0; i < info->count && SUCCEEDED(hr); i++)
++    {
++        if (FAILED(hr = available_network_create( &info->networks[i], &network ))) break;
++        hr = IVector_IInspectable_Append( vector, (IInspectable *)network );
++        IWiFiAvailableNetwork_Release( network );
++    }
++    if (FAILED(hr) || !(impl = calloc( 1, sizeof(*impl) )))
++    {
++        IVector_IInspectable_Release( vector );
++        return FAILED(hr) ? hr : E_OUTOFMEMORY;
++    }
++    impl->iface.lpVtbl = &network_report_vtbl;
++    impl->ref = 1;
++    GetSystemTimeAsFileTime( &now );
++    impl->timestamp.UniversalTime = ((INT64)now.dwHighDateTime << 32) | now.dwLowDateTime;
++    hr = IVector_IInspectable_GetView( vector, (IVectorView_IInspectable **)&impl->networks );
++    IVector_IInspectable_Release( vector );
++    if (FAILED(hr))
++    {
++        free( impl );
++        return hr;
++    }
++    *out = &impl->iface;
++    return S_OK;
++}
++
++/* WiFiAdapter */
++
++struct event_handler
++{
++    struct list entry;
++    EventRegistrationToken token;
++    ITypedEventHandler_WiFiAdapter_IInspectable *handler;
++};
++
++struct wifi_adapter
++{
++    IWiFiAdapter iface;
++    LONG ref;
++    CRITICAL_SECTION cs;
++    struct wifi_info_params *last_scan;
++    struct list handlers;
++    INT64 next_token;
++};
++
++DEFINE_SIMPLE_INSPECTABLE( wifi_adapter, IWiFiAdapter, struct wifi_adapter, L"Windows.Devices.WiFi.WiFiAdapter" )
++
++static void wifi_adapter_destroy( struct wifi_adapter *impl )
++{
++    struct event_handler *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &impl->handlers, struct event_handler, entry )
++    {
++        ITypedEventHandler_WiFiAdapter_IInspectable_Release( entry->handler );
++        free( entry );
++    }
++    free( impl->last_scan );
++    impl->cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection( &impl->cs );
++    free( impl );
++}
++
++static HRESULT WINAPI wifi_adapter_get_NetworkAdapter( IWiFiAdapter *iface, INetworkAdapter **value )
++{
++    struct wifi_info_params *info;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    if (FAILED(hr = query_wifi( FALSE, &info ))) return hr;
++    hr = network_adapter_for_interface( info->name, value );
++    free( info );
++    return hr;
++}
++
++static HRESULT scan_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    struct wifi_adapter *impl = wifi_adapter_from_iface( (IWiFiAdapter *)invoker );
++    ITypedEventHandler_WiFiAdapter_IInspectable **handlers = NULL;
++    struct wifi_info_params *info;
++    struct event_handler *entry;
++    UINT32 count = 0, i;
++    HRESULT hr;
++
++    if (!called_async) return STATUS_PENDING;
++    if (FAILED(hr = query_wifi( TRUE, &info ))) return hr;
++
++    EnterCriticalSection( &impl->cs );
++    free( impl->last_scan );
++    impl->last_scan = info;
++    if ((handlers = calloc( list_count( &impl->handlers ) + 1, sizeof(*handlers) )))
++        LIST_FOR_EACH_ENTRY( entry, &impl->handlers, struct event_handler, entry )
++            ITypedEventHandler_WiFiAdapter_IInspectable_AddRef( (handlers[count++] = entry->handler) );
++    LeaveCriticalSection( &impl->cs );
++
++    /* Outside the lock: a handler may read the new NetworkReport. */
++    for (i = 0; i < count; i++)
++    {
++        ITypedEventHandler_WiFiAdapter_IInspectable_Invoke( handlers[i], &impl->iface, NULL );
++        ITypedEventHandler_WiFiAdapter_IInspectable_Release( handlers[i] );
++    }
++    free( handlers );
++    return S_OK;
++}
++
++static HRESULT WINAPI wifi_adapter_ScanAsync( IWiFiAdapter *iface, IAsyncAction **operation )
++{
++    TRACE( "iface %p, operation %p.\n", iface, operation );
++    if (!operation) return E_POINTER;
++    return async_action_create( (IUnknown *)iface, scan_callback, operation );
++}
++
++static HRESULT WINAPI wifi_adapter_get_NetworkReport( IWiFiAdapter *iface, IWiFiNetworkReport **value )
++{
++    struct wifi_adapter *impl = wifi_adapter_from_iface( iface );
++    struct wifi_info_params *info;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++
++    /* Without a ScanAsync call, report what the host has seen most recently. */
++    EnterCriticalSection( &impl->cs );
++    hr = impl->last_scan ? network_report_create( impl->last_scan, value ) : S_FALSE;
++    LeaveCriticalSection( &impl->cs );
++    if (hr != S_FALSE) return hr;
++
++    if (FAILED(hr = query_wifi( FALSE, &info ))) return hr;
++    hr = network_report_create( info, value );
++    free( info );
++    return hr;
++}
++
++static HRESULT WINAPI wifi_adapter_add_AvailableNetworksChanged( IWiFiAdapter *iface, ITypedEventHandler_WiFiAdapter_IInspectable *handler,
++                                                                 EventRegistrationToken *token )
++{
++    struct wifi_adapter *impl = wifi_adapter_from_iface( iface );
++    struct event_handler *entry;
++
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    if (!handler || !token) return E_POINTER;
++    if (!(entry = calloc( 1, sizeof(*entry) ))) return E_OUTOFMEMORY;
++    ITypedEventHandler_WiFiAdapter_IInspectable_AddRef( (entry->handler = handler) );
++    EnterCriticalSection( &impl->cs );
++    entry->token.value = ++impl->next_token;
++    list_add_tail( &impl->handlers, &entry->entry );
++    LeaveCriticalSection( &impl->cs );
++    *token = entry->token;
++    return S_OK;
++}
++
++static HRESULT WINAPI wifi_adapter_remove_AvailableNetworksChanged( IWiFiAdapter *iface, EventRegistrationToken token )
++{
++    struct wifi_adapter *impl = wifi_adapter_from_iface( iface );
++    struct event_handler *entry, *found = NULL;
++
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    EnterCriticalSection( &impl->cs );
++    LIST_FOR_EACH_ENTRY( entry, &impl->handlers, struct event_handler, entry )
++    {
++        if (entry->token.value != token.value) continue;
++        list_remove( &entry->entry );
++        found = entry;
++        break;
++    }
++    LeaveCriticalSection( &impl->cs );
++    if (found)
++    {
++        ITypedEventHandler_WiFiAdapter_IInspectable_Release( found->handler );
++        free( found );
++    }
++    return S_OK;
++}
++
++static HRESULT connect_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    IWiFiAvailableNetwork *network = (IWiFiAvailableNetwork *)param;
++    IWiFiConnectionResult *connection;
++    WiFiConnectionStatus status;
++    HRESULT hr;
++
++    /* Joining networks belongs to macOS; a Windows program is only told it is connected
++     * to the network the Mac already uses. */
++    if (network && network->lpVtbl == &available_network_vtbl && available_network_from_iface( network )->net.current)
++        status = WiFiConnectionStatus_Success;
++    else
++        status = WiFiConnectionStatus_AccessRevoked;
++    if (FAILED(hr = connection_result_create( status, &connection ))) return hr;
++    result->vt = VT_UNKNOWN;
++    result->punkVal = (IUnknown *)connection;
++    return S_OK;
++}
++
++static HRESULT connect_async( IWiFiAdapter *iface, IWiFiAvailableNetwork *network, IAsyncOperation_WiFiConnectionResult **operation )
++{
++    if (!network || !operation) return E_POINTER;
++    return async_operation_inspectable_create( &IID_IAsyncOperation_WiFiConnectionResult, (IUnknown *)iface, (IUnknown *)network,
++                                               connect_callback, (IAsyncOperation_IInspectable **)operation );
++}
++
++static HRESULT WINAPI wifi_adapter_ConnectAsync( IWiFiAdapter *iface, IWiFiAvailableNetwork *network, WiFiReconnectionKind kind,
++                                                 IAsyncOperation_WiFiConnectionResult **operation )
++{
++    TRACE( "iface %p, network %p, kind %d, operation %p.\n", iface, network, kind, operation );
++    return connect_async( iface, network, operation );
++}
++
++static HRESULT WINAPI wifi_adapter_ConnectWithPasswordCredentialAsync( IWiFiAdapter *iface, IWiFiAvailableNetwork *network,
++                                                                       WiFiReconnectionKind kind, IInspectable *credential,
++                                                                       IAsyncOperation_WiFiConnectionResult **operation )
++{
++    TRACE( "iface %p, network %p, kind %d, credential %p, operation %p.\n", iface, network, kind, credential, operation );
++    return connect_async( iface, network, operation );
++}
++
++static HRESULT WINAPI wifi_adapter_ConnectWithPasswordCredentialAndSsidAsync( IWiFiAdapter *iface, IWiFiAvailableNetwork *network,
++                                                                              WiFiReconnectionKind kind, IInspectable *credential, HSTRING ssid,
++                                                                              IAsyncOperation_WiFiConnectionResult **operation )
++{
++    TRACE( "iface %p, network %p, kind %d, credential %p, ssid %s, operation %p.\n", iface, network, kind, credential,
++           debugstr_hstring( ssid ), operation );
++    return connect_async( iface, network, operation );
++}
++
++static HRESULT WINAPI wifi_adapter_Disconnect( IWiFiAdapter *iface )
++{
++    /* The connection is the Mac's; Windows programs must not take it away. */
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
++}
++
++static const struct IWiFiAdapterVtbl wifi_adapter_vtbl =
++{
++    SIMPLE_INSPECTABLE_METHODS( wifi_adapter ),
++    wifi_adapter_get_NetworkAdapter,
++    wifi_adapter_ScanAsync,
++    wifi_adapter_get_NetworkReport,
++    wifi_adapter_add_AvailableNetworksChanged,
++    wifi_adapter_remove_AvailableNetworksChanged,
++    wifi_adapter_ConnectAsync,
++    wifi_adapter_ConnectWithPasswordCredentialAsync,
++    wifi_adapter_ConnectWithPasswordCredentialAndSsidAsync,
++    wifi_adapter_Disconnect,
++};
++
++static HRESULT wifi_adapter_create( IWiFiAdapter **out )
++{
++    struct wifi_adapter *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->iface.lpVtbl = &wifi_adapter_vtbl;
++    impl->ref = 1;
++    list_init( &impl->handlers );
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": wifi_adapter.cs");
++    *out = &impl->iface;
++    return S_OK;
++}
++
++/* WiFiAdapter statics */
++
++struct wifi_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IWiFiAdapterStatics IWiFiAdapterStatics_iface;
++    LONG ref;
++};
++
++static inline struct wifi_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct wifi_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct wifi_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        IInspectable_AddRef( (*out = &impl->IActivationFactory_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IWiFiAdapterStatics ))
++    {
++        IInspectable_AddRef( (*out = &impl->IWiFiAdapterStatics_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    struct wifi_statics *impl = impl_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    struct wifi_statics *impl = impl_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    /* WiFiAdapter objects only come from FindAllAdaptersAsync and FromIdAsync. */
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IWiFiAdapterStatics, struct wifi_statics, IActivationFactory_iface )
++
++static HRESULT find_all_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    static const struct vector_iids iids =
++    {
++        .iterable = &IID_IIterable_WiFiAdapter,
++        .iterator = &IID_IIterator_WiFiAdapter,
++        .vector = &IID_IVector_WiFiAdapter,
++        .view = &IID_IVectorView_WiFiAdapter,
++    };
++    struct wifi_info_params *info;
++    IVectorView_IInspectable *view;
++    IVector_IInspectable *vector;
++    IWiFiAdapter *adapter;
++    HRESULT hr;
++
++    if (FAILED(hr = query_wifi( FALSE, &info ))) return hr;
++    if (SUCCEEDED(hr = vector_inspectable_create( &iids, &vector )))
++    {
++        if (info->present && SUCCEEDED(hr = wifi_adapter_create( &adapter )))
++        {
++            hr = IVector_IInspectable_Append( vector, (IInspectable *)adapter );
++            IWiFiAdapter_Release( adapter );
++        }
++        if (SUCCEEDED(hr) && SUCCEEDED(hr = IVector_IInspectable_GetView( vector, &view )))
++        {
++            result->vt = VT_UNKNOWN;
++            result->punkVal = (IUnknown *)view;
++        }
++        IVector_IInspectable_Release( vector );
++    }
++    free( info );
++    return hr;
++}
++
++static HRESULT WINAPI statics_FindAllAdaptersAsync( IWiFiAdapterStatics *iface, IAsyncOperation_IVectorView_WiFiAdapter **operation )
++{
++    TRACE( "iface %p, operation %p.\n", iface, operation );
++    if (!operation) return E_POINTER;
++    return async_operation_inspectable_create( &IID_IAsyncOperation_IVectorView_WiFiAdapter, (IUnknown *)iface, NULL,
++                                               find_all_callback, (IAsyncOperation_IInspectable **)operation );
++}
++
++static HRESULT WINAPI statics_GetDeviceSelector( IWiFiAdapterStatics *iface, HSTRING *selector )
++{
++    TRACE( "iface %p, selector %p.\n", iface, selector );
++    if (!selector) return E_POINTER;
++    return WindowsCreateString( device_selector, ARRAY_SIZE(device_selector) - 1, selector );
++}
++
++static HRESULT from_id_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    struct wifi_info_params *info;
++    IWiFiAdapter *adapter;
++    HSTRING id = (HSTRING)param;
++    WCHAR expected[128];
++    HRESULT hr = S_OK;
++
++    if (FAILED(hr = query_wifi( FALSE, &info ))) return hr;
++    adapter_id( info, expected, ARRAY_SIZE(expected) );
++    result->vt = VT_UNKNOWN;
++    result->punkVal = NULL;
++    if (info->present && !wcsicmp( WindowsGetStringRawBuffer( id, NULL ), expected ) && SUCCEEDED(hr = wifi_adapter_create( &adapter )))
++        result->punkVal = (IUnknown *)adapter;
++    free( info );
++    return hr;
++}
++
++/* Keeps an HSTRING alive as the async operation's parameter. */
++struct hstring_param
++{
++    IUnknown IUnknown_iface;
++    LONG ref;
++    HSTRING value;
++};
++
++static HRESULT WINAPI hstring_param_QueryInterface( IUnknown *iface, REFIID iid, void **out )
++{
++    if (!IsEqualGUID( iid, &IID_IUnknown )) return E_NOINTERFACE;
++    *out = iface;
++    IUnknown_AddRef( iface );
++    return S_OK;
++}
++
++static ULONG WINAPI hstring_param_AddRef( IUnknown *iface )
++{
++    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct hstring_param, IUnknown_iface )->ref );
++}
++
++static ULONG WINAPI hstring_param_Release( IUnknown *iface )
++{
++    struct hstring_param *impl = CONTAINING_RECORD( iface, struct hstring_param, IUnknown_iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        WindowsDeleteString( impl->value );
++        free( impl );
++    }
++    return ref;
++}
++
++static const IUnknownVtbl hstring_param_vtbl = { hstring_param_QueryInterface, hstring_param_AddRef, hstring_param_Release };
++
++static HRESULT from_id_param_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    return from_id_callback( invoker, (IUnknown *)CONTAINING_RECORD( param, struct hstring_param, IUnknown_iface )->value,
++                             result, called_async );
++}
++
++static HRESULT WINAPI statics_FromIdAsync( IWiFiAdapterStatics *iface, HSTRING id, IAsyncOperation_WiFiAdapter **operation )
++{
++    struct hstring_param *param;
++    HRESULT hr;
++
++    TRACE( "iface %p, id %s, operation %p.\n", iface, debugstr_hstring( id ), operation );
++    if (!operation) return E_POINTER;
++    if (!(param = calloc( 1, sizeof(*param) ))) return E_OUTOFMEMORY;
++    param->IUnknown_iface.lpVtbl = &hstring_param_vtbl;
++    param->ref = 1;
++    if (FAILED(hr = WindowsDuplicateString( id, &param->value )))
++    {
++        free( param );
++        return hr;
++    }
++    hr = async_operation_inspectable_create( &IID_IAsyncOperation_WiFiAdapter, (IUnknown *)iface, &param->IUnknown_iface,
++                                             from_id_param_callback, (IAsyncOperation_IInspectable **)operation );
++    IUnknown_Release( &param->IUnknown_iface );
++    return hr;
++}
++
++static HRESULT access_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    /* Reading Wi-Fi state needs no consent on macOS (SSIDs stay hidden without location access). */
++    result->vt = VT_I4;
++    result->lVal = WiFiAccessStatus_Allowed;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_RequestAccessAsync( IWiFiAdapterStatics *iface, IAsyncOperation_WiFiAccessStatus **operation )
++{
++    TRACE( "iface %p, operation %p.\n", iface, operation );
++    if (!operation) return E_POINTER;
++    return async_operation_int32_create( &IID_IAsyncOperation_WiFiAccessStatus, (IUnknown *)iface, NULL,
++                                         access_callback, (IAsyncOperation_IInspectable **)operation );
++}
++
++static const struct IWiFiAdapterStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    statics_FindAllAdaptersAsync,
++    statics_GetDeviceSelector,
++    statics_FromIdAsync,
++    statics_RequestAccessAsync,
++};
++
++static struct wifi_statics wifi_statics =
++{
++    {&factory_vtbl},
++    {&statics_vtbl},
++    1,
++};
++
++IActivationFactory *wifi_adapter_factory = &wifi_statics.IActivationFactory_iface;
+diff --git a/dlls/wlanapi/Makefile.in b/dlls/wlanapi/Makefile.in
+index bd2bf87d..d2846f3a 100644
+--- a/dlls/wlanapi/Makefile.in
++++ b/dlls/wlanapi/Makefile.in
+@@ -1,7 +1,10 @@
+ MODULE    = wlanapi.dll
++UNIXLIB   = wlanapi.so
+ IMPORTLIB = wlanapi
++IMPORTS   = iphlpapi
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
+-	main.c
++	main.c \
++	unixlib.c
+diff --git a/dlls/wlanapi/main.c b/dlls/wlanapi/main.c
+index c3712662..4a9d7d10 100644
+--- a/dlls/wlanapi/main.c
++++ b/dlls/wlanapi/main.c
+@@ -28,14 +28,106 @@
+ 
+ #include <stdarg.h>
+ 
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winternl.h"
++#include "winsock2.h"
++#include "ws2ipdef.h"
++#include "iphlpapi.h"
++#include "netioapi.h"
+ #include "wine/debug.h"
+ 
+ #include "wlanapi.h"
++#include "unixlib.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wlanapi);
+ 
++static BOOL have_unixlib;
++
++BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
++{
++    if (reason == DLL_PROCESS_ATTACH)
++    {
++        DisableThreadLibraryCalls( instance );
++        have_unixlib = !__wine_init_unix_call();
++    }
++    return TRUE;
++}
++
++/* Wi-Fi data from the host; also used by Windows.Devices.WiFi. */
++DWORD WINAPI __wine_wlan_query( struct wifi_info_params *params, BOOL scan )
++{
++    memset( params, 0, sizeof(*params) );
++    if (!have_unixlib) return ERROR_NOT_SUPPORTED;
++    return WINE_UNIX_CALL( scan ? unix_wifi_scan : unix_wifi_info, params ) ? ERROR_NOT_SUPPORTED : ERROR_SUCCESS;
++}
++
++static struct wifi_info_params *query_host( BOOL scan )
++{
++    struct wifi_info_params *params = malloc( sizeof(*params) );
++    if (params && __wine_wlan_query( params, scan )) memset( params, 0, sizeof(*params) );
++    return params;
++}
++
++/* The interface GUID is the one of the IEEE 802.11 network adapter, as on Windows. */
++static BOOL get_interface_guid( GUID *guid )
++{
++    IP_ADAPTER_ADDRESSES *buf = NULL, *aa;
++    ULONG size = 15000, err;
++    BOOL found = FALSE;
++
++    do
++    {
++        free( buf );
++        if (!(buf = malloc( size ))) return FALSE;
++        err = GetAdaptersAddresses( AF_UNSPEC, GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST |
++                                    GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, buf, &size );
++    } while (err == ERROR_BUFFER_OVERFLOW);
++    for (aa = buf; !err && aa && !found; aa = aa->Next)
++        if (aa->IfType == IF_TYPE_IEEE80211) found = !ConvertInterfaceLuidToGuid( &aa->Luid, guid );
++    free( buf );
++    return found;
++}
++
++static BOOL is_our_interface( const GUID *guid )
++{
++    GUID ours;
++    return guid && get_interface_guid( &ours ) && IsEqualGUID( guid, &ours );
++}
++
++static DOT11_PHY_TYPE phy_type( INT32 phy )
++{
++    /* WiFiPhyKind and DOT11_PHY_TYPE share their values; newer ones are passed as is. */
++    return phy;
++}
++
++static WLAN_SIGNAL_QUALITY signal_quality( INT32 rssi )
++{
++    /* Windows maps -100 dBm to 0 and -50 dBm or better to 100. */
++    if (rssi <= -100) return 0;
++    if (rssi >= -50) return 100;
++    return 2 * (rssi + 100);
++}
++
++static void security_algorithms( INT32 security, BOOL *enabled, DOT11_AUTH_ALGORITHM *auth, DOT11_CIPHER_ALGORITHM *cipher )
++{
++    *enabled = TRUE;
++    switch (security)
++    {
++    case WIFI_SECURITY_OPEN: *enabled = FALSE; *auth = DOT11_AUTH_ALGO_80211_OPEN; *cipher = DOT11_CIPHER_ALGO_NONE; break;
++    case WIFI_SECURITY_WEP: *auth = DOT11_AUTH_ALGO_80211_SHARED_KEY; *cipher = DOT11_CIPHER_ALGO_WEP; break;
++    case WIFI_SECURITY_WPA_PERSONAL: *auth = DOT11_AUTH_ALGO_WPA_PSK; *cipher = DOT11_CIPHER_ALGO_TKIP; break;
++    case WIFI_SECURITY_WPA_ENTERPRISE: *auth = DOT11_AUTH_ALGO_WPA; *cipher = DOT11_CIPHER_ALGO_TKIP; break;
++    case WIFI_SECURITY_WPA2_ENTERPRISE: *auth = DOT11_AUTH_ALGO_RSNA; *cipher = DOT11_CIPHER_ALGO_CCMP; break;
++    case WIFI_SECURITY_WPA3_PERSONAL: *auth = 9 /* DOT11_AUTH_ALGO_WPA3_SAE */; *cipher = DOT11_CIPHER_ALGO_CCMP; break;
++    case WIFI_SECURITY_WPA3_ENTERPRISE: *auth = 10 /* DOT11_AUTH_ALGO_WPA3_ENT */; *cipher = 0x08 /* GCMP_256 */; break;
++    case WIFI_SECURITY_OWE: *auth = 11 /* DOT11_AUTH_ALGO_OWE */; *cipher = DOT11_CIPHER_ALGO_CCMP; break;
++    default: *auth = DOT11_AUTH_ALGO_RSNA_PSK; *cipher = DOT11_CIPHER_ALGO_CCMP; break;
++    }
++}
++
+ #define WLAN_MAGIC 0x574c414e /* WLAN */
+ 
+ static struct wine_wlan
+@@ -74,7 +166,10 @@ DWORD WINAPI WlanEnumInterfaces(HANDLE handle, void *reserved, WLAN_INTERFACE_IN
+     struct wine_wlan *wlan;
+     WLAN_INTERFACE_INFO_LIST *ret_list;
+ 
+-    FIXME("(%p, %p, %p) semi-stub\n", handle, reserved, interface_list);
++    struct wifi_info_params *info;
++    GUID guid;
++
++    TRACE("(%p, %p, %p)\n", handle, reserved, interface_list);
+ 
+     if (!handle || reserved || !interface_list)
+         return ERROR_INVALID_PARAMETER;
+@@ -90,6 +185,17 @@ DWORD WINAPI WlanEnumInterfaces(HANDLE handle, void *reserved, WLAN_INTERFACE_IN
+     memset(&ret_list->InterfaceInfo[0], 0, sizeof(WLAN_INTERFACE_INFO));
+     ret_list->dwNumberOfItems = 0;
+     ret_list->dwIndex = 0; /* unused in this function */
++    if ((info = query_host(FALSE)) && info->present && get_interface_guid(&guid))
++    {
++        WLAN_INTERFACE_INFO *iface = &ret_list->InterfaceInfo[0];
++
++        iface->InterfaceGuid = guid;
++        swprintf(iface->strInterfaceDescription, ARRAY_SIZE(iface->strInterfaceDescription), L"Wi-Fi (%S)", info->name);
++        iface->isState = !info->power_on ? wlan_interface_state_not_ready :
++                         info->associated ? wlan_interface_state_connected : wlan_interface_state_disconnected;
++        ret_list->dwNumberOfItems = 1;
++    }
++    free(info);
+     *interface_list = ret_list;
+ 
+     return ERROR_SUCCESS;
+@@ -136,13 +242,22 @@ DWORD WINAPI WlanOpenHandle(DWORD client_version, void *reserved, DWORD *negotia
+     return ERROR_SUCCESS;
+ }
+ 
++static void CALLBACK scan_proc(TP_CALLBACK_INSTANCE *instance, void *context)
++{
++    free(query_host(TRUE));
++}
++
+ DWORD WINAPI WlanScan(HANDLE handle, const GUID *guid, const DOT11_SSID *ssid,
+                       const WLAN_RAW_DATA *raw, void *reserved)
+ {
+-    FIXME("(%p, %s, %p, %p, %p) stub\n",
+-          handle, wine_dbgstr_guid(guid), ssid, raw, reserved);
++    TRACE("(%p, %s, %p, %p, %p)\n", handle, wine_dbgstr_guid(guid), ssid, raw, reserved);
+ 
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    if (!handle || !guid || reserved) return ERROR_INVALID_PARAMETER;
++    if (!handle_index(handle)) return ERROR_INVALID_HANDLE;
++    if (!is_our_interface(guid)) return ERROR_NOT_FOUND;
++    /* Like on Windows the scan runs in the background; the host keeps the results. */
++    if (!TrySubmitThreadpoolCallback(scan_proc, NULL, NULL)) return GetLastError();
++    return ERROR_SUCCESS;
+ }
+ 
+ DWORD WINAPI WlanRegisterNotification(HANDLE handle, DWORD notify_source, BOOL ignore_dup,
+@@ -158,19 +273,144 @@ DWORD WINAPI WlanRegisterNotification(HANDLE handle, DWORD notify_source, BOOL i
+ DWORD WINAPI WlanGetAvailableNetworkList(HANDLE handle, const GUID *guid, DWORD flags,
+                                          void *reserved, WLAN_AVAILABLE_NETWORK_LIST **network_list)
+ {
+-    FIXME("(%p, %s, 0x%lx, %p, %p) stub\n",
+-          handle, wine_dbgstr_guid(guid), flags, reserved, network_list);
++    WLAN_AVAILABLE_NETWORK_LIST *list;
++    struct wifi_info_params *info;
++    UINT32 i, j, count = 0;
+ 
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    TRACE("(%p, %s, 0x%lx, %p, %p)\n", handle, wine_dbgstr_guid(guid), flags, reserved, network_list);
++
++    if (!handle || !guid || reserved || !network_list) return ERROR_INVALID_PARAMETER;
++    if (!handle_index(handle)) return ERROR_INVALID_HANDLE;
++    if (!is_our_interface(guid)) return ERROR_NOT_FOUND;
++    if (!(info = query_host(FALSE))) return ERROR_NOT_ENOUGH_MEMORY;
++
++    list = WlanAllocateMemory(offsetof(WLAN_AVAILABLE_NETWORK_LIST, Network[max(info->count, 1)]));
++    if (!list)
++    {
++        free(info);
++        return ERROR_NOT_ENOUGH_MEMORY;
++    }
++    /* One entry per SSID with its strongest access point; hidden SSIDs stay separate. */
++    for (i = 0; i < info->count; i++)
++    {
++        const struct wifi_network *net = &info->networks[i];
++        WLAN_AVAILABLE_NETWORK *entry = NULL;
++        size_t len = strlen(net->ssid);
++
++        for (j = 0; len && j < count; j++)
++            if (list->Network[j].dot11Ssid.uSSIDLength == len && !memcmp(list->Network[j].dot11Ssid.ucSSID, net->ssid, len))
++                entry = &list->Network[j];
++        if (entry)
++        {
++            entry->uNumberOfBssids++;
++            entry->wlanSignalQuality = max(entry->wlanSignalQuality, signal_quality(net->rssi));
++            if (net->current) entry->dwFlags |= WLAN_AVAILABLE_NETWORK_CONNECTED;
++            continue;
++        }
++        entry = &list->Network[count++];
++        memset(entry, 0, sizeof(*entry));
++        entry->dot11Ssid.uSSIDLength = len;
++        memcpy(entry->dot11Ssid.ucSSID, net->ssid, len);
++        entry->dot11BssType = net->adhoc ? dot11_BSS_type_independent : dot11_BSS_type_infrastructure;
++        entry->uNumberOfBssids = 1;
++        entry->bNetworkConnectable = TRUE;
++        entry->uNumberOfPhyTypes = 1;
++        entry->dot11PhyTypes[0] = phy_type(net->phy);
++        entry->wlanSignalQuality = signal_quality(net->rssi);
++        security_algorithms(net->security, &entry->bSecurityEnabled, &entry->dot11DefaultAuthAlgorithm,
++                            &entry->dot11DefaultCipherAlgorithm);
++        if (net->current) entry->dwFlags |= WLAN_AVAILABLE_NETWORK_CONNECTED;
++    }
++    list->dwNumberOfItems = count;
++    list->dwIndex = 0;
++    *network_list = list;
++    free(info);
++    return ERROR_SUCCESS;
+ }
+ 
+ DWORD WINAPI WlanQueryInterface(HANDLE handle, const GUID *guid, WLAN_INTF_OPCODE opcode,
+                     void *reserved, DWORD *data_size, void **data, WLAN_OPCODE_VALUE_TYPE *opcode_type)
+ {
+-    FIXME("(%p, %s, 0x%x, %p, %p, %p, %p) stub\n",
++    struct wifi_info_params *info;
++    DWORD value, ret = ERROR_SUCCESS;
++
++    TRACE("(%p, %s, 0x%x, %p, %p, %p, %p)\n",
+           handle, wine_dbgstr_guid(guid), opcode, reserved, data_size, data, opcode_type);
+ 
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    if (!handle || !guid || reserved || !data_size || !data) return ERROR_INVALID_PARAMETER;
++    if (!handle_index(handle)) return ERROR_INVALID_HANDLE;
++    if (!is_our_interface(guid)) return ERROR_NOT_FOUND;
++    if (!(info = query_host(FALSE))) return ERROR_NOT_ENOUGH_MEMORY;
++
++    switch (opcode)
++    {
++    case wlan_intf_opcode_interface_state:
++        value = !info->power_on ? wlan_interface_state_not_ready :
++                info->associated ? wlan_interface_state_connected : wlan_interface_state_disconnected;
++        break;
++    case wlan_intf_opcode_channel_number:
++        if (!info->associated) ret = ERROR_INVALID_STATE;
++        value = info->networks[0].channel;
++        break;
++    case wlan_intf_opcode_rssi:
++        if (!info->associated) ret = ERROR_INVALID_STATE;
++        value = info->networks[0].rssi;
++        break;
++    case wlan_intf_opcode_bss_type:
++        value = dot11_BSS_type_infrastructure;
++        break;
++    case wlan_intf_opcode_current_connection:
++    {
++        const struct wifi_network *net = &info->networks[0];
++        WLAN_CONNECTION_ATTRIBUTES *attr;
++        size_t len = strlen(net->ssid);
++
++        if (!info->associated)
++        {
++            ret = ERROR_INVALID_STATE;
++            break;
++        }
++        if (!(attr = WlanAllocateMemory(sizeof(*attr))))
++        {
++            ret = ERROR_NOT_ENOUGH_MEMORY;
++            break;
++        }
++        memset(attr, 0, sizeof(*attr));
++        attr->isState = wlan_interface_state_connected;
++        attr->wlanConnectionMode = wlan_connection_mode_profile;
++        /* Windows names the profile after the SSID; macOS hides it without location access. */
++        MultiByteToWideChar(CP_UTF8, 0, net->ssid, -1, attr->strProfileName, ARRAY_SIZE(attr->strProfileName));
++        attr->wlanAssociationAttributes.dot11Ssid.uSSIDLength = len;
++        memcpy(attr->wlanAssociationAttributes.dot11Ssid.ucSSID, net->ssid, len);
++        attr->wlanAssociationAttributes.dot11BssType = net->adhoc ? dot11_BSS_type_independent : dot11_BSS_type_infrastructure;
++        if (net->has_bssid) memcpy(attr->wlanAssociationAttributes.dot11Bssid, net->bssid, sizeof(net->bssid));
++        attr->wlanAssociationAttributes.dot11PhyType = phy_type(net->phy);
++        attr->wlanAssociationAttributes.wlanSignalQuality = signal_quality(net->rssi);
++        security_algorithms(net->security, &attr->wlanSecurityAttributes.bSecurityEnabled,
++                            &attr->wlanSecurityAttributes.dot11AuthAlgorithm,
++                            &attr->wlanSecurityAttributes.dot11CipherAlgorithm);
++        attr->wlanSecurityAttributes.bOneXEnabled = net->security == WIFI_SECURITY_WPA_ENTERPRISE ||
++                                                    net->security == WIFI_SECURITY_WPA2_ENTERPRISE ||
++                                                    net->security == WIFI_SECURITY_WPA3_ENTERPRISE;
++        free(info);
++        *data = attr;
++        *data_size = sizeof(*attr);
++        if (opcode_type) *opcode_type = wlan_opcode_value_type_query_only;
++        return ERROR_SUCCESS;
++    }
++    default:
++        FIXME("opcode 0x%x not supported\n", opcode);
++        ret = ERROR_NOT_SUPPORTED;
++        break;
++    }
++    free(info);
++    if (ret) return ret;
++
++    if (!(*data = WlanAllocateMemory(sizeof(DWORD)))) return ERROR_NOT_ENOUGH_MEMORY;
++    *(DWORD *)*data = value;
++    *data_size = sizeof(DWORD);
++    if (opcode_type) *opcode_type = wlan_opcode_value_type_query_only;
++    return ERROR_SUCCESS;
+ }
+ 
+ DWORD WINAPI WlanHostedNetworkQueryProperty(HANDLE handle, WLAN_HOSTED_NETWORK_OPCODE opcode,
+diff --git a/dlls/wlanapi/unixlib.c b/dlls/wlanapi/unixlib.c
+new file mode 100644
+index 00000000..7fc55870
+--- /dev/null
++++ b/dlls/wlanapi/unixlib.c
+@@ -0,0 +1,283 @@
++/*
++ * Wi-Fi data from the host for wlanapi.dll
++ *
++ * Copyright 2026 Daniel Özdek
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stdarg.h>
++#include <string.h>
++#include <stdio.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++
++#include "unixlib.h"
++
++#ifdef __APPLE__
++
++#include <dlfcn.h>
++#include <pthread.h>
++
++/* CoreWLAN is loaded at run time and driven through the Objective-C runtime, so the
++ * module needs neither Objective-C sources nor a link-time framework dependency. */
++typedef void *id;
++typedef void *SEL;
++
++static id   (*p_objc_getClass)( const char * );
++static SEL  (*p_sel_registerName)( const char * );
++static void *(*p_objc_autoreleasePoolPush)( void );
++static void (*p_objc_autoreleasePoolPop)( void * );
++static void *p_objc_msgSend;
++static pthread_once_t init_once = PTHREAD_ONCE_INIT;
++static BOOL corewlan_loaded;
++
++/* CWPHYMode, CWChannelBand and CWSecurity from CoreWLAN/CoreWLANTypes.h */
++enum { CW_PHY_11A = 1, CW_PHY_11B, CW_PHY_11G, CW_PHY_11N, CW_PHY_11AC, CW_PHY_11AX, CW_PHY_11BE };
++enum { CW_SEC_NONE = 0, CW_SEC_WEP = 1, CW_SEC_WPA_PERSONAL = 2, CW_SEC_WPA_PERSONAL_MIXED = 3,
++       CW_SEC_WPA2_PERSONAL = 4, CW_SEC_PERSONAL = 5, CW_SEC_DYNAMIC_WEP = 6, CW_SEC_WPA_ENTERPRISE = 7,
++       CW_SEC_WPA_ENTERPRISE_MIXED = 8, CW_SEC_WPA2_ENTERPRISE = 9, CW_SEC_ENTERPRISE = 10,
++       CW_SEC_WPA3_PERSONAL = 11, CW_SEC_WPA3_ENTERPRISE = 12, CW_SEC_WPA3_TRANSITION = 13,
++       CW_SEC_OWE = 14, CW_SEC_OWE_TRANSITION = 15 };
++
++static void load_corewlan( void )
++{
++    void *objc = dlopen( "/usr/lib/libobjc.A.dylib", RTLD_NOW );
++
++    if (!objc || !dlopen( "/System/Library/Frameworks/CoreWLAN.framework/CoreWLAN", RTLD_NOW )) return;
++    p_objc_getClass = dlsym( objc, "objc_getClass" );
++    p_sel_registerName = dlsym( objc, "sel_registerName" );
++    p_objc_autoreleasePoolPush = dlsym( objc, "objc_autoreleasePoolPush" );
++    p_objc_autoreleasePoolPop = dlsym( objc, "objc_autoreleasePoolPop" );
++    p_objc_msgSend = dlsym( objc, "objc_msgSend" );
++    corewlan_loaded = p_objc_getClass && p_sel_registerName && p_objc_autoreleasePoolPush &&
++                      p_objc_autoreleasePoolPop && p_objc_msgSend && p_objc_getClass( "CWWiFiClient" );
++}
++
++static SEL sel( const char *name ) { return p_sel_registerName( name ); }
++static id send( id obj, const char *name ) { return obj ? ((id (*)( id, SEL ))p_objc_msgSend)( obj, sel( name ) ) : NULL; }
++static long send_long( id obj, const char *name ) { return obj ? ((long (*)( id, SEL ))p_objc_msgSend)( obj, sel( name ) ) : 0; }
++static BOOL send_bool( id obj, const char *name ) { return obj && ((signed char (*)( id, SEL ))p_objc_msgSend)( obj, sel( name ) ); }
++static id send_index( id obj, const char *name, unsigned long index )
++{
++    return obj ? ((id (*)( id, SEL, unsigned long ))p_objc_msgSend)( obj, sel( name ), index ) : NULL;
++}
++static BOOL send_supports( id obj, const char *name, long value )
++{
++    return obj && ((signed char (*)( id, SEL, long ))p_objc_msgSend)( obj, sel( name ), value );
++}
++
++static void copy_string( id string, char *dst, size_t size )
++{
++    const char *utf8 = string ? (const char *)send( string, "UTF8String" ) : NULL;
++    dst[0] = 0;
++    if (utf8) snprintf( dst, size, "%s", utf8 );
++}
++
++static BOOL parse_mac( id string, BYTE *mac )
++{
++    char text[32];
++    unsigned int b[6];
++
++    copy_string( string, text, sizeof(text) );
++    if (sscanf( text, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5] ) != 6) return FALSE;
++    for (int i = 0; i < 6; i++) mac[i] = b[i];
++    return TRUE;
++}
++
++static INT32 phy_kind( long mode )
++{
++    switch (mode)
++    {
++    case CW_PHY_11A:  return 4;  /* Ofdm */
++    case CW_PHY_11B:  return 5;  /* Hrdsss */
++    case CW_PHY_11G:  return 6;  /* Erp */
++    case CW_PHY_11N:  return 7;  /* HT */
++    case CW_PHY_11AC: return 8;  /* Vht */
++    case CW_PHY_11AX: return 10; /* HE */
++    case CW_PHY_11BE: return 11; /* Eht */
++    default:          return 0;
++    }
++}
++
++static INT32 security_kind( long security )
++{
++    switch (security)
++    {
++    case CW_SEC_NONE: return WIFI_SECURITY_OPEN;
++    case CW_SEC_WEP: case CW_SEC_DYNAMIC_WEP: return WIFI_SECURITY_WEP;
++    case CW_SEC_WPA_PERSONAL: case CW_SEC_WPA_PERSONAL_MIXED: return WIFI_SECURITY_WPA_PERSONAL;
++    case CW_SEC_WPA2_PERSONAL: case CW_SEC_PERSONAL: return WIFI_SECURITY_WPA2_PERSONAL;
++    case CW_SEC_WPA3_PERSONAL: case CW_SEC_WPA3_TRANSITION: return WIFI_SECURITY_WPA3_PERSONAL;
++    case CW_SEC_WPA_ENTERPRISE: case CW_SEC_WPA_ENTERPRISE_MIXED: return WIFI_SECURITY_WPA_ENTERPRISE;
++    case CW_SEC_WPA2_ENTERPRISE: case CW_SEC_ENTERPRISE: return WIFI_SECURITY_WPA2_ENTERPRISE;
++    case CW_SEC_WPA3_ENTERPRISE: return WIFI_SECURITY_WPA3_ENTERPRISE;
++    case CW_SEC_OWE: case CW_SEC_OWE_TRANSITION: return WIFI_SECURITY_OWE;
++    default: return WIFI_SECURITY_UNKNOWN;
++    }
++}
++
++/* A scanned network only says which modes it supports; report the strongest. */
++static INT32 network_security( id network )
++{
++    static const long order[] = { CW_SEC_WPA3_ENTERPRISE, CW_SEC_WPA2_ENTERPRISE, CW_SEC_WPA_ENTERPRISE,
++                                  CW_SEC_WPA3_PERSONAL, CW_SEC_WPA2_PERSONAL, CW_SEC_WPA_PERSONAL,
++                                  CW_SEC_OWE, CW_SEC_WEP, CW_SEC_NONE };
++    for (unsigned int i = 0; i < ARRAY_SIZE(order); i++)
++        if (send_supports( network, "supportsSecurity:", order[i] )) return security_kind( order[i] );
++    return WIFI_SECURITY_UNKNOWN;
++}
++
++static INT32 network_phy( id network )
++{
++    static const long order[] = { CW_PHY_11BE, CW_PHY_11AX, CW_PHY_11AC, CW_PHY_11N, CW_PHY_11G, CW_PHY_11A, CW_PHY_11B };
++    for (unsigned int i = 0; i < ARRAY_SIZE(order); i++)
++        if (send_supports( network, "supportsPHYMode:", order[i] )) return phy_kind( order[i] );
++    return 0;
++}
++
++static void fill_channel( id channel, struct wifi_network *net )
++{
++    net->channel = send_long( channel, "channelNumber" );
++    net->band = send_long( channel, "channelBand" );
++}
++
++static void get_info( struct wifi_info_params *params, BOOL scan )
++{
++    id client, iface, results, list, current_bssid;
++    struct wifi_network *net;
++    char current[33];
++    void *pool;
++    long count;
++
++    memset( params, 0, sizeof(*params) );
++    pthread_once( &init_once, load_corewlan );
++    if (!corewlan_loaded) return;
++
++    pool = p_objc_autoreleasePoolPush();
++    client = send( p_objc_getClass( "CWWiFiClient" ), "sharedWiFiClient" );
++    if (!(iface = send( client, "interface" ))) goto done;
++
++    params->present = TRUE;
++    params->power_on = send_bool( iface, "powerOn" );
++    copy_string( send( iface, "interfaceName" ), params->name, sizeof(params->name) );
++    parse_mac( send( iface, "hardwareAddress" ), params->mac );
++
++    /* The current network; macOS hides SSID and BSSID without location access. */
++    copy_string( send( iface, "ssid" ), current, sizeof(current) );
++    current_bssid = send( iface, "bssid" );
++    if (send( iface, "wlanChannel" ))
++    {
++        net = &params->networks[params->count++];
++        params->associated = TRUE;
++        net->current = TRUE;
++        memcpy( net->ssid, current, sizeof(current) );
++        net->has_bssid = parse_mac( current_bssid, net->bssid );
++        net->rssi = send_long( iface, "rssiValue" );
++        fill_channel( send( iface, "wlanChannel" ), net );
++        net->phy = phy_kind( send_long( iface, "activePHYMode" ) );
++        net->security = security_kind( send_long( iface, "security" ) );
++    }
++
++    if (scan)
++    {
++        /* scanForNetworksWithName:error: blocks until the scan is done and fills the cache. */
++        ((id (*)( id, SEL, id, id * ))p_objc_msgSend)( iface, sel( "scanForNetworksWithName:error:" ), NULL, NULL );
++    }
++    results = send( iface, "cachedScanResults" );
++    list = send( results, "allObjects" );
++    count = send_long( list, "count" );
++    for (long i = 0; i < count && params->count < WIFI_MAX_NETWORKS; i++)
++    {
++        id network = send_index( list, "objectAtIndex:", i );
++        struct wifi_network scanned = {0};
++
++        copy_string( send( network, "ssid" ), scanned.ssid, sizeof(scanned.ssid) );
++        scanned.has_bssid = parse_mac( send( network, "bssid" ), scanned.bssid );
++        scanned.rssi = send_long( network, "rssiValue" );
++        fill_channel( send( network, "wlanChannel" ), &scanned );
++        scanned.phy = network_phy( network );
++        scanned.security = network_security( network );
++        scanned.beacon_ms = send_long( network, "beaconInterval" );
++        scanned.adhoc = send_bool( network, "ibss" );
++
++        /* Fill in what the scan knows about the current network instead of listing it twice. */
++        if (params->associated && params->networks[0].channel == scanned.channel &&
++            ((params->networks[0].has_bssid && scanned.has_bssid && !memcmp( params->networks[0].bssid, scanned.bssid, 6 )) ||
++             (!params->networks[0].has_bssid && current[0] && !strcmp( current, scanned.ssid ))))
++        {
++            params->networks[0].beacon_ms = scanned.beacon_ms;
++            params->networks[0].adhoc = scanned.adhoc;
++            if (!params->networks[0].phy) params->networks[0].phy = scanned.phy;
++            continue;
++        }
++        params->networks[params->count++] = scanned;
++    }
++
++done:
++    p_objc_autoreleasePoolPop( pool );
++}
++
++#else
++
++static void get_info( struct wifi_info_params *params, BOOL scan )
++{
++    memset( params, 0, sizeof(*params) );
++}
++
++#endif
++
++static NTSTATUS wifi_info( void *args )
++{
++    get_info( args, FALSE );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wifi_scan( void *args )
++{
++    get_info( args, TRUE );
++    return STATUS_SUCCESS;
++}
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    wifi_info,
++    wifi_scan,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
++
++#ifdef _WIN64
++
++/* The parameter block has no pointers, so 32-bit callers use the same entry points. */
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    wifi_info,
++    wifi_scan,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
++
++#endif
+diff --git a/dlls/wlanapi/unixlib.h b/dlls/wlanapi/unixlib.h
+new file mode 100644
+index 00000000..60530906
+--- /dev/null
++++ b/dlls/wlanapi/unixlib.h
+@@ -0,0 +1,29 @@
++/*
++ * Unix interface of wlanapi.dll
++ *
++ * Copyright 2026 Daniel Özdek
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "wine/unixlib.h"
++#include "wine/wifi.h"
++
++enum wlanapi_funcs
++{
++    unix_wifi_info,          /* interface data and the last scan results */
++    unix_wifi_scan,          /* scan, then like unix_wifi_info */
++    unix_funcs_count,
++};
+diff --git a/dlls/wlanapi/wlanapi.spec b/dlls/wlanapi/wlanapi.spec
+index 45d83c80..d713bc1d 100644
+--- a/dlls/wlanapi/wlanapi.spec
++++ b/dlls/wlanapi/wlanapi.spec
+@@ -37,3 +37,6 @@
+ @ stub WlanSetProfilePosition
+ @ stub WlanSetPsdIEDataList
+ @ stub WlanSetSecuritySettings
++
++# Wine extension for Windows.Devices.WiFi
++@ stdcall -private __wine_wlan_query(ptr long)
+diff --git a/include/Makefile.in b/include/Makefile.in
+index e0987cea..648fcf6b 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -887,6 +887,7 @@ SOURCES = \
+ 	windows.devices.power.idl \
+ 	windows.devices.radios.idl \
+ 	windows.devices.usb.idl \
++	windows.devices.wifi.idl \
+ 	windows.foundation.collections.idl \
+ 	windows.foundation.idl \
+ 	windows.foundation.metadata.idl \
+@@ -996,6 +997,7 @@ SOURCES = \
+ 	wine/vulkan.h \
+ 	wine/vulkan_driver.h \
+ 	wine/wgl.h \
++	wine/wifi.h \
+ 	wine/winbase16.h \
+ 	wine/windef16.h \
+ 	wine/wine_common_ver.rc \
+diff --git a/include/windows.devices.wifi.idl b/include/windows.devices.wifi.idl
+new file mode 100644
+index 00000000..ce2b7015
+--- /dev/null
++++ b/include/windows.devices.wifi.idl
+@@ -0,0 +1,238 @@
++/*
++ * Copyright 2026 Daniel Özdek
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.networking.connectivity.idl";
++
++namespace Windows.Devices.WiFi {
++    typedef enum WiFiAccessStatus WiFiAccessStatus;
++    typedef enum WiFiConnectionStatus WiFiConnectionStatus;
++    typedef enum WiFiNetworkKind WiFiNetworkKind;
++    typedef enum WiFiPhyKind WiFiPhyKind;
++    typedef enum WiFiReconnectionKind WiFiReconnectionKind;
++
++    interface IWiFiAdapter;
++    interface IWiFiAdapterStatics;
++    interface IWiFiAvailableNetwork;
++    interface IWiFiConnectionResult;
++    interface IWiFiNetworkReport;
++
++    runtimeclass WiFiAdapter;
++    runtimeclass WiFiAvailableNetwork;
++    runtimeclass WiFiConnectionResult;
++    runtimeclass WiFiNetworkReport;
++
++    declare {
++        interface Windows.Foundation.Collections.IIterable<Windows.Devices.WiFi.WiFiAdapter *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Devices.WiFi.WiFiAdapter *>;
++        interface Windows.Foundation.Collections.IVector<Windows.Devices.WiFi.WiFiAdapter *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.Devices.WiFi.WiFiAdapter *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Devices.WiFi.WiFiAvailableNetwork *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Devices.WiFi.WiFiAvailableNetwork *>;
++        interface Windows.Foundation.Collections.IVector<Windows.Devices.WiFi.WiFiAvailableNetwork *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.Devices.WiFi.WiFiAvailableNetwork *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.WiFi.WiFiAdapter *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.WiFi.WiFiAccessStatus>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.WiFi.WiFiConnectionResult *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Foundation.Collections.IVectorView<Windows.Devices.WiFi.WiFiAdapter *> *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Devices.WiFi.WiFiAdapter *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Devices.WiFi.WiFiAccessStatus>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Devices.WiFi.WiFiConnectionResult *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.Devices.WiFi.WiFiAdapter *> *>;
++        interface Windows.Foundation.TypedEventHandler<Windows.Devices.WiFi.WiFiAdapter *, IInspectable *>;
++    }
++
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum WiFiAccessStatus
++    {
++        Unspecified    = 0,
++        Allowed        = 1,
++        DeniedByUser   = 2,
++        DeniedBySystem = 3,
++    };
++
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum WiFiConnectionStatus
++    {
++        UnspecifiedFailure                = 0,
++        Success                           = 1,
++        AccessRevoked                     = 2,
++        InvalidCredential                 = 3,
++        NetworkNotAvailable               = 4,
++        Timeout                           = 5,
++        UnsupportedAuthenticationProtocol = 6,
++    };
++
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum WiFiNetworkKind
++    {
++        Any            = 0,
++        Infrastructure = 1,
++        Adhoc          = 2,
++    };
++
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum WiFiPhyKind
++    {
++        Unknown    = 0,
++        Fhss       = 1,
++        Dsss       = 2,
++        IRBaseband = 3,
++        Ofdm       = 4,
++        Hrdsss     = 5,
++        Erp        = 6,
++        HT         = 7,
++        Vht        = 8,
++        Dmg        = 9,
++        HE         = 10,
++        Eht        = 11,
++    };
++
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum WiFiReconnectionKind
++    {
++        Automatic = 0,
++        Manual    = 1,
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.WiFi.WiFiAdapter),
++        uuid(a6c4e423-3d75-43a4-b9de-11e26b72d9b0)
++    ]
++    interface IWiFiAdapter : IInspectable
++    {
++        [propget] HRESULT NetworkAdapter([out, retval] Windows.Networking.Connectivity.NetworkAdapter **value);
++        HRESULT ScanAsync([out, retval] Windows.Foundation.IAsyncAction **operation);
++        [propget] HRESULT NetworkReport([out, retval] Windows.Devices.WiFi.WiFiNetworkReport **value);
++        [eventadd] HRESULT AvailableNetworksChanged([in] Windows.Foundation.TypedEventHandler<Windows.Devices.WiFi.WiFiAdapter *, IInspectable *> *handler,
++                                                    [out, retval] EventRegistrationToken *token);
++        [eventremove] HRESULT AvailableNetworksChanged([in] EventRegistrationToken token);
++        [overload("ConnectAsync")]
++        HRESULT ConnectAsync([in] Windows.Devices.WiFi.WiFiAvailableNetwork *network, [in] Windows.Devices.WiFi.WiFiReconnectionKind kind,
++                             [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.WiFi.WiFiConnectionResult *> **operation);
++        [overload("ConnectAsync")]
++        HRESULT ConnectWithPasswordCredentialAsync([in] Windows.Devices.WiFi.WiFiAvailableNetwork *network, [in] Windows.Devices.WiFi.WiFiReconnectionKind kind,
++                                                   [in] IInspectable *credential /* Windows.Security.Credentials.PasswordCredential */,
++                                                   [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.WiFi.WiFiConnectionResult *> **operation);
++        [overload("ConnectAsync")]
++        HRESULT ConnectWithPasswordCredentialAndSsidAsync([in] Windows.Devices.WiFi.WiFiAvailableNetwork *network, [in] Windows.Devices.WiFi.WiFiReconnectionKind kind,
++                                                          [in] IInspectable *credential /* Windows.Security.Credentials.PasswordCredential */, [in] HSTRING ssid,
++                                                          [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.WiFi.WiFiConnectionResult *> **operation);
++        HRESULT Disconnect();
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.WiFi.WiFiAdapter),
++        uuid(da25fddd-d24c-43e3-aabd-c4659f730f99)
++    ]
++    interface IWiFiAdapterStatics : IInspectable
++    {
++        HRESULT FindAllAdaptersAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.Devices.WiFi.WiFiAdapter *> *> **operation);
++        HRESULT GetDeviceSelector([out, retval] HSTRING *selector);
++        HRESULT FromIdAsync([in] HSTRING id, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.WiFi.WiFiAdapter *> **operation);
++        HRESULT RequestAccessAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.WiFi.WiFiAccessStatus> **operation);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.WiFi.WiFiAvailableNetwork),
++        uuid(26e96246-183e-4704-9826-71b4a2f0f668)
++    ]
++    interface IWiFiAvailableNetwork : IInspectable
++    {
++        [propget] HRESULT Uptime([out, retval] Windows.Foundation.TimeSpan *value);
++        [propget] HRESULT Ssid([out, retval] HSTRING *value);
++        [propget] HRESULT Bssid([out, retval] HSTRING *value);
++        [propget] HRESULT ChannelCenterFrequencyInKilohertz([out, retval] INT32 *value);
++        [propget] HRESULT NetworkRssiInDecibelMilliwatts([out, retval] DOUBLE *value);
++        [propget] HRESULT SignalBars([out, retval] BYTE *value);
++        [propget] HRESULT NetworkKind([out, retval] Windows.Devices.WiFi.WiFiNetworkKind *value);
++        [propget] HRESULT PhyKind([out, retval] Windows.Devices.WiFi.WiFiPhyKind *value);
++        [propget] HRESULT SecuritySettings([out, retval] Windows.Networking.Connectivity.NetworkSecuritySettings **value);
++        [propget] HRESULT BeaconInterval([out, retval] Windows.Foundation.TimeSpan *value);
++        [propget] HRESULT IsWiFiDirect([out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.WiFi.WiFiConnectionResult),
++        uuid(143bdfd9-c37d-40be-a5c8-857bce85a931)
++    ]
++    interface IWiFiConnectionResult : IInspectable
++    {
++        [propget] HRESULT ConnectionStatus([out, retval] Windows.Devices.WiFi.WiFiConnectionStatus *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.WiFi.WiFiNetworkReport),
++        uuid(9524ded2-5911-445e-8194-be4f1a704895)
++    ]
++    interface IWiFiNetworkReport : IInspectable
++    {
++        [propget] HRESULT Timestamp([out, retval] Windows.Foundation.DateTime *value);
++        [propget] HRESULT AvailableNetworks([out, retval] Windows.Foundation.Collections.IVectorView<Windows.Devices.WiFi.WiFiAvailableNetwork *> **value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Devices.WiFi.IWiFiAdapterStatics, Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass WiFiAdapter
++    {
++        [default] interface Windows.Devices.WiFi.IWiFiAdapter;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass WiFiAvailableNetwork
++    {
++        [default] interface Windows.Devices.WiFi.IWiFiAvailableNetwork;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass WiFiConnectionResult
++    {
++        [default] interface Windows.Devices.WiFi.IWiFiConnectionResult;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass WiFiNetworkReport
++    {
++        [default] interface Windows.Devices.WiFi.IWiFiNetworkReport;
++    }
++}
+diff --git a/include/wine/wifi.h b/include/wine/wifi.h
+new file mode 100644
+index 00000000..05255f25
+--- /dev/null
++++ b/include/wine/wifi.h
+@@ -0,0 +1,70 @@
++/*
++ * Wi-Fi data shared by wlanapi.dll and Windows.Devices.WiFi
++ *
++ * Copyright 2026 Daniel Özdek
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_WIFI_H
++#define __WINE_WIFI_H
++
++#define WIFI_MAX_NETWORKS 64
++
++/* Only fixed-size fields, so 32- and 64-bit callers share one layout. */
++struct wifi_network
++{
++    char  ssid[33];          /* empty when the system does not reveal it */
++    BYTE  bssid[6];
++    BYTE  has_bssid;
++    INT32 rssi;              /* dBm */
++    INT32 channel;
++    INT32 band;              /* 1 = 2.4 GHz, 2 = 5 GHz, 3 = 6 GHz, 0 = unknown */
++    INT32 phy;               /* WiFiPhyKind */
++    INT32 security;          /* enum wifi_security */
++    INT32 beacon_ms;
++    BYTE  adhoc;
++    BYTE  current;           /* the network the interface is associated with */
++};
++
++enum wifi_security
++{
++    WIFI_SECURITY_UNKNOWN,
++    WIFI_SECURITY_OPEN,
++    WIFI_SECURITY_WEP,
++    WIFI_SECURITY_WPA_PERSONAL,
++    WIFI_SECURITY_WPA2_PERSONAL,
++    WIFI_SECURITY_WPA3_PERSONAL,
++    WIFI_SECURITY_WPA_ENTERPRISE,
++    WIFI_SECURITY_WPA2_ENTERPRISE,
++    WIFI_SECURITY_WPA3_ENTERPRISE,
++    WIFI_SECURITY_OWE,
++};
++
++struct wifi_info_params
++{
++    BYTE  present;           /* the machine has a Wi-Fi interface */
++    BYTE  power_on;
++    BYTE  associated;
++    BYTE  mac[6];
++    char  name[16];          /* BSD interface name, e.g. en0 */
++    UINT32 count;
++    struct wifi_network networks[WIFI_MAX_NETWORKS];
++};
++
++/* wlanapi.dll exports this for Windows.Devices.WiFi; scan blocks until the scan is done. */
++typedef DWORD (WINAPI *wine_wlan_query_func)( struct wifi_info_params *params, BOOL scan );
++
++#endif /* __WINE_WIFI_H */
+diff --git a/include/wlanapi.h b/include/wlanapi.h
+index 5150ff09..29a9955d 100644
+--- a/include/wlanapi.h
++++ b/include/wlanapi.h
+@@ -109,6 +109,9 @@ typedef enum _DOT11_CIPHER_ALGORITHM
+ 
+ #define WLAN_MAX_PHY_TYPE_NUMBER 8
+ 
++#define WLAN_AVAILABLE_NETWORK_CONNECTED   0x00000001
++#define WLAN_AVAILABLE_NETWORK_HAS_PROFILE 0x00000002
++
+ typedef struct _WLAN_AVAILABLE_NETWORK
+ {
+     WCHAR strProfileName[256];
+@@ -158,6 +161,47 @@ typedef enum _WLAN_INTF_OPCODE
+     wlan_intf_opcode_ihv_end = 0x3fffffff
+ } WLAN_INTF_OPCODE, *PWLAN_INTF_OPCODE;
+ 
++#define WLAN_MAX_NAME_LENGTH 256
++
++typedef enum _WLAN_CONNECTION_MODE
++{
++    wlan_connection_mode_profile = 0,
++    wlan_connection_mode_temporary_profile,
++    wlan_connection_mode_discovery_secure,
++    wlan_connection_mode_discovery_unsecure,
++    wlan_connection_mode_auto,
++    wlan_connection_mode_invalid
++} WLAN_CONNECTION_MODE, *PWLAN_CONNECTION_MODE;
++
++typedef struct _WLAN_ASSOCIATION_ATTRIBUTES
++{
++    DOT11_SSID dot11Ssid;
++    DOT11_BSS_TYPE dot11BssType;
++    DOT11_MAC_ADDRESS dot11Bssid;
++    DOT11_PHY_TYPE dot11PhyType;
++    ULONG uDot11PhyIndex;
++    WLAN_SIGNAL_QUALITY wlanSignalQuality;
++    ULONG ulRxRate;
++    ULONG ulTxRate;
++} WLAN_ASSOCIATION_ATTRIBUTES, *PWLAN_ASSOCIATION_ATTRIBUTES;
++
++typedef struct _WLAN_SECURITY_ATTRIBUTES
++{
++    BOOL bSecurityEnabled;
++    BOOL bOneXEnabled;
++    DOT11_AUTH_ALGORITHM dot11AuthAlgorithm;
++    DOT11_CIPHER_ALGORITHM dot11CipherAlgorithm;
++} WLAN_SECURITY_ATTRIBUTES, *PWLAN_SECURITY_ATTRIBUTES;
++
++typedef struct _WLAN_CONNECTION_ATTRIBUTES
++{
++    WLAN_INTERFACE_STATE isState;
++    WLAN_CONNECTION_MODE wlanConnectionMode;
++    WCHAR strProfileName[WLAN_MAX_NAME_LENGTH];
++    WLAN_ASSOCIATION_ATTRIBUTES wlanAssociationAttributes;
++    WLAN_SECURITY_ATTRIBUTES wlanSecurityAttributes;
++} WLAN_CONNECTION_ATTRIBUTES, *PWLAN_CONNECTION_ATTRIBUTES;
++
+ typedef enum _WLAN_OPCODE_VALUE_TYPE
+ {
+     wlan_opcode_value_type_query_only = 0,

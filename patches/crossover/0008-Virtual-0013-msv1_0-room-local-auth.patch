@@ -1,0 +1,375 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:23:47 +0100
+Subject: [PATCH] Virtual 0013: msv1_0-room-local-auth
+
+Windows authentication between the programs of a room (NegotiateStream,
+WCF, local HTTP) without a domain: each room gets its own random
+identity on first use; remote targets still use Samba's ntlm_auth
+---
+ dlls/msv1_0/main.c    | 210 ++++++++++++++++++++++++++++++++++++++++--
+ dlls/msv1_0/unixlib.h |   4 +
+ 2 files changed, 206 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/msv1_0/main.c b/dlls/msv1_0/main.c
+index 37b564ae..e20926ae 100644
+--- a/dlls/msv1_0/main.c
++++ b/dlls/msv1_0/main.c
+@@ -43,9 +43,134 @@ WINE_DEFAULT_DEBUG_CHANNEL(ntlm);
+ static ULONG ntlm_package_id;
+ static LSA_DISPATCH_TABLE lsa_dispatch;
+ 
++/* Virtual gives every room its own identity, so programs can use Windows
++ * authentication between their own processes (NegotiateStream, WCF, local HTTP)
++ * without a domain. Other targets keep using Samba's ntlm_auth. */
++static char *local_auth_helper(void)
++{
++    WCHAR path[MAX_PATH];
++    DWORD len = GetEnvironmentVariableW(L"VIRTUAL_LOCAL_AUTH_HELPER", path, ARRAY_SIZE(path));
++    char *ret;
++    int size;
++
++    if (!len || len >= ARRAY_SIZE(path) || !GetEnvironmentVariableW(L"VIRTUAL_LOCAL_AUTH_FILE", NULL, 0)) return NULL;
++    if (!(size = WideCharToMultiByte( CP_UNIXCP, 0, path, -1, NULL, 0, NULL, NULL ))) return NULL;
++    if (!(ret = malloc( size ))) return NULL;
++    WideCharToMultiByte( CP_UNIXCP, 0, path, -1, ret, size, NULL, NULL );
++    return ret;
++}
++
++static WCHAR *get_local_principal(void)
++{
++    WCHAR computer[MAX_COMPUTERNAME_LENGTH + 1], user[257], *name;
++    DWORD computer_len = ARRAY_SIZE(computer), user_len = ARRAY_SIZE(user);
++    if (!GetComputerNameW(computer, &computer_len) || !GetUserNameW(user, &user_len)) return NULL;
++    if (!(name = malloc((computer_len + user_len + 1) * sizeof(*name)))) return NULL;
++    wcscpy(name, computer);
++    wcscat(name, L"\\");
++    wcscat(name, user);
++    return name;
++}
++
++static BOOL is_local_host(const WCHAR *host, size_t len)
++{
++    static const WCHAR *names[] = { L"localhost", L"127.0.0.1", L"[::1]" };
++    WCHAR computer[MAX_COMPUTERNAME_LENGTH + 1];
++    DWORD size = ARRAY_SIZE(computer);
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(names); i++)
++        if (wcslen(names[i]) == len && !wcsnicmp(host, names[i], len)) return TRUE;
++    return GetComputerNameW(computer, &size) && size == len && !wcsnicmp(host, computer, len);
++}
++
++/* Service principal names such as host/localhost, HTTP/127.0.0.1:8080 or
++ * RestrictedKrbHost/COMPUTER point to this machine. */
++static BOOL is_local_target(const UNICODE_STRING *target)
++{
++    WCHAR text[288], *host, *end;
++
++    if (!target || !target->Buffer || target->Length % sizeof(WCHAR)
++            || target->Length >= sizeof(text)) return FALSE;
++    memcpy(text, target->Buffer, target->Length);
++    text[target->Length / sizeof(WCHAR)] = 0;
++    host = wcschr(text, '/') ? wcschr(text, '/') + 1 : text;
++    if (*host == '[')
++    {
++        if (!(end = wcschr(host, ']'))) return FALSE;
++        end++;
++    }
++    else end = host + wcscspn(host, L":/");
++    return is_local_host(host, end - host);
++}
++
++static char *get_room_principal_arg(void)
++{
++    WCHAR *principal = get_local_principal();
++    char *arg = NULL;
++    int len;
++
++    if (!principal) return NULL;
++    len = WideCharToMultiByte( CP_UTF8, 0, principal, -1, NULL, 0, NULL, NULL );
++    if (len && (arg = malloc( len + 17 )))
++    {
++        strcpy( arg, "--room-principal=" );
++        WideCharToMultiByte( CP_UTF8, 0, principal, -1, arg + 17, len, NULL, NULL );
++    }
++    free( principal );
++    return arg;
++}
++
++/* Map only a cryptographically authenticated, room-local principal to the
++ * existing Wine logon token. Never map a foreign/domain principal to this user. */
++static NTSTATUS set_local_principal(struct ntlm_ctx *ctx, const char *authenticated)
++{
++    WCHAR *expected, *provided = NULL;
++    int length;
++    if (!ctx->local_auth) return SEC_E_OK;
++    if (!(expected = get_local_principal())) return SEC_E_LOGON_DENIED;
++    if (authenticated)
++    {
++        length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, authenticated, -1, NULL, 0);
++        if (!length || length > 288 || !(provided = malloc(length * sizeof(*provided))))
++        { free(expected); return SEC_E_LOGON_DENIED; }
++        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, authenticated, -1, provided, length);
++        if (wcsicmp(expected, provided))
++        { free(provided); free(expected); return SEC_E_LOGON_DENIED; }
++        free(provided);
++    }
++    free(ctx->local_principal);
++    ctx->local_principal = expected;
++    return SEC_E_OK;
++}
++
++static NTSTATUS NTAPI ntlm_SpGetContextToken(LSA_SEC_HANDLE handle, HANDLE *token)
++{
++    struct ntlm_ctx *ctx = (struct ntlm_ctx *)handle;
++    WCHAR *expected;
++    HANDLE source;
++    BOOL matches, success;
++    if (!token) return SEC_E_INVALID_TOKEN;
++    *token = NULL;
++    if (!ctx || !ctx->authenticated) return SEC_E_INVALID_HANDLE;
++    if (!ctx->local_auth || !ctx->local_principal) return SEC_E_UNSUPPORTED_FUNCTION;
++    expected = get_local_principal();
++    matches = expected && !wcsicmp(expected, ctx->local_principal);
++    free(expected);
++    if (!matches) return SEC_E_LOGON_DENIED;
++    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &source)) return SEC_E_LOGON_DENIED;
++    success = DuplicateTokenEx(source, TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, NULL,
++            SecurityImpersonation, TokenImpersonation, token);
++    CloseHandle(source);
++    return success ? SEC_E_OK : SEC_E_LOGON_DENIED;
++}
++
+ static void ntlm_cleanup( struct ntlm_ctx *ctx )
+ {
++    if (!ctx) return;
+     WINE_UNIX_CALL( unix_cleanup, ctx );
++    free(ctx->local_principal);
++    SecureZeroMemory(ctx->session_key, sizeof(ctx->session_key));
+ }
+ 
+ static NTSTATUS ntlm_chat( struct ntlm_ctx *ctx, char *buf, unsigned int buflen, unsigned int *retlen )
+@@ -566,6 +691,7 @@ static NTSTATUS NTAPI ntlm_SpInitLsaModeContext( LSA_SEC_HANDLE cred_handle, LSA
+     NTSTATUS status = SEC_E_INSUFFICIENT_MEMORY;
+     struct ntlm_ctx *ctx = NULL;
+     char *buf, *bin, *want_flags = NULL, *username = NULL, *domain = NULL, *password = NULL;
++    char *local_helper = NULL, *room_principal = NULL;
+     unsigned int len, bin_len;
+     int idx;
+ 
+@@ -587,9 +713,11 @@ static NTSTATUS NTAPI ntlm_SpInitLsaModeContext( LSA_SEC_HANDLE cred_handle, LSA
+ 
+     if (!ctx_handle && !input)
+     {
+-        char *argv[5];
++        char *argv[6];
+         int password_len = 0;
+         struct ntlm_cred *cred = (struct ntlm_cred *)cred_handle;
++        BOOL explicit_cred = cred && (cred->username_arg || cred->domain_arg);
++        BOOL empty_target = !target || !target->Length;
+ 
+         if (!cred || !(cred->mode & MODE_CLIENT))
+         {
+@@ -658,12 +786,23 @@ static NTSTATUS NTAPI ntlm_SpInitLsaModeContext( LSA_SEC_HANDLE cred_handle, LSA
+             argv[4] = NULL;
+         }
+ 
++        if ((is_local_target( target ) || (empty_target && !explicit_cred))
++                && (local_helper = local_auth_helper()) && (room_principal = get_room_principal_arg()))
++        {
++            argv[0] = local_helper;
++            argv[5] = NULL;
++            argv[4] = argv[3];
++            argv[3] = argv[2];
++            argv[2] = room_principal;
++        }
++
+         if (!(ctx = calloc( 1, sizeof(*ctx) ))) goto done;
+ 
+         if ((status = ntlm_fork( ctx, argv )) != SEC_E_OK) goto done;
+         status = SEC_E_INSUFFICIENT_MEMORY;
+ 
+         ctx->mode = MODE_CLIENT;
++        ctx->local_auth = room_principal != NULL;
+         memset( ctx->session_key, 0, sizeof(ctx->session_key) );
+ 
+         /* generate the dummy session key = MD4(MD4(password))*/
+@@ -829,10 +968,15 @@ static NTSTATUS NTAPI ntlm_SpInitLsaModeContext( LSA_SEC_HANDLE cred_handle, LSA
+         else if (!strncmp( buf, "GK ", 3 ))
+         {
+             bin_len = decode_base64( buf + 3, len - 3, bin );
+-            TRACE( "session key is %s\n", debugstr_a(buf + 3) );
++            if (bin_len != sizeof(ctx->session_key)) { status = SEC_E_INVALID_TOKEN; goto done; }
++            if (!ctx->local_auth) TRACE( "session key is %s\n", debugstr_a(buf + 3) );
+             memcpy( ctx->session_key, bin, bin_len );
+         }
+ 
++        if (ctx->local_auth && (strncmp(buf, "GK ", 3) || !(ctx->flags & FLAG_NEGOTIATE_NTLM2)
++                || ((ctx_req & ISC_REQ_CONFIDENTIALITY) && !(ctx->flags & FLAG_NEGOTIATE_SEAL))
++                || ((ctx_req & ISC_REQ_INTEGRITY) && !(ctx->flags & FLAG_NEGOTIATE_SIGN))))
++        { status = SEC_E_QOP_NOT_SUPPORTED; goto done; }
+         arc4_init( &ctx->crypt.ntlm.arc4info, ctx->session_key, 16 );
+         ctx->crypt.ntlm.seq_no = 0;
+         create_ntlm2_subkeys( ctx );
+@@ -840,6 +984,14 @@ static NTSTATUS NTAPI ntlm_SpInitLsaModeContext( LSA_SEC_HANDLE cred_handle, LSA
+         arc4_init( &ctx->crypt.ntlm2.recv_arc4info, ctx->crypt.ntlm2.recv_seal_key, 16 );
+         ctx->crypt.ntlm2.send_seq_no = 0;
+         ctx->crypt.ntlm2.recv_seq_no = 0;
++        if ((status = set_local_principal(ctx, NULL)) != SEC_E_OK) goto done;
++        ctx->authenticated = TRUE;
++    }
++    if (ctx_attr && ctx && (status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED))
++    {
++        *ctx_attr = ctx->attrs & ~ISC_RET_MUTUAL_AUTH;
++        if (ctx->flags & FLAG_NEGOTIATE_SIGN) *ctx_attr |= ISC_RET_INTEGRITY;
++        if (ctx->flags & FLAG_NEGOTIATE_SEAL) *ctx_attr |= ISC_RET_CONFIDENTIALITY;
+     }
+ 
+ done:
+@@ -851,6 +1003,8 @@ done:
+     free( username );
+     free( domain );
+     free( password );
++    free( local_helper );
++    free( room_principal );
+     free( buf );
+     free( bin );
+     free( want_flags );
+@@ -867,7 +1021,7 @@ static NTSTATUS NTAPI ntlm_SpAcceptLsaModeContext( LSA_SEC_HANDLE cred_handle, L
+ {
+     NTSTATUS status = SEC_E_INSUFFICIENT_MEMORY;
+     struct ntlm_ctx *ctx = NULL;
+-    char *buf, *bin, *want_flags = NULL;
++    char *buf, *bin, *want_flags = NULL, *local_helper = NULL, *room_principal = NULL;
+     unsigned int len, bin_len;
+ 
+     TRACE( "%#Ix, %#Ix, %#lx, %lu, %p, %p, %p, %p, %p, %p, %p\n", cred_handle, ctx_handle, ctx_req, data_rep, input,
+@@ -880,7 +1034,7 @@ static NTSTATUS NTAPI ntlm_SpAcceptLsaModeContext( LSA_SEC_HANDLE cred_handle, L
+     if (!ctx_handle)
+     {
+         struct ntlm_cred *cred = (struct ntlm_cred *)cred_handle;
+-        char *argv[3];
++        char *argv[4];
+ 
+         if (!cred || !(cred->mode & MODE_SERVER))
+         {
+@@ -906,8 +1060,16 @@ static NTSTATUS NTAPI ntlm_SpAcceptLsaModeContext( LSA_SEC_HANDLE cred_handle, L
+         argv[0] = (char *)"ntlm_auth";
+         argv[1] = (char *)"--helper-protocol=squid-2.5-ntlmssp";
+         argv[2] = NULL;
++        /* Samba's acceptor needs a domain, so a room accepts its own identity. */
++        if ((local_helper = local_auth_helper()) && (room_principal = get_room_principal_arg()))
++        {
++            argv[0] = local_helper;
++            argv[2] = room_principal;
++            argv[3] = NULL;
++        }
+         if ((status = ntlm_fork( ctx, argv )) != SEC_E_OK) goto done;
+         ctx->mode = MODE_SERVER;
++        ctx->local_auth = room_principal != NULL;
+ 
+         if (!(want_flags = malloc( 73 )))
+         {
+@@ -1017,6 +1179,8 @@ static NTSTATUS NTAPI ntlm_SpAcceptLsaModeContext( LSA_SEC_HANDLE cred_handle, L
+                 goto done;
+             }
+         }
++        if ((status = set_local_principal(ctx, buf + 3)) != SEC_E_OK) goto done;
++
+         output->pBuffers[0].cbBuffer = 0;
+ 
+         strcpy( buf, "GF" );
+@@ -1031,7 +1195,8 @@ static NTSTATUS NTAPI ntlm_SpAcceptLsaModeContext( LSA_SEC_HANDLE cred_handle, L
+         else if (!strncmp( buf, "GK ", 3 ))
+         {
+             bin_len = decode_base64( buf + 3, len - 3, bin );
+-            TRACE( "session key is %s\n", debugstr_a(buf + 3) );
++            if (bin_len != sizeof(ctx->session_key)) { status = SEC_E_INVALID_TOKEN; goto done; }
++            if (!ctx->local_auth) TRACE( "session key is %s\n", debugstr_a(buf + 3) );
+             memcpy( ctx->session_key, bin, bin_len );
+         }
+ 
+@@ -1047,12 +1212,22 @@ static NTSTATUS NTAPI ntlm_SpAcceptLsaModeContext( LSA_SEC_HANDLE cred_handle, L
+             else if (!strncmp( buf, "GK ", 3 ))
+             {
+                 bin_len = decode_base64( buf + 3, len - 3, bin );
+-                TRACE( "session key is %s\n", debugstr_a(buf + 3) );
++                if (bin_len != sizeof(ctx->session_key)) { status = SEC_E_INVALID_TOKEN; goto done; }
++                if (!ctx->local_auth) TRACE( "session key is %s\n", debugstr_a(buf + 3) );
+                 memcpy( ctx->session_key, bin, 16 );
+             }
+         }
++        if (ctx->local_auth && (strncmp(buf, "GK ", 3) || !(ctx->flags & FLAG_NEGOTIATE_NTLM2)
++                || ((ctx_req & ASC_REQ_CONFIDENTIALITY) && !(ctx->flags & FLAG_NEGOTIATE_SEAL))
++                || ((ctx_req & ASC_REQ_INTEGRITY) && !(ctx->flags & FLAG_NEGOTIATE_SIGN))))
++        { status = SEC_E_QOP_NOT_SUPPORTED; goto done; }
+         arc4_init( &ctx->crypt.ntlm.arc4info, ctx->session_key, 16 );
+         ctx->crypt.ntlm.seq_no = 0;
++        create_ntlm2_subkeys(ctx);
++        arc4_init(&ctx->crypt.ntlm2.send_arc4info, ctx->crypt.ntlm2.send_seal_key, 16);
++        arc4_init(&ctx->crypt.ntlm2.recv_arc4info, ctx->crypt.ntlm2.recv_seal_key, 16);
++        ctx->crypt.ntlm2.send_seq_no = ctx->crypt.ntlm2.recv_seq_no = 0;
++        ctx->authenticated = TRUE;
+ 
+         *new_ctx_handle = (LSA_SEC_HANDLE)ctx;
+         status = SEC_E_OK;
+@@ -1067,6 +1242,14 @@ done:
+     free( buf );
+     free( bin );
+     free( want_flags );
++    free( local_helper );
++    free( room_principal );
++    if (ctx_attr && ctx && (status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED))
++    {
++        *ctx_attr = ctx->attrs;
++        if (ctx->flags & FLAG_NEGOTIATE_SIGN) *ctx_attr |= ASC_RET_INTEGRITY;
++        if (ctx->flags & FLAG_NEGOTIATE_SEAL) *ctx_attr |= ASC_RET_CONFIDENTIALITY;
++    }
+ 
+     TRACE( "returning %#lx\n", status );
+     return status;
+@@ -1115,7 +1298,18 @@ static NTSTATUS NTAPI ntlm_SpQueryContextAttributes( LSA_SEC_HANDLE handle, ULON
+     X(SECPKG_ATTR_AUTHORITY);
+     X(SECPKG_ATTR_DCE_INFO);
+     X(SECPKG_ATTR_LIFESPAN);
+-    X(SECPKG_ATTR_NAMES);
++    case SECPKG_ATTR_NAMES:
++    {
++        SecPkgContext_NamesW *names = buf;
++        struct ntlm_ctx *ctx = (struct ntlm_ctx *)handle;
++        SIZE_T size;
++        names->sUserName = NULL;
++        if (!ctx->authenticated || !ctx->local_auth || !ctx->local_principal) return SEC_E_UNSUPPORTED_FUNCTION;
++        size = (wcslen(ctx->local_principal) + 1) * sizeof(WCHAR);
++        if (!(names->sUserName = RtlAllocateHeap(GetProcessHeap(), 0, size))) return SEC_E_INSUFFICIENT_MEMORY;
++        memcpy(names->sUserName, ctx->local_principal, size);
++        return SEC_E_OK;
++    }
+     X(SECPKG_ATTR_NATIVE_NAMES);
+     X(SECPKG_ATTR_PACKAGE_INFO);
+     X(SECPKG_ATTR_PASSWORD_EXPIRY);
+@@ -1595,7 +1789,7 @@ static SECPKG_USER_FUNCTION_TABLE ntlm_user_table =
+     ntlm_SpVerifySignature,
+     ntlm_SpSealMessage,
+     ntlm_SpUnsealMessage,
+-    NULL, /* SpGetContextToken */
++    ntlm_SpGetContextToken,
+     NULL, /* SpQueryContextAttributes */
+     NULL, /* SpCompleteAuthToken */
+     NULL, /* SpDeleteContext */
+diff --git a/dlls/msv1_0/unixlib.h b/dlls/msv1_0/unixlib.h
+index bfa94972..c16b2535 100644
+--- a/dlls/msv1_0/unixlib.h
++++ b/dlls/msv1_0/unixlib.h
+@@ -89,6 +89,10 @@ struct ntlm_ctx
+             struct arc4_info recv_arc4info;
+         } ntlm2;
+     } crypt;
++    /* PE-side local logon state; Unix helpers only access the unchanged prefix. */
++    WCHAR       *local_principal;
++    BOOL         local_auth;
++    BOOL         authenticated;
+ };
+ 
+ 

@@ -37,10 +37,16 @@ tests: `winrt/README.md`.
 Since 0.7.0 the runtime is built from CodeWeavers' open-source CrossOver sources
 (Wine 11.0 plus their Mac work: msync, D3DMetal/DXMT bridge, controller support)
 instead of plain Wine 11.0. `build-wine-cx.sh` downloads the source archive, checks
-its SHA-256 and applies `crossover/0001-virtual-compatibility.patch`, which is the
-patch series above ported onto that base (0019 is replaced by CrossOver's own
-Mac-driver bridge) plus two CrossOver-specific changes: the real Windows user name
-instead of CrossOver's fixed "crossover", and libinotify flags for winebus.
+its SHA-256 and applies `crossover/series` in order: the patches above ported onto
+that base as one commit each (0015 merged with CrossOver's Mac driver, 0019 replaced
+by CrossOver's own bridge) plus two CrossOver-specific commits (the real Windows
+user name instead of CrossOver's fixed "crossover", libinotify flags for winebus).
+The WinRT networking/devices patches (0003–0006, 0014) are frozen at the end of the
+series: carried along on rebases, dropped if they stop applying.
+
+To change a patch: edit the series branch (`thirdparty/wine-cx-series`, branch
+`series/26.1`), then regenerate with
+`git format-patch --zero-commit --no-signature --no-numbered cx-26.1.0.. -o patches/crossover`.
 
 ## Renaming: what actually happens (honestly)
 

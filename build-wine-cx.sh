@@ -1,6 +1,8 @@
 #!/bin/bash
-# Reproduce the tested CrossOver FOSS base plus Virtual's ported patch set.
-# Only LGPL Wine sources are used; no proprietary CrossOver app or license key.
+# Reproduce the tested CrossOver FOSS base plus Virtual's patch series
+# (patches/crossover/series, applied in order; a patch that does not apply stops
+# the build and is named). Only LGPL Wine sources are used; no proprietary
+# CrossOver app or license key.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 VERSION=26.1.0
@@ -8,8 +10,13 @@ SHA=e4ec87d5821a009dd1f1d2e36ffe2e24b8fcbae9516375ea42f95a16928ab8fa
 URL="https://media.codeweavers.com/pub/crossover/source/crossover-sources-$VERSION.tar.gz"
 CACHE="$ROOT/thirdparty/crossover"
 PKG="$CACHE/crossover-sources-$VERSION.tar.gz"
-PATCH="$ROOT/patches/crossover/0001-virtual-compatibility.patch"
-PATCH_ID="$(shasum -a 256 "$PATCH" | awk '{print substr($1,1,12)}')"
+PATCHES="$ROOT/patches/crossover"
+SERIES=()
+while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    SERIES+=("$line")
+done < "$PATCHES/series"
+PATCH_ID="$( (cd "$PATCHES" && cat series "${SERIES[@]}") | shasum -a 256 | awk '{print substr($1,1,12)}')"
 SRC="$CACHE/wine-$VERSION-$PATCH_ID"
 mkdir -p "$CACHE"
 if [ ! -f "$PKG" ] || [ "$(shasum -a 256 "$PKG" | awk '{print $1}')" != "$SHA" ]; then
@@ -22,8 +29,10 @@ if [ ! -f "$SRC/.virtual-source-ready" ]; then
     trap 'rm -rf "$TMP"' EXIT
     tar -xzf "$PKG" -C "$TMP" sources/wine
     git init -q "$TMP/sources/wine"
-    git -C "$TMP/sources/wine" apply --check "$PATCH"
-    git -C "$TMP/sources/wine" apply "$PATCH"
+    for patch in "${SERIES[@]}"; do
+        git -C "$TMP/sources/wine" apply --check "$PATCHES/$patch" || { echo "Patch passt nicht: $patch" >&2; exit 1; }
+        git -C "$TMP/sources/wine" apply "$PATCHES/$patch"
+    done
     printf '%s\n' "$VERSION $SHA $PATCH_ID" > "$TMP/sources/wine/.virtual-source-ready"
     mv "$TMP/sources/wine" "$SRC"
 fi

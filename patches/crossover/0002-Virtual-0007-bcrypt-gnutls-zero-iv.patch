@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:23:47 +0100
+Subject: [PATCH] Virtual 0007: bcrypt-gnutls-zero-iv
+
+AES/3DES in ECB mode and AES key wrap no longer crash: the bundled
+GnuTLS 3.8.7 faults on block ciphers initialized without IV, so bcrypt
+now passes an all-zero vector (bcrypt tests: 15 failures -> 0)
+---
+ dlls/bcrypt/gnutls.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/bcrypt/gnutls.c b/dlls/bcrypt/gnutls.c
+index cff9526a..658ce9fb 100644
+--- a/dlls/bcrypt/gnutls.c
++++ b/dlls/bcrypt/gnutls.c
+@@ -669,6 +669,7 @@ static NTSTATUS key_symmetric_vector_reset( void *args )
+ 
+ static NTSTATUS init_cipher_handle( struct key *key )
+ {
++    static UCHAR zero_vector[16];
+     gnutls_cipher_algorithm_t cipher;
+     gnutls_datum_t secret, vector;
+     int ret;
+@@ -682,7 +683,15 @@ static NTSTATUS init_cipher_handle( struct key *key )
+     vector.data = key->u.s.vector;
+     vector.size = key->u.s.vector_len;
+ 
+-    if ((ret = pgnutls_cipher_init( &key_data(key)->cipher, cipher, &secret, key->u.s.vector ? &vector : NULL )))
++    /* ECB is emulated with CBC and an all-zero vector; some GnuTLS builds crash
++     * in cipher_encrypt2/decrypt2 when a block cipher is initialized without one. */
++    if (!vector.data && key->u.s.mode != CHAIN_MODE_GCM && key->u.s.block_size <= sizeof(zero_vector))
++    {
++        vector.data = zero_vector;
++        vector.size = key->u.s.block_size;
++    }
++
++    if ((ret = pgnutls_cipher_init( &key_data(key)->cipher, cipher, &secret, vector.data ? &vector : NULL )))
+     {
+         pgnutls_perror( ret );
+         return STATUS_INTERNAL_ERROR;

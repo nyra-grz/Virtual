@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:23:47 +0100
+Subject: [PATCH] Virtual 0020: services-object-security
+
+QueryServiceObjectSecurity/SetServiceObjectSecurity store and return a
+service's descriptor (Windows default DACL otherwise) instead of stubs;
+Epic Games' updater service works
+---
+ dlls/sechost/service.c  |  70 ++++++++++++++------
+ programs/services/rpc.c | 142 ++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 187 insertions(+), 25 deletions(-)
+
+diff --git a/dlls/sechost/service.c b/dlls/sechost/service.c
+index 474d977a..bf36938c 100644
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -1250,35 +1250,67 @@ BOOL WINAPI EnumDependentServicesW( SC_HANDLE hService, DWORD dwServiceState,
+ BOOL WINAPI DECLSPEC_HOTPATCH QueryServiceObjectSecurity( SC_HANDLE service, SECURITY_INFORMATION type,
+                                                           PSECURITY_DESCRIPTOR ret_descriptor, DWORD size, DWORD *ret_size )
+ {
+-    SECURITY_DESCRIPTOR descriptor;
+-    NTSTATUS status;
+-    ACL acl;
+-
+-    FIXME( "%p %ld %p %lu %p - semi-stub\n", service, type, ret_descriptor, size, ret_size );
+-
+-    if (type != DACL_SECURITY_INFORMATION)
+-        FIXME("information %ld not supported\n", type);
++    BYTE dummy;
++    DWORD err;
+ 
+-    InitializeSecurityDescriptor( &descriptor, SECURITY_DESCRIPTOR_REVISION );
++    TRACE( "%p %#lx %p %lu %p\n", service, type, ret_descriptor, size, ret_size );
+ 
+-    InitializeAcl( &acl, sizeof(ACL), ACL_REVISION );
+-    SetSecurityDescriptorDacl( &descriptor, TRUE, &acl, TRUE );
++    if (!ret_size) return set_error( ERROR_INVALID_ADDRESS );
++    if (!ret_descriptor) size = 0;
+ 
+-    status = RtlMakeSelfRelativeSD( &descriptor, ret_descriptor, &size );
+-    *ret_size = size;
++    __TRY
++    {
++        err = svcctl_QueryServiceObjectSecurity( service, type, size ? ret_descriptor : &dummy, size, ret_size );
++    }
++    __EXCEPT(rpc_filter)
++    {
++        err = map_exception_code( GetExceptionCode() );
++    }
++    __ENDTRY
+ 
+-    return set_error( RtlNtStatusToDosError( status ) );
++    return set_error( err );
+ }
+ 
+ /******************************************************************************
+  *     SetServiceObjectSecurity   (sechost.@)
+  */
+-BOOL WINAPI SetServiceObjectSecurity(SC_HANDLE hService,
+-       SECURITY_INFORMATION dwSecurityInformation,
+-       PSECURITY_DESCRIPTOR lpSecurityDescriptor)
++BOOL WINAPI SetServiceObjectSecurity( SC_HANDLE service, SECURITY_INFORMATION type,
++                                      PSECURITY_DESCRIPTOR descriptor )
+ {
+-    FIXME("%p %ld %p\n", hService, dwSecurityInformation, lpSecurityDescriptor);
+-    return TRUE;
++    SECURITY_DESCRIPTOR_CONTROL control;
++    PSECURITY_DESCRIPTOR relative = descriptor;
++    DWORD revision, len = 0, err;
++
++    TRACE( "%p %#lx %p\n", service, type, descriptor );
++
++    if (!descriptor || !GetSecurityDescriptorControl( descriptor, &control, &revision ))
++        return set_error( ERROR_INVALID_PARAMETER );
++
++    /* the service manager takes a self-relative descriptor */
++    if (!(control & SE_SELF_RELATIVE))
++    {
++        MakeSelfRelativeSD( descriptor, NULL, &len );
++        if (!len || !(relative = malloc( len ))) return set_error( ERROR_OUTOFMEMORY );
++        if (!MakeSelfRelativeSD( descriptor, relative, &len ))
++        {
++            free( relative );
++            return FALSE;
++        }
++    }
++    else len = GetSecurityDescriptorLength( descriptor );
++
++    __TRY
++    {
++        err = svcctl_SetServiceObjectSecurity( service, type, relative, len );
++    }
++    __EXCEPT(rpc_filter)
++    {
++        err = map_exception_code( GetExceptionCode() );
++    }
++    __ENDTRY
++
++    if (relative != descriptor) free( relative );
++    return set_error( err );
+ }
+ 
+ static DWORD WINAPI notify_thread(void *user)
+diff --git a/programs/services/rpc.c b/programs/services/rpc.c
+index b2f541ea..fc608247 100644
+--- a/programs/services/rpc.c
++++ b/programs/services/rpc.c
+@@ -26,6 +26,7 @@
+ #include <windows.h>
+ #include <winternl.h>
+ #include <winsvc.h>
++#include <sddl.h>
+ #include <ddk/ntddk.h>
+ #include <ntsecapi.h>
+ #include <rpc.h>
+@@ -1895,25 +1896,154 @@ DWORD __cdecl svcctl_QueryServiceConfigEx(
+     return ERROR_CALL_NOT_IMPLEMENTED;
+ }
+ 
++/* Virtual: service object security, stored like Windows in Services\<name>\Security
++ * (value "Security", self-relative descriptor). Services without one get Windows'
++ * default service DACL. Updaters (e.g. Epic Games) grant users the right to start
++ * their service and check that grant afterwards. */
++static const WCHAR default_service_sddl[] =
++    L"O:SYG:SYD:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"
++    L"(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
++
++/* returns a LocalAlloc'ed self-relative descriptor */
++static DWORD load_service_security(struct service_entry *entry, PSECURITY_DESCRIPTOR *sd)
++{
++    DWORD size = 0, type, err;
++    HKEY key;
++
++    *sd = NULL;
++    if (!RegOpenKeyExW(entry->db->root_key, entry->name, 0, KEY_READ, &key))
++    {
++        if (!RegGetValueW(key, L"Security", L"Security", RRF_RT_REG_BINARY, &type, NULL, &size) && size &&
++            (*sd = LocalAlloc(LMEM_FIXED, size)) &&
++            (RegGetValueW(key, L"Security", L"Security", RRF_RT_REG_BINARY, &type, *sd, &size) ||
++             !IsValidSecurityDescriptor(*sd)))
++        {
++            LocalFree(*sd);
++            *sd = NULL;
++        }
++        RegCloseKey(key);
++    }
++    if (*sd) return ERROR_SUCCESS;
++    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(default_service_sddl, SDDL_REVISION_1, sd, NULL))
++    {
++        err = GetLastError();
++        return err ? err : ERROR_OUTOFMEMORY;
++    }
++    return ERROR_SUCCESS;
++}
++
++static DWORD access_for_security_info(SECURITY_INFORMATION info, BOOL write)
++{
++    DWORD access = 0;
++
++    if (info & SACL_SECURITY_INFORMATION) access |= ACCESS_SYSTEM_SECURITY;
++    if (write)
++    {
++        if (info & DACL_SECURITY_INFORMATION) access |= WRITE_DAC;
++        if (info & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) access |= WRITE_OWNER;
++    }
++    else if (info & (DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION))
++        access |= READ_CONTROL;
++    return access;
++}
++
+ DWORD __cdecl svcctl_QueryServiceObjectSecurity(
+-    SC_RPC_HANDLE service,
++    SC_RPC_HANDLE handle,
+     SECURITY_INFORMATION info,
+     BYTE *descriptor,
+     DWORD buf_size,
+     DWORD *needed_size)
+ {
+-    WINE_FIXME("\n");
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    PSECURITY_DESCRIPTOR stored = NULL;
++    SECURITY_DESCRIPTOR part;
++    struct sc_service_handle *service;
++    BOOL present, defaulted;
++    PSID sid;
++    PACL acl;
++    DWORD err;
++
++    WINE_TRACE("(%p, %#lx, %p, %lu)\n", handle, info, descriptor, buf_size);
++
++    if ((err = validate_service_handle(handle, access_for_security_info(info, FALSE), &service)))
++        return err;
++
++    service_lock(service->service_entry);
++    err = load_service_security(service->service_entry, &stored);
++    service_unlock(service->service_entry);
++    if (err) return err;
++
++    /* only the requested parts, like Windows */
++    InitializeSecurityDescriptor(&part, SECURITY_DESCRIPTOR_REVISION);
++    if ((info & OWNER_SECURITY_INFORMATION) && GetSecurityDescriptorOwner(stored, &sid, &defaulted))
++        SetSecurityDescriptorOwner(&part, sid, defaulted);
++    if ((info & GROUP_SECURITY_INFORMATION) && GetSecurityDescriptorGroup(stored, &sid, &defaulted))
++        SetSecurityDescriptorGroup(&part, sid, defaulted);
++    if ((info & DACL_SECURITY_INFORMATION) && GetSecurityDescriptorDacl(stored, &present, &acl, &defaulted))
++        SetSecurityDescriptorDacl(&part, present, acl, defaulted);
++    if ((info & SACL_SECURITY_INFORMATION) && GetSecurityDescriptorSacl(stored, &present, &acl, &defaulted))
++        SetSecurityDescriptorSacl(&part, present, acl, defaulted);
++
++    *needed_size = buf_size;
++    if (MakeSelfRelativeSD(&part, descriptor, needed_size)) err = ERROR_SUCCESS;
++    else err = GetLastError();
++    LocalFree(stored);
++    return err;
+ }
+ 
+ DWORD __cdecl svcctl_SetServiceObjectSecurity(
+-    SC_RPC_HANDLE service,
++    SC_RPC_HANDLE handle,
+     SECURITY_INFORMATION info,
+     BYTE *descriptor,
+     DWORD buf_size)
+ {
+-    WINE_FIXME("\n");
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    PSECURITY_DESCRIPTOR stored = NULL, sd = descriptor;
++    SECURITY_DESCRIPTOR merged;
++    struct sc_service_handle *service;
++    BOOL present, defaulted;
++    PSID sid;
++    PACL acl;
++    BYTE *result = NULL;
++    DWORD err, size = 0;
++    HKEY key;
++
++    WINE_TRACE("(%p, %#lx, %p, %lu)\n", handle, info, descriptor, buf_size);
++
++    if (!descriptor || !buf_size || !IsValidSecurityDescriptor(sd)) return ERROR_INVALID_PARAMETER;
++    if ((err = validate_service_handle(handle, access_for_security_info(info, TRUE), &service)))
++        return err;
++
++    service_lock(service->service_entry);
++    if ((err = load_service_security(service->service_entry, &stored))) goto done;
++
++    /* start from the stored descriptor, replace the parts the caller passes */
++    InitializeSecurityDescriptor(&merged, SECURITY_DESCRIPTOR_REVISION);
++    if (GetSecurityDescriptorOwner((info & OWNER_SECURITY_INFORMATION) ? sd : stored, &sid, &defaulted))
++        SetSecurityDescriptorOwner(&merged, sid, defaulted);
++    if (GetSecurityDescriptorGroup((info & GROUP_SECURITY_INFORMATION) ? sd : stored, &sid, &defaulted))
++        SetSecurityDescriptorGroup(&merged, sid, defaulted);
++    if (GetSecurityDescriptorDacl((info & DACL_SECURITY_INFORMATION) ? sd : stored, &present, &acl, &defaulted))
++        SetSecurityDescriptorDacl(&merged, present, acl, defaulted);
++    if (GetSecurityDescriptorSacl((info & SACL_SECURITY_INFORMATION) ? sd : stored, &present, &acl, &defaulted))
++        SetSecurityDescriptorSacl(&merged, present, acl, defaulted);
++
++    MakeSelfRelativeSD(&merged, NULL, &size);
++    if (!size || !(result = malloc(size)) || !MakeSelfRelativeSD(&merged, result, &size))
++    {
++        err = result ? GetLastError() : ERROR_OUTOFMEMORY;
++        goto done;
++    }
++    if (!(err = RegCreateKeyExW(service->service_entry->db->root_key, service->service_entry->name, 0, NULL,
++                                REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &key, NULL)))
++    {
++        err = RegSetKeyValueW(key, L"Security", L"Security", REG_BINARY, result, size);
++        RegCloseKey(key);
++    }
++
++done:
++    service_unlock(service->service_entry);
++    LocalFree(stored);
++    free(result);
++    return err;
+ }
+ 
+ DWORD __cdecl svcctl_QueryServiceStatus(

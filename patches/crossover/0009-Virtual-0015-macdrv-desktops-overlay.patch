@@ -1,0 +1,502 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:24:11 +0100
+Subject: [PATCH] Virtual 0015: macdrv-desktops-overlay
+
+Only the input desktop's windows are visible (SwitchDesktop reaches all
+processes); kiosk desktops and borderless full-screen windows float
+above normal Mac apps, shrinkable with Virtual's shortcut
+
+Ported onto CrossOver's Mac driver: window style masks are merged with
+CrossOver's own macdrv_GetWindowStyleMasks changes (replaces 0019).
+---
+ dlls/win32u/driver.c            |  11 +++
+ dlls/win32u/winstation.c        |   5 ++
+ dlls/winemac.drv/cocoa_app.h    |   4 +
+ dlls/winemac.drv/cocoa_app.m    |  36 +++++++-
+ dlls/winemac.drv/cocoa_window.h |  13 +++
+ dlls/winemac.drv/cocoa_window.m | 152 ++++++++++++++++++++++++++++++++
+ dlls/winemac.drv/gdi.c          |   1 +
+ dlls/winemac.drv/macdrv.h       |   1 +
+ dlls/winemac.drv/macdrv_cocoa.h |   3 +
+ dlls/winemac.drv/window.c       |  33 ++++++-
+ include/wine/gdi_driver.h       |   3 +-
+ 11 files changed, 259 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index 9a302da6..d0f0ff86 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -818,6 +818,10 @@ static void nulldrv_SetDesktopWindow( HWND hwnd )
+ {
+ }
+ 
++static void nulldrv_SwitchDesktop( const WCHAR *name )
++{
++}
++
+ static void nulldrv_ActivateWindow( HWND hwnd, HWND previous )
+ {
+ }
+@@ -1220,6 +1224,11 @@ static void loaderdrv_SetDesktopWindow( HWND hwnd )
+     load_driver()->pSetDesktopWindow( hwnd );
+ }
+ 
++static void loaderdrv_SwitchDesktop( const WCHAR *name )
++{
++    load_driver()->pSwitchDesktop( name );
++}
++
+ static void loaderdrv_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWORD flags )
+ {
+     load_driver()->pSetLayeredWindowAttributes( hwnd, key, alpha, flags );
+@@ -1309,6 +1318,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     nulldrv_ScrollDC,
+     nulldrv_SetCapture,
+     loaderdrv_SetDesktopWindow,
++    loaderdrv_SwitchDesktop,
+     nulldrv_ActivateWindow,
+     loaderdrv_SetLayeredWindowAttributes,
+     nulldrv_SetParent,
+@@ -1412,6 +1422,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(ScrollDC);
+     SET_USER_FUNC(SetCapture);
+     SET_USER_FUNC(SetDesktopWindow);
++    SET_USER_FUNC(SwitchDesktop);
+     SET_USER_FUNC(ActivateWindow);
+     SET_USER_FUNC(SetLayeredWindowAttributes);
+     SET_USER_FUNC(SetParent);
+diff --git a/dlls/win32u/winstation.c b/dlls/win32u/winstation.c
+index eaa5f40c..11bcd861 100644
+--- a/dlls/win32u/winstation.c
++++ b/dlls/win32u/winstation.c
+@@ -614,6 +614,8 @@ HDESK WINAPI NtUserOpenInputDesktop( DWORD flags, BOOL inherit, ACCESS_MASK acce
+ 
+ BOOL WINAPI NtUserSwitchDesktop( HDESK desktop )
+ {
++    WCHAR name[MAX_PATH];
++
+     TRACE( "desktop %p\n", desktop );
+ 
+     SERVER_START_REQ( set_input_desktop )
+@@ -623,6 +625,9 @@ BOOL WINAPI NtUserSwitchDesktop( HDESK desktop )
+     }
+     SERVER_END_REQ;
+ 
++    /* Only the input desktop is visible; let the driver hide the other desktops' windows. */
++    if (NtUserGetObjectInformation( desktop, UOI_NAME, name, sizeof(name), NULL ))
++        user_driver->pSwitchDesktop( name );
+     return TRUE;
+ }
+ 
+diff --git a/dlls/winemac.drv/cocoa_app.h b/dlls/winemac.drv/cocoa_app.h
+index f9acd289..0e0d2238 100644
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -35,6 +35,10 @@
+ @protocol WineClipCursorHandler;
+ 
+ 
++extern BOOL virtual_kiosk_overlay(void);
++extern BOOL virtual_kiosk_shrunk;
++extern void virtual_set_input_desktop(NSString* name);
++
+ @interface WineApplicationController : NSObject <NSApplicationDelegate>
+ {
+     CFRunLoopSourceRef requestSource;
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 227d68b9..99739081 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -732,7 +732,7 @@ - (void) adjustWindowLevels:(BOOL)active
+             NSInteger origLevel = [window level];
+             NSInteger newLevel = [window minimumLevelForActive:active];
+ 
+-            if (window.floating)
++            if (window.floating && ![window virtualKioskDemoted])
+             {
+                 if (minFloatingLevel <= maxNonfloatingLevel)
+                     minFloatingLevel = maxNonfloatingLevel + 1;
+@@ -1970,6 +1970,40 @@ - (void) setupObservations
+         NSNotificationCenter* wsnc = [[NSWorkspace sharedWorkspace] notificationCenter];
+         NSDistributedNotificationCenter* dnc = [NSDistributedNotificationCenter defaultCenter];
+ 
++        if (virtual_kiosk_overlay())
++        {
++            /* Virtual's shortcut: shrink kiosk windows to normal windows or restore them. */
++            [dnc addObserverForName:@"com.oezdek.virtual.kiosk"
++                             object:nil
++                              queue:[NSOperationQueue mainQueue]
++                         usingBlock:^(NSNotification *note){
++                BOOL shrunk = [note.userInfo[@"shrunk"] boolValue];
++                virtual_kiosk_shrunk = shrunk;
++                for (NSWindow* window in [NSApp windows])
++                    if ([window isKindOfClass:[WineWindow class]])
++                        [(WineWindow*)window virtualSetKioskShrunk:shrunk];
++                [self adjustWindowLevels];
++                /* The program answers the size change asynchronously; settle levels afterwards. */
++                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++                    [self adjustWindowLevels];
++                });
++            }];
++        }
++
++        /* A program of this prefix switched the input desktop (SwitchDesktop). */
++        [dnc addObserverForName:@"com.oezdek.virtual.desktop"
++                         object:nil
++                          queue:[NSOperationQueue mainQueue]
++                     usingBlock:^(NSNotification *note){
++            const char* prefix = getenv("WINEPREFIX");
++            if (![note.userInfo[@"prefix"] isEqualToString:prefix ? @(prefix) : @""]) return;
++            virtual_set_input_desktop(note.userInfo[@"desktop"]);
++            for (NSWindow* window in [NSApp windows])
++                if ([window isKindOfClass:[WineWindow class]])
++                    [(WineWindow*)window virtualUpdateDesktop];
++            [self adjustWindowLevels];
++        }];
++
+         [nc addObserverForName:NSWindowDidBecomeKeyNotification
+                         object:nil
+                          queue:nil
+diff --git a/dlls/winemac.drv/cocoa_window.h b/dlls/winemac.drv/cocoa_window.h
+index 23ecd6da..b6a26c1a 100644
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -69,6 +69,14 @@ @interface WineWindow : NSPanel <NSWindowDelegate>
+     BOOL enteringFullScreen;
+     BOOL exitingFullScreen;
+     NSRect nonFullscreenFrame;
++
++    /* Virtual: kiosk window shrunk by the user, and its full-screen frame. */
++    BOOL virtualKioskShrunk;
++    NSRect virtualKioskFrame;
++    /* Virtual: the window's Windows desktop; hidden while another desktop is the input desktop. */
++    NSString* virtualDesktop;
++    BOOL virtualDesktopHidden;
++    BOOL virtualDesktopWasVisible;
+     NSTimeInterval enteredFullScreenTime;
+ 
+     int draggingPhase;
+@@ -101,6 +109,11 @@ @interface WineWindow : NSPanel <NSWindowDelegate>
+ @property (readonly, nonatomic) BOOL presentsVisibleContent;
+ 
+     - (NSInteger) minimumLevelForActive:(BOOL)active;
++    - (void) virtualSetKioskShrunk:(BOOL)shrunk;
++    - (void) virtualUpdateDesktop;
++    - (void) virtualSetDesktop:(NSString*)name;
++    - (BOOL) virtualIsKiosk;
++    - (BOOL) virtualKioskDemoted;
+     - (void) updateFullscreen;
+ 
+     - (void) postKeyEvent:(NSEvent *)theEvent;
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index ffb7c6af..370c448f 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -155,6 +155,33 @@ static inline NSUInteger adjusted_modifiers_for_settings(NSUInteger modifiers)
+     return new_modifiers;
+ }
+ 
++/* Virtual: a kiosk window (borderless, covering the screen) behaves like an overlay above
++ * normal Mac apps instead of a locked-down full-screen mode, and the user can shrink it to
++ * a normal window with Virtual's shortcut. Set by Virtual for the programs it starts. */
++BOOL virtual_kiosk_overlay(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) enabled = getenv("VIRTUAL_KIOSK_OVERLAY") != NULL;
++    return enabled;
++}
++
++/* Virtual: the input desktop of this prefix, and whether the user shrank the kiosk. */
++static NSString* virtual_input_desktop;
++BOOL virtual_kiosk_shrunk;
++
++void virtual_set_input_desktop(NSString* name)
++{
++    if (!name.length || [name isEqualToString:virtual_input_desktop]) return;
++    [virtual_input_desktop release];
++    virtual_input_desktop = [name copy];
++}
++
++/* A program switched to a desktop of its own (kiosk and exam software does that). */
++static BOOL virtual_kiosk_desktop_active(void)
++{
++    return virtual_input_desktop && [virtual_input_desktop caseInsensitiveCompare:@"Default"] != NSOrderedSame;
++}
++
+ static inline BOOL stage_manager_enabled(void)
+ {
+     /* There is no documented way to determine if Stage Manager is enabled,
+@@ -1099,6 +1126,7 @@ - (void) dealloc
+     {
+         [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
+         [[NSNotificationCenter defaultCenter] removeObserver:self];
++        [virtualDesktop release];
+         [queue release];
+         [latentChildWindows release];
+         [latentParentWindow release];
+@@ -1269,9 +1297,95 @@ - (NSInteger) minimumLevelForActive:(BOOL)active
+             }
+         }
+ 
++        /* Stays above other apps' windows while another app is active, until shrunk. */
++        if ([self virtualKioskDemoted])
++            level = NSNormalWindowLevel;
++        else if ((fullscreen && virtual_kiosk_overlay()) || [self virtualIsKiosk])
++        {
++            if (!active && level < NSFloatingWindowLevel)
++                level = NSFloatingWindowLevel + (self.floating ? 1 : 0);
++        }
++
+         return level;
+     }
+ 
++    /* On the desktop a program switched to for itself, i.e. part of a kiosk. */
++    - (BOOL) virtualIsKiosk
++    {
++        return virtual_kiosk_overlay() && virtualDesktop && virtual_kiosk_desktop_active() &&
++               [virtualDesktop caseInsensitiveCompare:virtual_input_desktop] == NSOrderedSame;
++    }
++
++    - (BOOL) virtualKioskDemoted
++    {
++        return virtual_kiosk_shrunk && (fullscreen || virtualKioskShrunk || [self virtualIsKiosk]);
++    }
++
++    - (void) virtualSetDesktop:(NSString*)name
++    {
++        [virtualDesktop release];
++        virtualDesktop = [name copy];
++        [self virtualUpdateDesktop];
++    }
++
++    - (void) virtualUpdateDesktop
++    {
++        BOOL hide = virtualDesktop && virtual_input_desktop &&
++                    [virtualDesktop caseInsensitiveCompare:virtual_input_desktop] != NSOrderedSame;
++
++        if (hide && !virtualDesktopHidden)
++        {
++            virtualDesktopHidden = YES;
++            virtualDesktopWasVisible = [self isVisible];
++            if (virtualDesktopWasVisible) [super orderWindow:NSWindowOut relativeTo:0];
++        }
++        else if (!hide && virtualDesktopHidden)
++        {
++            virtualDesktopHidden = NO;
++            if (virtualDesktopWasVisible) [super orderWindow:NSWindowAbove relativeTo:0];
++            virtualDesktopWasVisible = NO;
++        }
++    }
++
++    /* Wine may order the window in while its desktop is not the input desktop. */
++    - (void) orderWindow:(NSWindowOrderingMode)mode relativeTo:(NSInteger)otherWindowNumber
++    {
++        if (virtualDesktopHidden && mode != NSWindowOut)
++        {
++            virtualDesktopWasVisible = YES;
++            return;
++        }
++        if (virtualDesktopHidden) virtualDesktopWasVisible = NO;
++        [super orderWindow:mode relativeTo:otherWindowNumber];
++    }
++
++    - (void) virtualSetKioskShrunk:(BOOL)shrunk
++    {
++        NSScreen* screen;
++        NSRect frame;
++
++        if (shrunk == virtualKioskShrunk) return;
++        if (shrunk)
++        {
++            if (![self isVisible] || [self isMiniaturized]) return;
++            screen = [self screen] ? [self screen] : [NSScreen mainScreen];
++            if (!fullscreen && !([self virtualIsKiosk] && self.frame.size.width * self.frame.size.height >=
++                                 0.8 * screen.frame.size.width * screen.frame.size.height))
++                return;
++            virtualKioskFrame = self.wine_fractionalFrame;
++            frame = [screen visibleFrame];
++            frame = NSInsetRect(frame, frame.size.width * 0.15, frame.size.height * 0.15);
++        }
++        else
++            frame = virtualKioskFrame;
++
++        virtualKioskShrunk = shrunk;
++        [self setFrameAndWineFrame:frame];
++        [self updateFullscreen];
++        /* The program re-lays itself out for the new size, as after a WM_SIZE on Windows. */
++        [self postWindowFrameChanged:frame fullscreen:NO resizing:NO skipSizeMove:YES];
++    }
++
+     - (void) postDidUnminimizeEvent
+     {
+         macdrv_event* event;
+@@ -3565,6 +3679,44 @@ void macdrv_set_cocoa_window_title(macdrv_window w, const unsigned short* title,
+ }
+ }
+ 
++/***********************************************************************
++ *              macdrv_set_cocoa_window_desktop
++ */
++void macdrv_set_cocoa_window_desktop(macdrv_window w, const UniChar* desktop, size_t length,
++                                     const UniChar* input, size_t input_length)
++{
++@autoreleasepool
++{
++    WineWindow* window = (WineWindow*)w;
++    NSString* name = [NSString stringWithCharacters:desktop length:length];
++    NSString* inputName = [NSString stringWithCharacters:input length:input_length];
++
++    OnMainThreadAsync(^{
++        virtual_set_input_desktop(inputName);
++        [window virtualSetDesktop:name];
++    });
++}
++}
++
++/***********************************************************************
++ *              macdrv_switch_desktop
++ *
++ * Tells all Wine processes of this prefix (and this one) the new input desktop.
++ */
++void macdrv_switch_desktop(const UniChar* name, size_t length)
++{
++@autoreleasepool
++{
++    const char* prefix = getenv("WINEPREFIX");
++    NSDictionary* info = @{@"desktop": [NSString stringWithCharacters:name length:length],
++                           @"prefix": prefix ? @(prefix) : @""};
++    [[NSDistributedNotificationCenter defaultCenter] postNotificationName:@"com.oezdek.virtual.desktop"
++                                                                   object:nil
++                                                                 userInfo:info
++                                                       deliverImmediately:YES];
++}
++}
++
+ /***********************************************************************
+  *              macdrv_order_cocoa_window
+  *
+diff --git a/dlls/winemac.drv/gdi.c b/dlls/winemac.drv/gdi.c
+index 7342494a..9713c234 100644
+--- a/dlls/winemac.drv/gdi.c
++++ b/dlls/winemac.drv/gdi.c
+@@ -264,6 +264,7 @@ static const struct user_driver_funcs macdrv_funcs =
+     .pSetCursor = macdrv_SetCursor,
+     .pSetCursorPos = macdrv_SetCursorPos,
+     .pSetDesktopWindow = macdrv_SetDesktopWindow,
++    .pSwitchDesktop = macdrv_SwitchDesktop,
+     .pActivateWindow = macdrv_ActivateWindow,
+     .pSetLayeredWindowAttributes = macdrv_SetLayeredWindowAttributes,
+     .pSetParent = macdrv_SetParent,
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 5735ff78..41613b01 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -140,6 +140,7 @@ static inline RECT rect_from_cgrect(CGRect cgrect)
+ extern NTSTATUS macdrv_SetCurrentProcessExplicitAppUserModelID(LPCWSTR aumid);  /* CW Hack 22310 */
+ extern NTSTATUS macdrv_GetCurrentProcessExplicitAppUserModelID(LPWSTR buffer, INT size);  /* CW Hack 22310 */
+ extern void macdrv_SetDesktopWindow(HWND hwnd);
++extern void macdrv_SwitchDesktop(const WCHAR *name);
+ extern void macdrv_ActivateWindow(HWND hwnd, HWND previous);
+ extern void macdrv_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha,
+                                               DWORD flags);
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index 477efe9f..f16221c9 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -531,6 +531,9 @@ extern void macdrv_set_cocoa_window_features(macdrv_window w,
+         const struct macdrv_window_features* wf);
+ extern void macdrv_set_cocoa_window_state(macdrv_window w,
+         const struct macdrv_window_state* state);
++extern void macdrv_set_cocoa_window_desktop(macdrv_window w, const UniChar* desktop, size_t length,
++                                            const UniChar* input, size_t input_length);
++extern void macdrv_switch_desktop(const UniChar* name, size_t length);
+ extern void macdrv_set_cocoa_window_title(macdrv_window w, const UniChar* title,
+         size_t length);
+ extern void macdrv_order_cocoa_window(macdrv_window w, macdrv_window prev,
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 741f7fda..d2030b81 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -481,6 +481,8 @@ static void sync_window_min_max_info(HWND hwnd)
+  *
+  * Create the whole Mac window for a given window
+  */
++static void set_cocoa_window_desktop(struct macdrv_win_data *data);
++
+ static void create_cocoa_window(struct macdrv_win_data *data)
+ {
+     struct macdrv_thread_data *thread_data = macdrv_init_thread_data();
+@@ -517,6 +519,7 @@ static void create_cocoa_window(struct macdrv_win_data *data)
+     data->cocoa_window = macdrv_create_cocoa_window(&wf, frame, data->hwnd, thread_data->queue);
+     if (!data->cocoa_window) goto done;
+ 
++    set_cocoa_window_desktop(data);
+     set_cocoa_window_properties(data);
+ 
+     /* set the window text */
+@@ -1237,6 +1240,34 @@ struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd)
+     return surface;
+ }
+ 
++/**********************************************************************
++ *              SwitchDesktop   (MACDRV.@)
++ *
++ * Only windows of the input desktop are visible on Windows; tell every
++ * process of this prefix which desktop that is now.
++ */
++void macdrv_SwitchDesktop(const WCHAR *name)
++{
++    TRACE("%s\n", debugstr_w(name));
++    macdrv_switch_desktop(name, wcslen(name));
++}
++
++/* Which desktop a window belongs to and which one is visible right now. */
++static void set_cocoa_window_desktop(struct macdrv_win_data *data)
++{
++    WCHAR name[MAX_PATH], input[MAX_PATH];
++    HDESK desktop = NtUserGetThreadDesktop(GetCurrentThreadId()), input_desktop;
++
++    if (!NtUserGetObjectInformation(desktop, UOI_NAME, name, sizeof(name), NULL)) return;
++    input[0] = 0;
++    if ((input_desktop = NtUserOpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS)))
++    {
++        if (!NtUserGetObjectInformation(input_desktop, UOI_NAME, input, sizeof(input), NULL)) input[0] = 0;
++        NtUserCloseDesktop(input_desktop);
++    }
++    macdrv_set_cocoa_window_desktop(data->cocoa_window, name, wcslen(name), input, wcslen(input));
++}
++
+ /**********************************************************************
+  *              SetDesktopWindow   (MACDRV.@)
+  */
+@@ -1654,7 +1685,7 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
+     /* CW HACK 16933: No Cocoa window decorations for the Quicken main window. */
+     if (is_main_quicken_window(hwnd)) return FALSE;
+ 
+-    *style_mask = ex_style = 0;
++    *style_mask = *ex_style_mask = 0;
+     if (wf.title_bar)
+     {
+         *style_mask |= WS_CAPTION;
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 727f9982..3bb8d0ad 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -218,7 +218,7 @@ struct gdi_dc_funcs
+ };
+ 
+ /* increment this when you change the DC function table */
+-#define WINE_GDI_DRIVER_VERSION 108
++#define WINE_GDI_DRIVER_VERSION 109
+ 
+ #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
+ #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
+@@ -412,6 +412,7 @@ struct user_driver_funcs
+     BOOL    (*pScrollDC)(HDC,INT,INT,HRGN);
+     void    (*pSetCapture)(HWND,UINT);
+     void    (*pSetDesktopWindow)(HWND);
++    void    (*pSwitchDesktop)(const WCHAR *);
+     void    (*pActivateWindow)(HWND,HWND);
+     void    (*pSetLayeredWindowAttributes)(HWND,COLORREF,BYTE,DWORD);
+     void    (*pSetParent)(HWND,HWND,HWND);

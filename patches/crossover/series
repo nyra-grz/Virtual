@@ -1,0 +1,26 @@
+# Virtual's patches on CrossOver's open-source Wine, applied in this order by
+# build-wine-cx.sh. Generated with git format-patch from the series branch.
+0001-Virtual-0002-nsiproxy-macos-wifi-type.patch
+0002-Virtual-0007-bcrypt-gnutls-zero-iv.patch
+0003-Virtual-0008-ncrypt-ecdsa-persisted-keys.patch
+0004-Virtual-0009-win32u-accessibility-keys-setcursors.patch
+0005-Virtual-0010-wintypes-resolve-metadata.patch
+0006-Virtual-0011-combase-parameterized-iids.patch
+0007-Virtual-0012-mmdevapi-endpoint-volume.patch
+0008-Virtual-0013-msv1_0-room-local-auth.patch
+0009-Virtual-0015-macdrv-desktops-overlay.patch
+0010-Virtual-0016-chromium-browsers.patch
+0011-Virtual-0017-com-services-winhttp.patch
+0012-Virtual-0018-macdrv-keyboard-locale-upstream.patch
+0013-Virtual-0020-services-object-security.patch
+0014-Virtual-0021-winegstreamer-fixed-caps.patch
+0015-winebus.sys-Pass-INOTIFY_CFLAGS-libinotify-outside-t.patch
+0016-advapi32-shell32-Report-the-real-Windows-user-name.patch
+
+# frozen: WinRT networking/devices for Safe Exam Browser. Carried along
+# mechanically on rebases; dropped (with their smoke probes) if they conflict.
+0017-Virtual-0003-hostname-implement.patch
+0018-Virtual-0004-connectivity-implement.patch
+0019-Virtual-0005-enumeration-upstream-fixes.patch
+0020-Virtual-0006-devices-implement.patch
+0021-Virtual-0014-wlanapi-wifi.patch

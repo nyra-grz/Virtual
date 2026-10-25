@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20=C3=96zdek?= <daniel.timur.23@gmail.com>
+Date: Sun, 25 Oct 2026 13:23:47 +0100
+Subject: [PATCH] Virtual 0021: winegstreamer-fixed-caps
+
+Media formats are only converted from fixed GStreamer caps; incomplete
+types stay unknown while Media Foundation negotiates instead of failing
+---
+ dlls/winegstreamer/wg_format.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/winegstreamer/wg_format.c b/dlls/winegstreamer/wg_format.c
+index bed7ffb2..09c37bda 100644
+--- a/dlls/winegstreamer/wg_format.c
++++ b/dlls/winegstreamer/wg_format.c
+@@ -624,14 +624,14 @@ void wg_format_from_caps(struct wg_format *format, const GstCaps *caps)
+     {
+         GstAudioInfo info;
+ 
+-        if (gst_audio_info_from_caps(&info, caps))
++        if (gst_caps_is_fixed(caps) && gst_audio_info_from_caps(&info, caps))
+             wg_format_from_audio_info(format, &info);
+     }
+     else if (!strcmp(name, "video/x-raw"))
+     {
+         GstVideoInfo info;
+ 
+-        if (gst_video_info_from_caps(&info, caps))
++        if (gst_caps_is_fixed(caps) && gst_video_info_from_caps(&info, caps))
+             wg_format_from_video_info(format, &info);
+     }
+     else if (!strcmp(name, "audio/mpeg") && gst_structure_get_boolean(structure, "parsed", &parsed) && parsed)
