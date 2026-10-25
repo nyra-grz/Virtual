@@ -16,6 +16,7 @@
 0014-Virtual-0021-winegstreamer-fixed-caps.patch
 0015-advapi32-shell32-Report-the-real-Windows-user-name.patch
 0021-Virtual-0022-kernelbase-process-group-affinity.patch
+0022-Virtual-0023-threadpool-timer-ex.patch
 
 # frozen: WinRT networking/devices for Safe Exam Browser. Carried along
 # mechanically on rebases; dropped (with their smoke probes) if they conflict.
