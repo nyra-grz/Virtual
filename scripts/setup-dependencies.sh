@@ -16,7 +16,7 @@ mkdir -p "$W_CACHE" "$WINEPREFIX/.virtual/components"
 for component in "$@"; do
     case "$component" in
         vcrun2005|vcrun2008|vcrun2010|vcrun2012|vcrun2013|vcrun2026|mfc42|vb6run) ;;
-        d3dcompiler_43|d3dcompiler_47|d3dx9|d3dx10_43|d3dx11_43|physx|msxml4|msxml6|openal|xna40) ;;
+        d3dcompiler_43|d3dcompiler_47|d3dx9|d3dx10|d3dx10_43|d3dx11_42|d3dx11_43|physx|msxml4|msxml6|openal|xna40) ;;
         dotnet*)
             [[ "$component" =~ ^dotnet(desktop)?(6|7|8|9|10)-(x86|x64)(@[0-9]+\.[0-9]+\.[0-9]+)?$ ]] || exit 1
             ;;

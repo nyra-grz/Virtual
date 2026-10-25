@@ -73,8 +73,7 @@ struct ExecutableRequirements {
             else if dll == "d3dcompiler_47.dll" { result.components.append("d3dcompiler_47") }
             else if dll == "d3dcompiler_43.dll" { result.components.append("d3dcompiler_43") }
             else if dll.hasPrefix("d3dx9_") { result.components.append("d3dx9") }
-            else if dll.hasPrefix("d3dx10_") { result.components.append("d3dx10_43") }
-            else if dll.hasPrefix("d3dx11_") { result.components.append("d3dx11_43") }
+            else if dll.hasPrefix("d3dx10_") || dll.hasPrefix("d3dx11_") { result.components.append(d3dxRecipe(dll)) }
             else if dll.hasPrefix("physxloader") || dll.hasPrefix("physxcore") || dll.hasPrefix("physxcooking") { result.components.append("physx") }
             else if dll == "msxml6.dll" { result.components.append("msxml6") }
             else if dll == "msxml4.dll" { result.components.append("msxml4") }
@@ -83,6 +82,15 @@ struct ExecutableRequirements {
             }
         }
         return Array(Set(result.components)).sorted()
+    }
+
+    /// Rezepte des gebündelten winetricks: eigene für d3dx10_43, d3dx11_42 und d3dx11_43;
+    /// d3dx10_33…42 liefert nur „d3dx10“ (alle d3dx10-Fassungen). Unbekannte wie bisher → _43.
+    private static func d3dxRecipe(_ dll: String) -> String {
+        let name = dll.hasSuffix(".dll") ? String(dll.dropLast(4)) : dll
+        if ["d3dx10_43", "d3dx11_42", "d3dx11_43"].contains(name) { return name }
+        if name.hasPrefix("d3dx10_"), let version = Int(name.dropFirst(7)), (33...42).contains(version) { return "d3dx10" }
+        return name.hasPrefix("d3dx10_") ? "d3dx10_43" : "d3dx11_43"
     }
 
     private struct PEImports {

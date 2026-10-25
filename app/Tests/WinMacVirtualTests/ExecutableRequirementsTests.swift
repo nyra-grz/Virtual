@@ -54,6 +54,36 @@ final class ExecutableRequirementsTests: XCTestCase {
         let url = try fixture(imports: ["MSVCR120.dll", "D3DX9_43.dll"])
         XCTAssertEqual(ExecutableRequirements.inspect(url, in: room).components, ["d3dx9", "vcrun2013"])
     }
+
+    /// Jede d3dx10/11-Fassung bekommt das winetricks-Rezept, das genau diese DLL liefert.
+    func testD3dxVersionsUseTheMatchingWinetricksRecipe() throws {
+        let expected = [
+            "D3DX10_43.dll": "d3dx10_43", "d3dx10_42.dll": "d3dx10", "d3dx10_33.dll": "d3dx10",
+            "D3DX11_42.dll": "d3dx11_42", "d3dx11_43.dll": "d3dx11_43",
+            "d3dx10_99.dll": "d3dx10_43", "d3dx11_99.dll": "d3dx11_43",
+        ]
+        for (dll, recipe) in expected {
+            XCTAssertEqual(ExecutableRequirements.components(forLibraries: [dll]), [recipe], dll)
+        }
+        let url = try fixture(imports: ["d3dx10_41.dll", "d3dx11_42.dll"])
+        XCTAssertEqual(ExecutableRequirements.inspect(url, in: room).components, ["d3dx10", "d3dx11_42"])
+        let log = "err:module:import_dll Library d3dx11_42.dll (which is needed) not found"
+        XCTAssertEqual(LaunchDiagnostics.missingComponents(output: log), ["d3dx11_42"])
+    }
+
+    /// setup-dependencies.sh nimmt nur bekannte Komponenten an; jedes d3dx-Rezept muss dort stehen.
+    func testDependencyScriptAcceptsEveryD3dxRecipe() throws {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let script = try String(contentsOf: repository.appendingPathComponent("scripts/setup-dependencies.sh"), encoding: .utf8)
+        let accepted = Set(script.components(separatedBy: .newlines).filter { $0.hasSuffix(") ;;") }.flatMap {
+            $0.trimmingCharacters(in: .whitespaces).dropLast(4).split(separator: "|").map(String.init)
+        })
+        let libraries = (33...43).map { "d3dx10_\($0).dll" } + ["d3dx11_42.dll", "d3dx11_43.dll"]
+        let recipes = Set(ExecutableRequirements.components(forLibraries: libraries))
+        XCTAssertEqual(recipes, ["d3dx10", "d3dx10_43", "d3dx11_42", "d3dx11_43"])
+        XCTAssertTrue(recipes.isSubset(of: accepted), "\(recipes.subtracting(accepted))")
+    }
     func testModernDesktopConfigChoosesArchitectureAndDoesNotReplaceMono() throws {
         let url = try fixture(imports: [], clr: true, x64: false)
         let config = #"{"runtimeOptions":{"frameworks":[{"name":"Microsoft.NETCore.App","version":"8.0.0"},{"name":"Microsoft.WindowsDesktop.App","version":"8.0.0"}]}}"#
