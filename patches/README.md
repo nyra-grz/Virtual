@@ -29,6 +29,7 @@ cannot silently ship without a required compatibility fix.
 | `0020-services-object-security.patch` | `QueryServiceObjectSecurity`/`SetServiceObjectSecurity` store and return a service's descriptor (Windows default DACL otherwise) instead of stubs; Epic Games' updater service works |
 | `0021-winegstreamer-fixed-caps.patch` | Media formats are only converted from fixed GStreamer caps; incomplete types stay unknown while Media Foundation negotiates instead of failing |
 | `0022` (in `crossover/`) | `GetProcessGroupAffinity` reports processor group 0 like Windows instead of failing as a stub without setting the count; Qt 6 apps such as KeePassXC crashed on the garbage |
+| `0023-threadpool-timer-ex.patch` | Implements `SetThreadpoolTimerEx` / `TpSetTimerEx` from Wine upstream, preserving queued/running callback cancellation semantics and serializing immediate submission with cancellation. Removes a confirmed Zoom API-stub abort; 32-/64-bit semantic and concurrent cancellation probes, not a full Zoom compatibility claim. |
 
 They are applied in this order on top of `WINE_TAG` (wine-11.0). Details, limits and
 tests: `winrt/README.md`.

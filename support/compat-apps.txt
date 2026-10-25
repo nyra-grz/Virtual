@@ -1,0 +1,177 @@
+# 150 gemischte Apps aus Claudes 306 erfolgreich geprüften Manifesten (25.10.2026).
+# Auswahl priorisiert verschiedene Kategorien und Framework-Annotationen.
+# [login] bedeutet: keine Anmeldung automatisieren; nur öffentliches Startfenster prüfen.
+
+# --- Browser ---
+Google.Chrome  # Browser; Chromium (Blink/V8); wix; x64
+Mozilla.Firefox  # Browser; Gecko; nullsoft; x64
+Brave.Brave  # Browser; Chromium; exe; x64
+Microsoft.Edge  # Browser; Chromium (Edge, WebView2-Basis); msi; x64
+Vivaldi.Vivaldi  # Browser; Chromium + Web-UI; exe; x64
+TorProject.TorBrowser  # Browser; Gecko + Tor; nullsoft; x64
+MoonchildProductions.PaleMoon  # Browser; Goanna/XUL; nullsoft; x64
+KDE.Falkon  # Browser; Qt6 WebEngine (Widgets); nullsoft; x64
+Opera.Opera  # Browser; Chromium; exe; x64
+Opera.OperaGX  # Browser; Chromium; exe; x64
+LibreWolf.LibreWolf  # Browser; Gecko; nullsoft; x64
+Waterfox.Waterfox  # Browser; Gecko; exe; x64
+Zen-Team.Zen-Browser  # Browser; Gecko; exe; x64
+
+# --- Messenger ---
+Discord.Discord  # Messenger; Electron (Squirrel); exe; x64
+Telegram.TelegramDesktop  # Messenger; Qt6 Widgets (eigenes UI); inno; x64
+Zoom.Zoom  # Messenger; Qt5/Qt Quick + CEF; msi; x64
+Pidgin.Pidgin  # Messenger; GTK2; nullsoft; x86
+Mumble.Mumble.Client  # Messenger; Qt5 Widgets + Audio; burn; x64
+eMClient.eMClient  # Messenger; WPF .NET; wix; x86
+SlackTechnologies.Slack  # Messenger; Electron; login; exe; x64
+OpenWhisperSystems.Signal  # Messenger; Electron; login; nullsoft; x64
+Element.Element  # Messenger; Electron (Squirrel); login; exe; x64
+Mozilla.Thunderbird  # Messenger; Gecko; nullsoft; x64
+HexChat.HexChat  # Messenger; GTK2; inno; x64
+TeamSpeakSystems.TeamSpeakClient  # Messenger; Qt5 Widgets; nullsoft; x64
+Ferdium.Ferdium  # Messenger; Electron; nullsoft; x64
+
+# --- Office ---
+Evernote.Evernote  # Office; Electron; login; nullsoft; x64
+TheDocumentFoundation.LibreOffice  # Office; VCL (LibreOffice eigenes Toolkit); msi; x64
+Apache.OpenOffice  # Office; VCL (OpenOffice); nullsoft; x86
+ONLYOFFICE.DesktopEditors  # Office; Qt + CEF; inno; x64
+Kingsoft.WPSOffice  # Office; Qt5; exe; x86
+SoftMaker.FreeOffice.2024  # Office; Win32 (eigenes UI); wix; x64
+Adobe.Acrobat.Reader.64-bit  # Office; Win32/MFC + CEF; exe; x64
+PDFsam.PDFsam  # Office; Java JavaFX (gebündelte JRE); wix; x64
+DigitalScholar.Zotero  # Office; Gecko/XUL; nullsoft; x64
+calibre.calibre  # Office; Qt6 Widgets (PyQt) + WebEngine; wix; x64
+KDE.Okular  # Office; Qt6/KF6 Widgets; nullsoft; x64
+MiKTeX.MiKTeX  # Office; Qt Widgets (MiKTeX Console); exe; x64
+Freeplane.Freeplane  # Office; Java Swing; inno; x64
+
+# --- Medien ---
+VideoLAN.VLC  # Medien; Qt Widgets + Direct3D; nullsoft; x64
+Spotify.Spotify  # Medien; CEF; login; exe; x64
+Audacity.Audacity  # Medien; wxWidgets + PortAudio; wix; x64
+OBSProject.OBSStudio  # Medien; Qt6 Widgets + D3D11 + CEF; nullsoft; x64
+clsid2.mpc-hc  # Medien; Win32 MFC + DirectShow; inno; x64
+HandBrake.HandBrake  # Medien; WPF .NET 8; nullsoft; x64
+Daum.PotPlayer  # Medien; Win32 + DirectShow/D3D; nullsoft; x64
+KDE.Kdenlive  # Medien; Qt6 Widgets + QML (MLT); nullsoft; x64
+OpenShot.OpenShot  # Medien; Qt5 (PyQt) + WebEngine; inno; x64
+AIMP.AIMP  # Medien; Delphi (ACL/VCL); exe; x64
+Winamp.Winamp  # Medien; Win32 klassisch (Skins); nullsoft; x86
+Apple.iTunes  # Medien; Win32 + Apple-Frameworks; exe; x64
+Cockos.REAPER  # Medien; Win32 (SWELL) + ASIO/WASAPI; exe; x64
+
+# --- Grafik ---
+GIMP.GIMP.3  # Grafik; GTK3; inno; x64
+KDE.Krita  # Grafik; Qt5 Widgets + OpenGL/ANGLE; nullsoft; x64
+Inkscape.Inkscape  # Grafik; GTK3/gtkmm; wix; x64
+BlenderFoundation.Blender  # Grafik; OpenGL 4.3 (eigenes UI); wix; x64
+darktable.darktable  # Grafik; GTK3 + OpenCL; inno; x64
+FreeCAD.FreeCAD  # Grafik; Qt Widgets + Coin3D/OpenGL; nullsoft; x64
+KiCad.KiCad  # Grafik; wxWidgets + OpenGL; nullsoft; x64
+Pinta.Pinta  # Grafik; GTK4 .NET 8; inno; x64
+LibreCAD.LibreCAD  # Grafik; Qt Widgets; nullsoft; x64
+Ultimaker.Cura  # Grafik; Qt6 Quick (PyQt6) + OpenGL; nullsoft; x64
+eTeks.SweetHome3D  # Grafik; Java Swing + Java3D (gebündelte JRE); inno; x86
+PTRTECH.UVtools  # Grafik; Avalonia .NET; wix; x64
+RawTherapee.RawTherapee  # Grafik; GTK3; inno; x64
+
+# --- Entwicklung ---
+Git.Git  # Entwicklung; MSYS2/mintty + Tk; inno; x64
+Python.Python.3.13  # Entwicklung; CPython + Tk (IDLE); burn; x64
+Notepad++.Notepad++  # Entwicklung; Win32 klassisch (Scintilla); nullsoft; x64
+JetBrains.IntelliJIDEA.Community  # Entwicklung; Java Swing (JBR gebündelt); nullsoft; x64
+Codelerity.NetBeans  # Entwicklung; Java Swing (gebündeltes JDK); inno; x64
+SublimeHQ.SublimeText.4  # Entwicklung; Win32 + eigenes UI (Skia); inno; x64
+WinSCP.WinSCP  # Entwicklung; C++Builder VCL; inno; x86
+ArduinoSA.IDE.stable  # Entwicklung; Electron (Theia); nullsoft; x64
+DBeaver.DBeaver.Community  # Entwicklung; Java SWT/Eclipse RCP (gebündelte JRE); nullsoft; x64
+TheQtCompanyLtd.QtCreator  # Entwicklung; Qt6 Widgets + QML; wix; x64
+GitExtensionsTeam.GitExtensions  # Entwicklung; WinForms .NET 8/9; wix; x64
+Atlassian.Sourcetree  # Entwicklung; WPF .NET Framework (Squirrel); login; exe; x64
+ZedIndustries.Zed  # Entwicklung; Rust GPUI + DirectX 11; inno; x64
+
+# --- System ---
+7zip.7zip  # System; Win32 klassisch; exe; x64
+Giorgiotani.Peazip  # System; Free Pascal LCL; inno; x64
+voidtools.Everything  # System; Win32 klassisch + NTFS-Index; wix; x64
+CrystalDewWorld.CrystalDiskInfo  # System; Win32 MFC + SMART/WMI; inno; x64
+Piriform.CCleaner  # System; Win32; exe; x64
+AntibodySoftware.WizTree  # System; Win32 (MFT-Lesen); inno; x64
+WinDirStat.WinDirStat  # System; Win32 MFC; wix; x64
+JAMSoftware.TreeSize.Free  # System; Delphi VCL; inno; x64
+Microsoft.PowerToys  # System; WinUI 3 + WPF .NET 9; burn; x64
+Ghisler.TotalCommander  # System; Delphi/Lazarus; exe; x64
+BleachBit.BleachBit  # System; GTK3 (Python); nullsoft; x86
+TeamViewer.TeamViewer  # System; Win32 + Dienst; nullsoft; x64
+LocalSend.LocalSend  # System; Flutter; inno; x64
+
+# --- Passwort ---
+KeePassXCTeam.KeePassXC  # Passwort; Qt5 Widgets; wix; x64
+DominikReichl.KeePass  # Passwort; WinForms .NET Framework 4.8; inno; x64
+AgileBits.1Password  # Passwort; Electron (Rust-Kern); login; msi; x64
+RonyShapiro.PasswordSafe  # Passwort; wxWidgets; wix; x64
+Bitwarden.Bitwarden  # Passwort; Electron; login; nullsoft; x64
+Sinew.Enpass  # Passwort; Qt Quick (QML); burn; x64
+KeeWeb.KeeWeb  # Passwort; Electron; nullsoft; x64
+
+# --- Spiele-Launcher ---
+Valve.Steam  # Spiele-Launcher; Win32 + CEF (steamwebhelper); login; nullsoft; x86
+EpicGames.EpicGamesLauncher  # Spiele-Launcher; Unreal Engine 4 (Slate) + CEF; login; wix; x64
+ElectronicArts.EADesktop  # Spiele-Launcher; Qt WebEngine; login; burn; x64
+Playnite.Playnite  # Spiele-Launcher; WPF .NET Framework; inno; x86
+Mojang.MinecraftLauncher  # Spiele-Launcher; Win32 + CEF; login; wix; x86
+Modrinth.ModrinthApp  # Spiele-Launcher; Tauri (WebView2); nullsoft; x64
+Nvidia.GeForceNow  # Spiele-Launcher; CEF + Video-Streaming; login; exe; x64
+GOG.Galaxy  # Spiele-Launcher; CEF; login; inno; x86
+Ubisoft.Connect  # Spiele-Launcher; CEF; login; nullsoft; x86
+Blizzard.BattleNet  # Spiele-Launcher; Qt + CEF; login; exe; x86
+HeroicGamesLauncher.HeroicGamesLauncher  # Spiele-Launcher; Electron; nullsoft; x64
+Amazon.Games  # Spiele-Launcher; Electron; login; exe; x86
+RockstarGames.Launcher  # Spiele-Launcher; CEF; login; exe; x64
+
+# --- Spiele ---
+SuperTuxKart.SuperTuxKart  # Spiele; OpenGL 3.3 + SDL2; nullsoft; x64
+WildfireGames.0AD  # Spiele; OpenGL + SDL2 (SpiderMonkey); nullsoft; x64
+OpenTTD.OpenTTD  # Spiele; SDL2/Win32 + OpenGL; nullsoft; x64
+Warzone2100Project.Warzone2100  # Spiele; SDL2 + OpenGL/Vulkan; inno; x64
+OpenRA.OpenRA.Release  # Spiele; .NET 6 + SDL2/OpenGL; nullsoft; x64
+FreeCiv.FreeCiv  # Spiele; GTK/Qt/SDL2; nullsoft; x64
+Hedgewars.Hedgewars  # Spiele; Qt5 + SDL2; nullsoft; x86
+SuperTux.SuperTux  # Spiele; SDL2 + OpenGL; wix; x64
+ppy.osu  # Spiele; .NET 8 osu!framework (Veldrid D3D11) Squirrel; exe; x64
+Libretro.RetroArch  # Spiele; Vulkan/D3D11/OpenGL; nullsoft; x64
+PCSX2Team.PCSX2  # Spiele; Qt6 + D3D11/Vulkan; inno; x64
+PPSSPPTeam.PPSSPP  # Spiele; Win32 + D3D11; inno; x64
+QuintonReeves.RedEclipse  # Spiele; SDL2 + OpenGL (Cube 2); nullsoft; x86
+
+# --- Bildung ---
+Anki.Anki  # Bildung; Qt6 WebEngine (PyQt); wix; x64
+GeoGebra.Classic.5  # Bildung; Java Swing (gebündelte JRE); nullsoft; x86
+KDE.GCompris  # Bildung; Qt Quick (QML); nullsoft; x64
+NewBreedSoftware.TuxPaint  # Bildung; SDL2; inno; x64
+KDE.Marble  # Bildung; Qt Widgets + QML; inno; x64
+logisim-evolution.logisim-evolution  # Bildung; Java Swing (jpackage); wix; x64
+InfiniteInstant.KoduGameLab  # Bildung; XNA 4 (.NET Framework); wix; x86
+TuxGuitar.TuxGuitar  # Bildung; Java SWT (gebündelte JRE); exe; x64
+Algoryx.Algodoo  # Bildung; Win32 + OpenGL; inno; x64
+GeoGebra.Classic  # Bildung; Electron; exe; x86
+MITMediaLab.Scratch.3  # Bildung; Electron; nullsoft; x86
+FelipeEFdeCastro.Klavaro  # Bildung; GTK3; inno; x64
+OpenEducationFoundation.OpenBoard  # Bildung; Qt WebEngine; inno; x86
+
+# --- Wissenschaft ---
+Stellarium.Stellarium  # Wissenschaft; Qt6 + OpenGL; inno; x64
+Celestia.Celestia  # Wissenschaft; Qt + OpenGL; inno; x86
+OSGeo.QGIS  # Wissenschaft; Qt5 Widgets (PyQt); wix; x64
+OpenChemistry.Avogadro2  # Wissenschaft; Qt5 + OpenGL; nullsoft; x64
+GNU.Octave  # Wissenschaft; Qt6 Widgets; nullsoft; x64
+Scilab.Scilab  # Wissenschaft; Java Swing (gebündelte JRE) + Tcl/Tk; inno; x64
+MaximaTeam.Maxima  # Wissenschaft; wxWidgets (wxMaxima) + SBCL; nullsoft; x64
+UniversityOfAmsterdam.JASP  # Wissenschaft; Qt6 Quick + R; wix; x64
+Jamovi.Desktop.Current  # Wissenschaft; Electron + R/Python; nullsoft; x64
+Gephi.Gephi  # Wissenschaft; Java Swing/NetBeans Platform (gebündelte JRE); inno; x64
+Cytoscape.Cytoscape  # Wissenschaft; Java Swing (install4j); exe; x64
+RProject.R  # Wissenschaft; Win32 (Rgui); inno; x64
+Posit.RStudio  # Wissenschaft; Electron/Qt; nullsoft; x64

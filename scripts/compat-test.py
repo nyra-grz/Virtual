@@ -16,6 +16,7 @@ Die Fenster der getesteten Apps erscheinen kurz auf dem Bildschirm.
 """
 import argparse, hashlib, json, os, re, shlex, shutil, subprocess, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from pathlib import Path
 
 import yaml
@@ -28,7 +29,7 @@ DEFAULT_APPS = [
     "GIMP.GIMP.3", "KeePassXCTeam.KeePassXC", "TheDocumentFoundation.LibreOffice",
     "OBSProject.OBSStudio", "GOG.Galaxy", "ElectronicArts.EADesktop", "Ubisoft.Connect",
     "Python.Python.3.13", "Git.Git", "Zoom.Zoom", "Obsidian.Obsidian", "Spotify.Spotify",
-    "qBittorrent.qBittorrent", "TimKosse.FileZilla.Client", "Blizzard.BattleNet",
+    "qBittorrent.qBittorrent", "Blizzard.BattleNet",
 ]
 ENGINE = ROOT / "build" / "Virtual.app" / "Contents" / "Resources" / "Engine"
 # Fehlerdialoge zählen nicht als „läuft“; kleine Fenster sind meist Start-/Update-Fenster.
@@ -222,7 +223,7 @@ def missing_dlls(prefix, *logs):
 
 STUB = re.compile(r"fixme:(\w+):(\w+) .*?\b(stub|not implemented|semi-stub)", re.I)
 CRASH = re.compile(r"Unhandled (page fault on \w+ access to [0-9A-Fa-f]+|exception [0-9a-fx]+) at address ([0-9A-Fa-f]+)")
-LOADED = re.compile(r'Loaded L"([^"]+)" at ([0-9A-Fa-f]+): (\w+)')
+UNIMPLEMENTED = re.compile(r"wine: Call from \S+ to unimplemented function ([^\s,]+), aborting", re.I)
 
 
 def cause(res, *logs):
@@ -238,13 +239,16 @@ def cause(res, *logs):
         stubs.append(name)
     res["last_stubs"] = stubs[-6:]
     status = res.get("status", "")
+    unimplemented = UNIMPLEMENTED.search(text)
+    if unimplemented:
+        res["unimplemented_function"] = unimplemented.group(1)
+        return "nicht implementiert: " + unimplemented.group(1)
     if crash:
-        addr = int(crash.group(2), 16)
-        mods = [(int(a, 16), n.rsplit("\\", 1)[-1], kind) for n, a, kind in LOADED.findall(text)]
-        below = [m for m in mods if m[0] <= addr]
-        where = max(below) if below else None
-        res["crash_in"] = f"{where[1]} ({where[2]}) +0x{addr - where[0]:x}" if where else crash.group(2)
-        return f"Absturz in {where[1].lower()}" if where else "Absturz (Modul unbekannt)"
+        # +loaddll provides bases, not image bounds, and the default log prefix
+        # is a thread ID rather than a process ID. The nearest lower base may
+        # belong to another process (or another image), so it proves no module.
+        res["crash_in"] = crash.group(2)
+        return "Absturz (Modul unbekannt)"
     if res.get("missing_dlls"):
         return "fehlt: " + ", ".join(res["missing_dlls"])
     titles = " ".join(w.get("title") or "" for w in res.get("windows", []))
@@ -256,6 +260,8 @@ def cause(res, *logs):
         return status
     if status == "Fenster einfarbig":
         return "leeres Fenster (Rendering)"
+    if status == "Fenster offen (Darstellung ungeprüft)":
+        return "Darstellung nicht geprüft (keine Fensteraufnahme)"
     if status in ("kein Fenster", "Fenster wieder zu", "nur Startfenster"):
         return status + (f" nach Stub {stubs[-1]}" if stubs else "")
     return ""
@@ -275,18 +281,52 @@ def isolate_user_folders(prefix):
                 folder.mkdir()
 
 
+def positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("muss größer als null sein")
+    return number
+
+
+def stop_room(server, env):
+    """Bounded shutdown of this prefix only, including detached installer children."""
+    try:
+        run([str(server), "-k"], env=env, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    # A completed wait proves shutdown even if the server exited before -k.
+    try:
+        return run([str(server), "-w"], env=env, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+
+def write_results(path, results, lock, completed=None):
+    # A reader sees either the previous complete snapshot or the new one. The
+    # lock also prevents parallel workers from sharing the temporary filename.
+    with lock:
+        if completed is not None:
+            index, result = completed
+            results[index] = result.copy()
+        snapshot = json.dumps(results, indent=2, ensure_ascii=False)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(snapshot)
+        temporary.replace(path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("apps", nargs="*")
     ap.add_argument("--list", help="Datei mit winget-IDs (eine pro Zeile, # leitet Kommentare ein)")
-    ap.add_argument("--jobs", type=int, default=1, help="so viele Apps gleichzeitig testen (eigene Räume)")
+    ap.add_argument("--jobs", type=positive_int, default=1, help="so viele Apps gleichzeitig testen (eigene Räume)")
     ap.add_argument("--out", default=str(ROOT / "logs" / f"compat-{time.strftime('%Y%m%d-%H%M')}"))
     # Standard: die Engine im App-Bundle – genau das, was ausgeliefert wird.
     ap.add_argument("--engine", default=str(ENGINE if ENGINE.exists() else ROOT),
                     help="Ordner mit runtime/ und scripts/ (App-Engine oder Projektordner)")
     ap.add_argument("--winlist", default=str(ROOT / "build" / "winlist"))
-    ap.add_argument("--install-timeout", type=int, default=420)
-    ap.add_argument("--launch-wait", type=int, default=60, help="Sekunden bis zur Prüfung; Launcher mit kleinem Startfenster bekommen bis zum Dreifachen")
+    ap.add_argument("--install-timeout", type=positive_int, default=420)
+    ap.add_argument("--launch-wait", type=positive_int, default=60, help="Sekunden bis zur Prüfung; Launcher mit kleinem Startfenster bekommen bis zum Dreifachen")
     ap.add_argument("--guest-windows", action="store_true", help="Only query windows inside the isolated Wine instance; no macOS window capture")
     args = ap.parse_args()
     apps = list(args.apps)
@@ -318,17 +358,17 @@ def main():
 
     # Vorlage: einmal frisch eingerichteter Raum, pro App per APFS-Klon kopiert
     base = out / "base-room" / "prefix"
+    env = {**os.environ, "WINEPREFIX": str(base), "WINMAC_ROOT": str(ROOT), "WINMAC_RUNTIME": str(runtime),
+           "WINMAC_ASSETS_ROOT": str(engine)}
     if not (base / "drive_c/windows/system32").exists():
         print("==> Lege Vorlagen-Raum an …", flush=True)
         base.parent.mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, "WINEPREFIX": str(base), "WINMAC_ROOT": str(ROOT), "WINMAC_RUNTIME": str(runtime),
-               "WINMAC_ASSETS_ROOT": str(engine)}
         r = run(["bash", str(engine / "scripts/init-prefix.sh"), "win10"], env=env)
         (out / "base-room.log").write_text(r.stdout + r.stderr)
         if r.returncode:
             sys.exit("Vorlagen-Raum gescheitert, siehe base-room.log")
-        run([str(server), "-k"], env=env)
-        run([str(server), "-w"], env=env)
+    if not stop_room(server, env):
+        sys.exit("Vorlagen-Raum konnte nicht beendet werden")
     isolate_user_folders(base)
     base_links = {p.relative_to(base) for p in shortcuts(base)}
     base_apps = set(registered_apps(base))
@@ -364,125 +404,146 @@ def main():
             return
 
         room = out / "rooms" / app / "prefix"
-        if room.parent.exists():
-            shutil.rmtree(room.parent)
-        room.parent.mkdir(parents=True)
-        run(["cp", "-cR", str(base), str(room)])
         env = {**os.environ, "WINEPREFIX": str(room), "WINEDEBUG": "err+all,fixme+all,+loaddll",
                "WINEDLLOVERRIDES": "winedbg.exe=d", "MVK_CONFIG_LOG_LEVEL": "0"}
-        log = out / "rooms" / app / "install.log"
-        if kind in ("msi", "wix"):
-            cmd = [str(virtual), "msiexec", "/i", str(dl), "/qn", "/norestart"]
-        else:
-            # Ohne Schalter: viele Installer (Squirrel: Discord, Slack …) sind ohnehin still;
-            # zeigt einer doch einen Dialog, beendet ihn das Zeitlimit.
-            silent = switches.get("Silent") or switches.get("SilentWithProgress")
-            sw = shlex.split(silent) if silent else list(SILENT.get(kind, []))
-            cmd = [str(virtual), str(dl), *sw]
-        cmd += shlex.split(switches.get("Custom", ""))
-        if runner is not None:
-            cmd.insert(1, str(runner))
-        t0 = time.time()
-        with open(log, "w") as f:
-            try:
-                p = subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT, timeout=args.install_timeout)
-                res["install_exit"] = p.returncode
-            except subprocess.TimeoutExpired:
-                res["install_exit"] = "Zeitlimit"
-        res["install_seconds"] = round(time.time() - t0)
-        run([str(server), "-k"], env=env)
-        time.sleep(2)
-
-        links = [p for p in shortcuts(room) if p.relative_to(room) not in base_links and not NOT_MAIN.search(p.stem)]
-        registered = {k: v for k, v in registered_apps(room).items() if k not in base_apps}
-        if links:
-            target = sorted(links, key=lambda p: (len(p.parts), len(p.stem)))[0]
-        elif registered:
-            target = sorted(registered.values(), key=lambda p: len(p.parts))[0]
-        else:
-            res["status"] = "nicht installiert"
-            res["result"] = "installiert? keine Verknüpfung, kein Uninstall-Eintrag"
-            res["missing_dlls"] = missing_dlls(room, log)
-            res["cause"] = cause(res, log)
-            return
-        res["shortcut"] = target.stem
-        guest = virtual if args.guest_windows else None
-        before = windows(winlist, guest, env, room)
-        launch_log = out / "rooms" / app / "launch.log"
-        with open(launch_log, "w") as f:
-            launch = [str(virtual), "start", "/wait", "/unix", str(target)]
+        proc = None
+        try:
+            if room.parent.exists():
+                shutil.rmtree(room.parent)
+            room.parent.mkdir(parents=True)
+            copied = run(["cp", "-cR", str(base), str(room)])
+            if copied.returncode:
+                raise RuntimeError(f"Raum konnte nicht geklont werden: {copied.stderr.strip()}")
+            log = out / "rooms" / app / "install.log"
+            if kind in ("msi", "wix"):
+                cmd = [str(virtual), "msiexec", "/i", str(dl), "/qn", "/norestart"]
+            else:
+                # Ohne Schalter: viele Installer (Squirrel: Discord, Slack …) sind ohnehin still;
+                # zeigt einer doch einen Dialog, beendet ihn das Zeitlimit.
+                silent = switches.get("Silent") or switches.get("SilentWithProgress")
+                sw = shlex.split(silent) if silent else list(SILENT.get(kind, []))
+                cmd = [str(virtual), str(dl), *sw]
+            cmd += shlex.split(switches.get("Custom", ""))
             if runner is not None:
-                launch.insert(1, str(runner))
-            proc = subprocess.Popen(launch, env=env, stdout=f, stderr=subprocess.STDOUT)
+                cmd.insert(1, str(runner))
             t0 = time.time()
-            seen = {}
-            # Bis zur Prüfzeit warten; zeigt sich bis dahin nur ein kleines Start-/Update-Fenster
-            # (Steam, Epic, GIMP …), bis zum Dreifachen auf das Hauptfenster warten.
-            while time.time() - t0 < args.launch_wait * 3:
-                time.sleep(3)
-                now = {wid: info for wid, info in windows(winlist, guest, env, room).items() if wid not in before}
-                seen.update(now)
-                if time.time() - t0 < args.launch_wait:
-                    return
-                if not now or max(w * h for _, w, h in now.values()) >= MAIN_WINDOW_AREA:
-                    break
-        # Gezählt wird, was am Ende noch offen ist – nicht, was zwischendurch kurz aufging.
-        final = {wid: info for wid, info in windows(winlist, guest, env, room).items() if wid not in before}
-        res["seconds"] = round(time.time() - t0)
-        shots = []
-        for wid, (title, w, h) in sorted(final.items(), key=lambda kv: -kv[1][1] * kv[1][2])[:3]:
-            entry = {"title": title, "size": f"{w}x{h}", "file": ""}
-            if not args.guest_windows:
-                shot = out / "rooms" / app / f"window-{wid}.png"
-                if run(["screencapture", "-x", "-o", "-l", wid, str(shot)]).returncode == 0 and shot.exists():
-                    entry["file"] = str(shot.relative_to(out))
-                    entry["uniform"] = uniform(shot)
-            shots.append(entry)
-        text = launch_log.read_text(errors="replace")
-        crashed = bool(re.search(r"Unhandled (page fault|exception)|wine: Unhandled|unhandled exception", text, re.I))
-        res["windows"] = shots
-        res["crash"] = crashed
-        res["missing_dlls"] = missing_dlls(room, log, launch_log)
-        errors = [w["title"] for w in shots if ERROR_TITLE.search(w["title"] or "")]
-        main = shots[0] if shots else None
-        if crashed:
-            res["status"] = "Absturz"
-        elif not shots:
-            res["status"] = "Fenster wieder zu" if seen else "kein Fenster"
-        elif errors:
-            res["status"] = f"Fehlerdialog: {errors[0]}"
-        elif max(w * h for _, w, h in final.values()) < MAIN_WINDOW_AREA:
-            res["status"] = "nur Startfenster"
-        elif main.get("uniform"):
-            res["status"] = "Fenster einfarbig"
-        else:
-            res["status"] = "läuft"
-        res["result"] = res["status"]
-        if res["status"] != "läuft":
-            res["cause"] = cause(res, launch_log)
-        run([str(server), "-k"], env=env)
-        proc.kill()
-        time.sleep(2)
+            with open(log, "w") as f:
+                try:
+                    p = subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT, timeout=args.install_timeout)
+                    res["install_exit"] = p.returncode
+                except subprocess.TimeoutExpired:
+                    res["install_exit"] = "Zeitlimit"
+            res["install_seconds"] = round(time.time() - t0)
+            if not stop_room(server, env):
+                raise RuntimeError("Installer-Prozesse im Testraum konnten nicht beendet werden")
+
+            links = [p for p in shortcuts(room) if p.relative_to(room) not in base_links and not NOT_MAIN.search(p.stem)]
+            registered = {k: v for k, v in registered_apps(room).items() if k not in base_apps}
+            if links:
+                target = sorted(links, key=lambda p: (len(p.parts), len(p.stem)))[0]
+            elif registered:
+                target = sorted(registered.values(), key=lambda p: len(p.parts))[0]
+            else:
+                res["status"] = "nicht installiert"
+                res["result"] = "installiert? keine Verknüpfung, kein Uninstall-Eintrag"
+                res["missing_dlls"] = missing_dlls(room, log)
+                res["cause"] = cause(res, log)
+                return
+            res["shortcut"] = target.stem
+            guest = virtual if args.guest_windows else None
+            before = windows(winlist, guest, env, room)
+            launch_log = out / "rooms" / app / "launch.log"
+            with open(launch_log, "w") as f:
+                launch = [str(virtual), "start", "/wait", "/unix", str(target)]
+                if runner is not None:
+                    launch.insert(1, str(runner))
+                proc = subprocess.Popen(launch, env=env, stdout=f, stderr=subprocess.STDOUT)
+                t0 = time.time()
+                seen = {}
+                # Bis zur Prüfzeit warten; zeigt sich bis dahin nur ein kleines Start-/Update-Fenster
+                # (Steam, Epic, GIMP …), bis zum Dreifachen auf das Hauptfenster warten.
+                while time.time() - t0 < args.launch_wait * 3:
+                    time.sleep(3)
+                    now = {wid: info for wid, info in windows(winlist, guest, env, room).items() if wid not in before}
+                    seen.update(now)
+                    if time.time() - t0 < args.launch_wait:
+                        continue
+                    if not now or max(w * h for _, w, h in now.values()) >= MAIN_WINDOW_AREA:
+                        break
+            # Gezählt wird, was am Ende noch offen ist – nicht, was zwischendurch kurz aufging.
+            final = {wid: info for wid, info in windows(winlist, guest, env, room).items() if wid not in before}
+            res["seconds"] = round(time.time() - t0)
+            shots = []
+            for wid, (title, w, h) in sorted(final.items(), key=lambda kv: -kv[1][1] * kv[1][2])[:3]:
+                entry = {"title": title, "size": f"{w}x{h}", "file": ""}
+                if not args.guest_windows:
+                    shot = out / "rooms" / app / f"window-{wid}.png"
+                    if run(["screencapture", "-x", "-o", "-l", wid, str(shot)]).returncode == 0 and shot.exists():
+                        entry["file"] = str(shot.relative_to(out))
+                        entry["uniform"] = uniform(shot)
+                shots.append(entry)
+            text = launch_log.read_text(errors="replace")
+            crashed = bool(UNIMPLEMENTED.search(text) or re.search(r"Unhandled (page fault|exception)|wine: Unhandled|unhandled exception", text, re.I))
+            res["windows"] = shots
+            res["crash"] = crashed
+            res["missing_dlls"] = missing_dlls(room, log, launch_log)
+            errors = [w["title"] for w in shots if ERROR_TITLE.search(w["title"] or "")]
+            main = shots[0] if shots else None
+            if crashed:
+                res["status"] = "Absturz"
+            elif not shots:
+                res["status"] = "Fenster wieder zu" if seen else "kein Fenster"
+            elif errors:
+                res["status"] = f"Fehlerdialog: {errors[0]}"
+            elif max(w * h for _, w, h in final.values()) < MAIN_WINDOW_AREA:
+                res["status"] = "nur Startfenster"
+            elif main.get("uniform"):
+                res["status"] = "Fenster einfarbig"
+            elif "uniform" not in main:
+                res["status"] = "Fenster offen (Darstellung ungeprüft)"
+            else:
+                res["status"] = "läuft"
+            res["result"] = res["status"]
+            if res["status"] != "läuft":
+                res["cause"] = cause(res, launch_log)
+        finally:
+            if not stop_room(server, env):
+                res["cleanup_error"] = "Testraum wurde nicht vollständig beendet"
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    res["cleanup_error"] = "Startprozess wurde nicht vollständig beendet"
+            if res.get("cleanup_error"):
+                res["status"] = res["result"] = "Testfehler: " + res["cleanup_error"]
+
 
 
     results = [{"app": app} for app in apps]
+    results_lock = Lock()
 
-    def guarded(res):
+    def guarded(index):
+        # Active workers own their mutable dictionaries. Published snapshots
+        # contain completed copies only, never dictionaries another worker edits.
+        res = {"app": apps[index]}
         print(f"==> {res['app']}", flush=True)
         try:
             test_app(res["app"], res)
         except Exception as e:  # ein kaputter Fall soll den Lauf nicht beenden
             res["status"] = res["result"] = f"Testfehler: {e}"
-        (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
+        write_results(out / "results.json", results, results_lock, (index, res))
         print(f"    {res['app']}: {res.get('status') or res.get('result')}", flush=True)
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        list(pool.map(guarded, results))
+        list(pool.map(guarded, range(len(apps))))
 
-    (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    write_results(out / "results.json", results, results_lock)
     ok = sum(1 for r in results if r.get("status") == "läuft")
     lines = [f"# Kompatibilitätstest {time.strftime('%Y-%m-%d %H:%M')}", "", f"Engine: `{engine}`", "",
-             f"{ok} von {len(results)} Apps laufen (Hauptfenster nach {args.launch_wait} s noch offen, kein Fehlerdialog, nicht einfarbig).", "",
+             f"{ok} von {len(results)} Apps bestehen die Fensterprüfung (Hauptfenster nach {args.launch_wait} s noch offen, kein Fehlerdialog, Aufnahme nicht einfarbig).", "",
+             "Ohne erfolgreiche Fensteraufnahme bleibt die Darstellung ungeprüft; diese Fälle zählen nicht als bestanden. Die Prüfung belegt keine vollständige App-Funktion.", "",
              "| App | Version | Installer | Ergebnis | Ursache | Fenster | Fehlende DLLs |", "|---|---|---|---|---|---|---|"]
     for r in results:
         wins = ", ".join(f"[{w['title'] or 'ohne Titel'} {w['size']}]({w['file']})" if w['file'] else f"{w['title'] or 'ohne Titel'} {w['size']}" for w in r.get("windows", []))
@@ -496,7 +557,7 @@ def main():
         groups.setdefault(r.get("cause") or r.get("result") or "?", []).append(r["app"])
         for stub in r.get("last_stubs", []):
             stub_hits.setdefault(stub, []).append(r["app"])
-    causes = [f"# Ursachen {time.strftime('%Y-%m-%d %H:%M')}", "", f"{len(results) - ok} von {len(results)} Apps laufen nicht.", "",
+    causes = [f"# Ursachen {time.strftime('%Y-%m-%d %H:%M')}", "", f"{len(results) - ok} von {len(results)} Apps bestehen die Fensterprüfung nicht.", "",
               "| Ursache | Apps | Anzahl |", "|---|---|---|"]
     for c, names in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         causes.append(f"| {c} | {', '.join(names)} | {len(names)} |")

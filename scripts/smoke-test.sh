@@ -472,6 +472,21 @@ else
     show_log compile-d3d.log
     show_log d3d.out
 fi
+# Timer cancellation must not report success while a callback can still run.
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    if [ "$PREFIX_READY" != 1 ]; then
+        report übersprungen "Integration: Threadpool-Timer $bits Bit" "Prefix-Einrichtung fehlgeschlagen"
+    elif "$cc" -O2 "$ROOT/winrt/tests/threadpool_timer_ex.c" -o "timer$bits.exe" >"compile-timer$bits.log" 2>&1 &&
+         "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/timer$bits.exe" >"timer$bits.out" 2>"timer$bits.err"; then
+        report ok "Integration: Threadpool-Timer $bits Bit" "$(tr -d '\r' <"timer$bits.out" | tail -1)"
+    else
+        report FEHLER "Integration: Threadpool-Timer $bits Bit"
+        show_log "compile-timer$bits.log"
+        show_log "timer$bits.out"
+        show_log "timer$bits.err"
+    fi
+done
 # Windows-System-ICU (icu.dll + Weiterleitungen), 64 und 32 Bit; der Test ist mit -licu
 # gelinkt und startet ohne icu.dll gar nicht.
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do

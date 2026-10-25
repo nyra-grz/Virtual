@@ -304,6 +304,7 @@ Publish a new version (requires the GitHub CLI `gh`):
 ```bash
 uv run scripts/compat-test.py                      # default list of popular apps
 uv run scripts/compat-test.py Mozilla.Firefox 7zip.7zip --out logs/compat-x
+uv run scripts/compat-test.py --list support/compat-apps.txt --jobs 3 --out logs/compat-broad
 ```
 Downloads installers from the public winget manifests (checksums verified), installs
 each app silently in its own clone of a freshly set up room and starts it, using the
@@ -312,6 +313,26 @@ An app only counts as running when its main window is still open after 60 s (sma
 splash/updater windows get up to three times as long), is not an error dialog and is
 not a single-coloured (blank) window. `report.md`/`results.json` also list DLLs that
 are really missing. The apps' windows briefly appear on screen.
+
+`support/compat-apps.txt` contains 150 package IDs selected from the Scout's
+manifest checks on 25 October 2026. This is test coverage to run, not a list of
+compatible apps; framework labels are annotations. Installer checksums are verified
+when downloaded. A full run downloads and installs substantial amounts of software;
+start with a small group of IDs to check a new runtime first. Each worker gets its
+own cloned prefix, and only that prefix is stopped during cleanup. These Wine
+prefixes are not security sandboxes.
+
+`causes.md` groups failures for triage. An unimplemented API is reported explicitly;
+nearby Wine stubs are only diagnostic clues, not proof of a crash's cause. Window
+observation confirms startup, not login, updates or full application functionality.
+Rendering remains unverified when a window cannot be captured or when using
+`--guest-windows`.
+
+Run the tester's regression checks without Windows installers:
+
+```bash
+uv run --with pyyaml python -m unittest discover -s scripts/tests -v
+```
 
 ## Limits (honest, not worked around)
 
