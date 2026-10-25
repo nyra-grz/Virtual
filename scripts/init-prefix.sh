@@ -114,7 +114,8 @@ done
 # Infobereich-Zustand wie unter Windows (leere Liste). Ältere Squirrel-Installer
 # (Discord, Slack …) lesen IconStreams ohne Null-Prüfung und brechen sonst ab.
 TRAY='HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify'
-if ! "$BIN/virtual" reg query "$TRAY" /v IconStreams >/dev/null 2>&1; then
+# Exitcode 1 heißt hier nur „fehlt noch“.
+if ! WINMAC_EXPECT_NONZERO=1 "$BIN/virtual" reg query "$TRAY" /v IconStreams >/dev/null 2>&1; then
     "$BIN/virtual" reg add "$TRAY" /v IconStreams /t REG_BINARY /d 1400000007000000010001000000000014000000 /f >/dev/null 2>&1 ||
         echo "    TrayNotify konnte nicht angelegt werden."
 fi

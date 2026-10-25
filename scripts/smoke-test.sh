@@ -163,6 +163,8 @@ exit "$status"
 WRAPPER
         chmod +x "$WINMAC_RUNTIME/bin/$tool" || exit 1
     done
+    # Module, die init-prefix.sh aus der Runtime in den Raum kopiert (GStreamer, ICU).
+    ln -s "$WINMAC_SMOKE_RUNTIME/wine-build" "$WINMAC_RUNTIME/wine-build" || exit 1
     WINE_READY=1
 else
     report FEHLER "Runtime-Dateien" "virtual, virtualboot oder virtualserver fehlt unter $WINMAC_SMOKE_RUNTIME/bin"
