@@ -18,6 +18,9 @@ RUNTIME="${WINMAC_RUNTIME:-$ROOT/runtime}"
     echo "GStreamer is missing; build Wine with GStreamer and run scripts/bundle-gstreamer.sh runtime/wine-build." >&2; exit 1;
 }
 [ -x "$RUNTIME/sspi/venv/bin/python" ] || { echo "Local authentication runtime is missing; run scripts/setup-local-auth.sh first." >&2; exit 1; }
+[ -f "$RUNTIME/wine-build/lib/icu/x86_64-windows/icu.dll" ] && [ -f "$RUNTIME/wine-build/lib/icu/i386-windows/icu.dll" ] || {
+    echo "Windows ICU is missing; run scripts/build-icu.sh --install first." >&2; exit 1;
+}
 mkdir -p "$(dirname "$DEST")"
 STAGE="$(mktemp -d "$(dirname "$DEST")/.engine.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT

@@ -458,6 +458,21 @@ for probe in keyboard change; do
         show_log "$probe.err"
     fi
 done
+# Windows-System-ICU (icu.dll + Weiterleitungen), 64 und 32 Bit; der Test ist mit -licu
+# gelinkt und startet ohne icu.dll gar nicht.
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    if [ ! -d "$WINMAC_RUNTIME/wine-build/lib/icu" ]; then
+        report übersprungen "Integration: ICU $bits Bit" "scripts/build-icu.sh --install fehlt"
+    elif "$cc" "$ROOT/winrt/tests/icu.c" -o "icu$bits.exe" -licu >"compile-icu$bits.log" 2>&1 &&
+         "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/icu$bits.exe" >"icu$bits.out" 2>"icu$bits.err"; then
+        report ok "Integration: ICU $bits Bit" "$(tr -d '\r' <"icu$bits.out" | tail -1)"
+    else
+        report FEHLER "Integration: ICU $bits Bit"
+        show_log "compile-icu$bits.log"
+        show_log "icu$bits.out"
+    fi
+done
 if x86_64-w64-mingw32-gcc -municode "$ROOT/winrt/tests/media.c" -o media.exe -lmfreadwrite -lmfplat -lmfuuid -lole32 >compile-media.log 2>&1; then
     media_path="Z:${ROOT//\//\\}\\winrt\\tests\\blue-h264.mp4"
     if "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/media.exe" "$media_path" >media.out 2>media.err && grep -q 'decoded-blue=1' media.out; then

@@ -85,6 +85,18 @@ if [ "${#ADDED64[@]}" -gt 0 ] || [ "${#ADDED32[@]}" -gt 0 ]; then
     wait_server 30
 fi
 
+# Windows-System-ICU (icu.dll + Weiterleitungen icuuc/icuin, scripts/build-icu.sh), wie
+# sie Windows 10 seit 1903 hat. Nur fehlende kopieren: eigene DLLs eines Raums bleiben.
+ICU_LIB="$RUNTIME/wine-build/lib/icu"
+for pair in "x86_64-windows:system32" "i386-windows:syswow64"; do
+    arch="${pair%%:*}" sys="$WINEPREFIX/drive_c/windows/${pair#*:}"
+    [ -d "$ICU_LIB/$arch" ] && [ -d "$sys" ] || continue
+    for name in icu.dll icuuc.dll icuin.dll; do
+        [ -f "$ICU_LIB/$arch/$name" ] && [ ! -e "$sys/$name" ] || continue
+        cp -c "$ICU_LIB/$arch/$name" "$sys/$name" 2>/dev/null || cp "$ICU_LIB/$arch/$name" "$sys/$name"
+    done
+done
+
 # Windows-Desktop wie bei CrossOver: eigener Ordner im Raum, der Mac-Schreibtisch nur als
 # „My Mac Desktop“ darin. Ältere Räume zeigen direkt auf ~/Desktop – dort landeten sonst
 # die .lnk-Verknüpfungen jedes Installers. Vorhandene Dateien bleiben, wo sie sind.

@@ -25,6 +25,13 @@ Versioned download URLs and SHA checksums are in `components.lock.json`.
 - libinotify-kqueue 20240724, MIT:
   https://github.com/libinotify-kqueue/libinotify-kqueue
   Provides real directory change notifications through macOS kqueue.
+- ICU 78.3 (International Components for Unicode), Unicode-3.0:
+  https://github.com/unicode-org/icu/releases/tag/release-78.3
+  Built by `scripts/build-icu.sh` with MinGW as Windows' system `icu.dll` (C API,
+  unversioned names, data embedded) plus `icuuc.dll`/`icuin.dll` forwarders, the
+  layout Windows 10 has had since 1903. The export list comes from MinGW-w64's
+  import library. ICU's LICENSE (including the dictionary data licenses) ships
+  next to the DLLs in `runtime/wine-build/lib/icu/`.
 
 Windows redistributable packages and user prefixes are not included in the app
 archive. Python and its packages retain their upstream license files.
