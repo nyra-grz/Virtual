@@ -95,11 +95,14 @@ fi
 export WINMAC_DOTNET="$SCRATCH/kein-dotnet-installer.exe"
 printf 'Wegwerf-Prefix: %s\n\n' "$WINEPREFIX"
 
-# a) App nur in diesem Checkout bauen, nicht im gemeinsamen WINMAC_HOME.
+# a) App in den Wegwerf-Ordner bauen: build/Virtual.app ist die benutzte App mit Engine,
+#    ein Build ohne Engine darüber würde sie entfernen.
 if [ "$(uname -s)" != Darwin ] || ! command -v swift >/dev/null 2>&1; then
     report übersprungen "App-Build und Info.plist" "macOS mit Swift erforderlich"
-elif [ "${WINMAC_SMOKE_SKIP_BUILD:-0}" = 1 ] || /bin/bash "$ROOT/build-app.sh" >"$SCRATCH/app-build.log" 2>&1; then
-    BUNDLE="${WINMAC_SMOKE_BUNDLE:-$ROOT/build/Virtual.app}"
+elif [ "${WINMAC_SMOKE_SKIP_BUILD:-0}" = 1 ] ||
+     WINMAC_APP_BUNDLE="$SCRATCH/app/Virtual.app" /bin/bash "$ROOT/build-app.sh" >"$SCRATCH/app-build.log" 2>&1; then
+    BUNDLE="${WINMAC_SMOKE_BUNDLE:-$SCRATCH/app/Virtual.app}"
+    [ "${WINMAC_SMOKE_SKIP_BUILD:-0}" = 1 ] && BUNDLE="${WINMAC_SMOKE_BUNDLE:-$ROOT/build/Virtual.app}"
     if [ -x "$BUNDLE/Contents/MacOS/Virtual" ]; then
         report ok "App-Build" "$BUNDLE"
     else
