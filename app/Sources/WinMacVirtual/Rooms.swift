@@ -19,6 +19,8 @@ final class Room: Codable {
     var driveC: URL { prefixURL.appendingPathComponent("drive_c") }
     /// Eingerichtet, sobald wineboot das Windows-Verzeichnis angelegt hat.
     var isReady: Bool { FileManager.default.fileExists(atPath: driveC.appendingPathComponent("windows/system32").path) }
+    /// Microsofts .NET Framework 4.8 statt Wine Mono (scripts/setup-dotnet48.sh legt die Markierung an).
+    var hasDotNet48: Bool { FileManager.default.fileExists(atPath: prefixURL.appendingPathComponent(".virtual/dotnet").path) }
 }
 
 /// Alle Räume, gespeichert in ~/WinMac_Virtual/rooms.json. Der erste ist „Standard“,
@@ -111,7 +113,10 @@ final class RoomStore {
     func environment(for room: Room) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["WINEPREFIX"] = room.prefixPath
-        env["WINEDEBUG"] = env["WINEDEBUG"] ?? "err+all"
+        // Nur echte Fehler ins Programm-Log; „fixme“ sind Wine-Notizen, keine Fehler.
+        env["WINEDEBUG"] = env["WINEDEBUG"] ?? "fixme-all"
+        // Kiosk-Apps als Overlay über anderen Apps statt Vollbild-Sperre (Mac-Treiber der Runtime).
+        if Settings.shared.overlayEnabled { env["VIRTUAL_KIOSK_OVERLAY"] = "1" } else { env["VIRTUAL_KIOSK_OVERLAY"] = nil }
         return env
     }
 }

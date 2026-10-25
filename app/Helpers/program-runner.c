@@ -19,6 +19,13 @@ static WCHAR *command_line(int argc, WCHAR **argv)
     {
         const WCHAR *p = argv[i];
         if (i > 1) *out++ = L' ';
+        /* Some Windows installers inspect GetCommandLine rather than argv.
+         * Keep plain switches such as NSIS /S plain; quote only when needed. */
+        if (*p && !wcspbrk(p, L" \t\r\n\v\f\""))
+        {
+            while (*p) *out++ = *p++;
+            continue;
+        }
         *out++ = L'"';
         for (;;)
         {
@@ -85,5 +92,8 @@ int wmain(int argc, WCHAR **argv)
     if (child.hProcess) CloseHandle(child.hProcess);
     CloseHandle(job);
     HeapFree(GetProcessHeap(), 0, line);
+    /* Preserve Windows' 32-bit result; the host process exit status only keeps
+     * the low byte (for example, MSI success-with-reboot 3010 becomes 194). */
+    printf("\nVIRTUAL_EXIT_CODE=%lu\n", status);
     return status;
 }

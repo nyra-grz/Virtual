@@ -1,0 +1,357 @@
+wintypes: Implement RoResolveNamespace by reading .winmd files.
+The CLR resolves Windows Runtime types through RoResolveNamespace; Wine's stub always
+returned RO_E_METADATA_NAME_NOT_FOUND, so .NET Framework programs that touch any WinRT
+type (WPF/WinForms apps on Windows 10 APIs, many launchers) failed while loading.
+Now the TypeDef namespaces of the .winmd files in the given or the system WinMetadata
+directory are read (ECMA-335 tables), returning the matching files and sub-namespaces.
+Test: winrt/tests/projection.c.
+Resolved files are ordered so the one describing most of the namespace comes first (Wine's partial .winmd files must not shadow the SDK's Windows.winmd).
+
+diff --git a/dlls/wintypes/Makefile.in b/dlls/wintypes/Makefile.in
+index 883d02f8..0bea9f13 100644
+--- a/dlls/wintypes/Makefile.in
++++ b/dlls/wintypes/Makefile.in
+@@ -6,6 +6,7 @@ SOURCES = \
+ 	buffer.c \
+ 	classes.idl \
+ 	main.c \
++	metadata.c \
+ 	map.c \
+ 	propertyset.c \
+ 	storage.c \
+diff --git a/dlls/wintypes/main.c b/dlls/wintypes/main.c
+index 287e5992..c7e324b9 100644
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -1811,21 +1811,6 @@ HRESULT WINAPI RoIsApiContractMajorVersionPresent(const WCHAR *name, UINT16 majo
+     return S_OK;
+ }
+ 
+-HRESULT WINAPI RoResolveNamespace(HSTRING name, HSTRING windowsMetaDataDir,
+-                                  DWORD packageGraphDirsCount, const HSTRING *packageGraphDirs,
+-                                  DWORD *metaDataFilePathsCount, HSTRING **metaDataFilePaths,
+-                                  DWORD *subNamespacesCount, HSTRING **subNamespaces)
+-{
+-    FIXME("name %s, windowsMetaDataDir %s, metaDataFilePaths %p, subNamespaces %p stub!\n",
+-            debugstr_hstring(name), debugstr_hstring(windowsMetaDataDir),
+-            metaDataFilePaths, subNamespaces);
+-
+-    if (!metaDataFilePaths && !subNamespaces)
+-        return E_INVALIDARG;
+-
+-    return RO_E_METADATA_NAME_NOT_FOUND;
+-}
+-
+ struct parse_type_context
+ {
+     DWORD allocated_parts_count;
+diff --git a/dlls/wintypes/metadata.c b/dlls/wintypes/metadata.c
+new file mode 100644
+index 00000000..8b81df72
+--- /dev/null
++++ b/dlls/wintypes/metadata.c
+@@ -0,0 +1,304 @@
++/* Windows Runtime metadata discovery for CLR namespace resolution.
++ * Copyright 2026 Virtual contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#include "private.h"
++#include <stdlib.h>
++#include <string.h>
++#include "winnls.h"
++
++struct metadata_result
++{
++    const char *name;
++    size_t length;
++    BOOL want_files, want_names;
++    DWORD file_count, name_count;
++    HSTRING *files, *names;
++    DWORD *file_types;  /* types each file defines in the namespace itself */
++};
++
++static WORD read_u16(const BYTE *p) { WORD n; memcpy(&n, p, sizeof(n)); return n; }
++static DWORD read_u32(const BYTE *p) { DWORD n; memcpy(&n, p, sizeof(n)); return n; }
++static ULONGLONG read_u64(const BYTE *p) { ULONGLONG n; memcpy(&n, p, sizeof(n)); return n; }
++static DWORD read_index(const BYTE *p, unsigned int width)
++{
++    return width == 4 ? read_u32(p) : read_u16(p);
++}
++
++static HRESULT append_string(HSTRING **array, DWORD *count, const WCHAR *s, UINT32 length)
++{
++    HSTRING *next;
++    DWORD i;
++    HRESULT hr;
++    for (i = 0; i < *count; ++i)
++    {
++        UINT32 n;
++        const WCHAR *existing = WindowsGetStringRawBuffer((*array)[i], &n);
++        if (n == length && !memcmp(existing, s, length * sizeof(WCHAR))) return S_OK;
++    }
++    if (!(next = CoTaskMemRealloc(*array, (*count + 1) * sizeof(**array)))) return E_OUTOFMEMORY;
++    *array = next;
++    if (FAILED(hr = WindowsCreateString(s, length, &next[*count]))) return hr;
++    ++*count;
++    return S_OK;
++}
++
++static void free_strings(HSTRING *array, DWORD count)
++{
++    while (count) WindowsDeleteString(array[--count]);
++    CoTaskMemFree(array);
++}
++
++/* A winmd is a PE file containing ECMA-335 metadata. Only the TypeDef namespaces
++ * are inspected: filenames and arbitrary strings do not prove namespace membership. */
++static const BYTE *metadata_rva(const BYTE *data, SIZE_T size, DWORD rva, DWORD length)
++{
++    DWORD pe, optional, sections, headers, offset, raw, address, raw_size;
++    WORD count, optional_size;
++    unsigned int i;
++    if (size < 64 || read_u16(data) != IMAGE_DOS_SIGNATURE) return NULL;
++    pe = read_u32(data + 60);
++    if (pe > size || size - pe < 24 || read_u32(data + pe) != IMAGE_NT_SIGNATURE) return NULL;
++    count = read_u16(data + pe + 6);
++    optional_size = read_u16(data + pe + 20);
++    optional = pe + 24;
++    if (optional_size < 64 || optional_size > size - optional) return NULL;
++    headers = read_u32(data + optional + 60);
++    if (rva < headers && rva <= size && length <= size - rva) return data + rva;
++    sections = optional + optional_size;
++    if (count > (size - sections) / 40) return NULL;
++    for (i = 0; i < count; ++i)
++    {
++        const BYTE *section = data + sections + i * 40;
++        address = read_u32(section + 12);
++        raw_size = read_u32(section + 16);
++        raw = read_u32(section + 20);
++        if (rva < address || rva - address > raw_size || length > raw_size - (rva - address)) continue;
++        if (raw > size || rva - address > size - raw) continue;
++        offset = raw + rva - address;
++        if (length <= size - offset) return data + offset;
++    }
++    return NULL;
++}
++
++static HRESULT inspect_metadata(const BYTE *data, SIZE_T size, const WCHAR *path, struct metadata_result *result)
++{
++    const BYTE *cli, *root, *tables = NULL, *strings = NULL, *p, *row;
++    SIZE_T root_size, table_size = 0, strings_size = 0, position, table_position;
++    DWORD pe, optional, directory, rows[64] = {0}, i, offset, length;
++    unsigned int string_width, guid_width, scope_width, extends_width, row_size, streams;
++    ULONGLONG valid;
++    BOOL found = FALSE;
++    DWORD types = 0;
++    HRESULT hr;
++
++    if (size < 64 || read_u16(data) != IMAGE_DOS_SIGNATURE) return S_FALSE;
++    pe = read_u32(data + 60);
++    if (pe > size || size - pe < 24 || read_u32(data + pe) != IMAGE_NT_SIGNATURE) return S_FALSE;
++    optional = pe + 24;
++    if (read_u16(data + pe + 20) > size - optional || size - optional < 2) return S_FALSE;
++    if (read_u16(data + optional) == IMAGE_NT_OPTIONAL_HDR32_MAGIC) directory = 96;
++    else if (read_u16(data + optional) == IMAGE_NT_OPTIONAL_HDR64_MAGIC) directory = 112;
++    else return S_FALSE;
++    directory += IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR * 8;
++    if (read_u16(data + pe + 20) < directory + 8) return S_FALSE;
++    if (!(cli = metadata_rva(data, size, read_u32(data + optional + directory), 16))) return S_FALSE;
++    root_size = read_u32(cli + 12);
++    if (root_size < 20 || !(root = metadata_rva(data, size, read_u32(cli + 8), root_size))) return S_FALSE;
++    if (read_u32(root) != 0x424a5342) return S_FALSE;
++    position = 16 + (SIZE_T)read_u32(root + 12);
++    position = (position + 3) & ~(SIZE_T)3;
++    if (position > root_size || root_size - position < 4) return S_FALSE;
++    streams = read_u16(root + position + 2);
++    position += 4;
++    for (i = 0; i < streams; ++i)
++    {
++        const char *name, *end;
++        if (position > root_size || root_size - position < 9) return S_FALSE;
++        offset = read_u32(root + position);
++        length = read_u32(root + position + 4);
++        name = (const char *)root + position + 8;
++        if (!(end = memchr(name, 0, root_size - position - 8))) return S_FALSE;
++        if (offset > root_size || length > root_size - offset) return S_FALSE;
++        if (!strcmp(name, "#Strings")) { strings = root + offset; strings_size = length; }
++        if (!strcmp(name, "#~") || !strcmp(name, "#-")) { tables = root + offset; table_size = length; }
++        position = ((const BYTE *)end - root + 4) & ~(SIZE_T)3;
++    }
++    if (!tables || !strings || table_size < 24) return S_FALSE;
++    string_width = (tables[6] & 1) ? 4 : 2;
++    guid_width = (tables[6] & 2) ? 4 : 2;
++    valid = read_u64(tables + 8);
++    table_position = 24;
++    for (i = 0; i < 64; ++i)
++        if (valid & ((ULONGLONG)1 << i))
++        {
++            if (table_position > table_size || table_size - table_position < 4) return S_FALSE;
++            rows[i] = read_u32(tables + table_position);
++            table_position += 4;
++        }
++    scope_width = rows[0] >= 16384 || rows[26] >= 16384 || rows[35] >= 16384 || rows[1] >= 16384 ? 4 : 2;
++    extends_width = rows[2] >= 16384 || rows[1] >= 16384 || rows[27] >= 16384 ? 4 : 2;
++    if (rows[0] > (table_size - table_position) / (2 + string_width + 3 * guid_width)) return S_FALSE;
++    table_position += (SIZE_T)rows[0] * (2 + string_width + 3 * guid_width);
++    if (rows[1] > (table_size - table_position) / (scope_width + 2 * string_width)) return S_FALSE;
++    table_position += (SIZE_T)rows[1] * (scope_width + 2 * string_width);
++    row_size = 4 + 2 * string_width + extends_width + (rows[4] >= 65536 ? 4 : 2) + (rows[6] >= 65536 ? 4 : 2);
++    if (table_position > table_size || rows[2] > (table_size - table_position) / row_size) return S_FALSE;
++    for (i = 0; i < rows[2]; ++i)
++    {
++        const char *ns, *end;
++        SIZE_T ns_length;
++        row = tables + table_position + (SIZE_T)i * row_size;
++        offset = read_index(row + 4 + string_width, string_width);
++        if (offset >= strings_size) return S_FALSE;
++        ns = (const char *)strings + offset;
++        if (!(end = memchr(ns, 0, strings_size - offset))) return S_FALSE;
++        ns_length = end - ns;
++        if (ns_length < result->length || memcmp(ns, result->name, result->length)) continue;
++        if (ns_length != result->length && result->length && ns[result->length] != '.') continue;
++        found = TRUE;
++        if (ns_length == result->length) ++types;
++        if (result->want_names && ns_length > result->length)
++        {
++            WCHAR *wide;
++            int count;
++            const char *child_end;
++            SIZE_T child_length;
++            p = (const BYTE *)ns + result->length + (result->length ? 1 : 0);
++            child_end = memchr(p, '.', end - (const char *)p);
++            child_length = child_end ? child_end - ns : ns_length;
++            if (!(count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, ns, child_length, NULL, 0))) continue;
++            if (!(wide = malloc(count * sizeof(*wide)))) return E_OUTOFMEMORY;
++            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, ns, child_length, wide, count);
++            hr = append_string(&result->names, &result->name_count, wide, count);
++            free(wide);
++            if (FAILED(hr)) return hr;
++        }
++    }
++    if (found && result->want_files)
++    {
++        DWORD *weights, count = result->file_count, pos;
++        HSTRING added;
++
++        if (FAILED(hr = append_string(&result->files, &result->file_count, path, wcslen(path)))) return hr;
++        if (result->file_count == count) return S_OK;
++        if (!(weights = CoTaskMemRealloc(result->file_types, result->file_count * sizeof(*weights)))) return E_OUTOFMEMORY;
++        result->file_types = weights;
++        /* Wine installs partial .winmd files next to complete ones such as the SDK's
++         * Windows.winmd. The CLR binds to the first file defining a type, so the file
++         * describing most of the namespace comes first. */
++        added = result->files[count];
++        for (pos = count; pos && weights[pos - 1] < types; --pos)
++        {
++            result->files[pos] = result->files[pos - 1];
++            weights[pos] = weights[pos - 1];
++        }
++        result->files[pos] = added;
++        weights[pos] = types;
++    }
++    return S_OK;
++}
++
++static HRESULT search_directory(const WCHAR *directory, struct metadata_result *result)
++{
++    WCHAR *path;
++    WIN32_FIND_DATAW entry;
++    HANDLE find, file;
++    DWORD length, read;
++    SIZE_T prefix;
++    LARGE_INTEGER size;
++    BYTE *data;
++    HRESULT hr = S_OK;
++
++    length = GetFullPathNameW(directory, 0, NULL, NULL);
++    if (!length) return S_OK;
++    if (!(path = malloc((length + MAX_PATH + 1) * sizeof(*path)))) return E_OUTOFMEMORY;
++    if (!GetFullPathNameW(directory, length, path, NULL)) { free(path); return S_OK; }
++    prefix = wcslen(path);
++    if (prefix && path[prefix - 1] != '\\') path[prefix++] = '\\';
++    wcscpy(path + prefix, L"*.winmd");
++    find = FindFirstFileW(path, &entry);
++    if (find != INVALID_HANDLE_VALUE)
++    {
++        do
++        {
++            if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
++            wcscpy(path + prefix, entry.cFileName);
++            file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++            if (file == INVALID_HANDLE_VALUE) continue;
++            if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= 128 * 1024 * 1024)
++            {
++                if (!(data = malloc(size.QuadPart))) { CloseHandle(file); hr = E_OUTOFMEMORY; break; }
++                if (ReadFile(file, data, size.QuadPart, &read, NULL) && read == size.QuadPart)
++                    hr = inspect_metadata(data, read, path, result);
++                free(data);
++            }
++            CloseHandle(file);
++            if (FAILED(hr)) break;
++        } while (FindNextFileW(find, &entry));
++        FindClose(find);
++    }
++    free(path);
++    return hr;
++}
++
++HRESULT WINAPI RoResolveNamespace(HSTRING name, HSTRING windowsMetaDataDir,
++        DWORD packageGraphDirsCount, const HSTRING *packageGraphDirs,
++        DWORD *metaDataFilePathsCount, HSTRING **metaDataFilePaths,
++        DWORD *subNamespacesCount, HSTRING **subNamespaces)
++{
++    struct metadata_result result = {0};
++    const WCHAR *namespace = WindowsGetStringRawBuffer(name, NULL);
++    const WCHAR *directory = WindowsGetStringRawBuffer(windowsMetaDataDir, NULL);
++    WCHAR system[MAX_PATH + 16];
++    BOOL embedded;
++    unsigned int i;
++    int length;
++    char *utf8;
++    HRESULT hr;
++
++    if (metaDataFilePathsCount) *metaDataFilePathsCount = 0;
++    if (metaDataFilePaths) *metaDataFilePaths = NULL;
++    if (subNamespacesCount) *subNamespacesCount = 0;
++    if (subNamespaces) *subNamespaces = NULL;
++    if ((!metaDataFilePaths && !subNamespaces) || (metaDataFilePaths && !metaDataFilePathsCount)
++            || (subNamespaces && !subNamespacesCount) || (!*namespace && metaDataFilePaths)) return E_INVALIDARG;
++    WindowsStringHasEmbeddedNull(name, &embedded);
++    if (embedded) return E_INVALIDARG;
++    WindowsStringHasEmbeddedNull(windowsMetaDataDir, &embedded);
++    if (embedded) return E_INVALIDARG;
++    length = WideCharToMultiByte(CP_UTF8, 0, namespace, -1, NULL, 0, NULL, NULL);
++    if (!(utf8 = malloc(length))) return E_OUTOFMEMORY;
++    WideCharToMultiByte(CP_UTF8, 0, namespace, -1, utf8, length, NULL, NULL);
++    result.name = utf8;
++    result.length = length - 1;
++    result.want_files = !!metaDataFilePaths;
++    result.want_names = !!subNamespaces;
++    if (!*directory)
++    {
++        length = GetSystemDirectoryW(system, MAX_PATH);
++        if (!length || length >= MAX_PATH) { free(utf8); return E_FAIL; }
++        wcscat(system, L"\\WinMetadata");
++        directory = system;
++    }
++    hr = search_directory(directory, &result);
++    for (i = 0; SUCCEEDED(hr) && packageGraphDirs && i < packageGraphDirsCount; ++i)
++    {
++        WindowsStringHasEmbeddedNull(packageGraphDirs[i], &embedded);
++        if (embedded) { hr = E_INVALIDARG; break; }
++        directory = WindowsGetStringRawBuffer(packageGraphDirs[i], NULL);
++        if (*directory) hr = search_directory(directory, &result);
++    }
++    free(utf8);
++    CoTaskMemFree(result.file_types);
++    if (FAILED(hr))
++    {
++        free_strings(result.files, result.file_count);
++        free_strings(result.names, result.name_count);
++        return hr;
++    }
++    if (metaDataFilePaths) { *metaDataFilePaths = result.files; *metaDataFilePathsCount = result.file_count; }
++    if (subNamespaces) { *subNamespaces = result.names; *subNamespacesCount = result.name_count; }
++    return result.file_count || result.name_count ? S_OK : RO_E_METADATA_NAME_NOT_FOUND;
++}

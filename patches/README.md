@@ -1,8 +1,8 @@
 # patches/ — own changes to the Wine fork "Virtual"
 
 After cloning, `build-wine.sh` applies every `*.patch` in this folder to the Wine
-source (`git apply --check` first; if a patch does not fit the chosen `WINE_TAG`,
-it is skipped cleanly instead of breaking the build).
+source (`git apply --check` first). A failed patch stops the build, so a runtime
+cannot silently ship without a required compatibility fix.
 
 ## The patches
 
@@ -16,6 +16,17 @@ it is skipped cleanly instead of breaking the build).
 | `0007-bcrypt-gnutls-zero-iv.patch` | AES/3DES in ECB mode and AES key wrap no longer crash: the bundled GnuTLS 3.8.7 faults on block ciphers initialized without IV, so bcrypt now passes an all-zero vector (bcrypt tests: 15 failures → 0) |
 | `0008-ncrypt-ecdsa-persisted-keys.patch` | ncrypt: ECDSA P-256 keys (from upstream) and named, persisted keys (`NCryptOpenKey`/`NCryptDeleteKey`, stored in the prefix registry, not DPAPI-protected). Needed by Epic Games Launcher / EOS for its DPoP login key (ncrypt tests: 470, 0 failures) |
 | `0009-win32u-accessibility-keys-setcursors.patch` | StickyKeys, ToggleKeys and FilterKeys can be read and changed via `SystemParametersInfo` (stored like on Windows, Windows 10 defaults), so games can turn off the Shift-x5 hotkey. `SPI_SETCURSORS` succeeds instead of failing (built-in cursors only) |
+| `0010-wintypes-resolve-metadata.patch` | `RoResolveNamespace` reads the `.winmd` files, so the .NET Framework can resolve Windows Runtime types instead of failing on load |
+| `0011-combase-parameterized-iids.patch` | `RoGetParameterizedTypeInstanceIID`: GUIDs of generic WinRT interfaces (`IVector<T>`, `IAsyncOperation<T>` …) from their type signature |
+| `0012-mmdevapi-endpoint-volume.patch` | Full `IAudioEndpointVolume` (real channel count, master/channel levels with balance, mute, steps, notifications, shared by all programs of a room and saved). On macOS session/stream/channel volume and mute now actually work: applied to the samples, the Mac volume stays untouched (test: 73 checks, 0 failures) |
+| `0013-msv1_0-room-local-auth.patch` | Windows authentication between the programs of a room (NegotiateStream, WCF, local HTTP) without a domain: each room gets its own random identity on first use; remote targets still use Samba's `ntlm_auth` |
+| `0014-wlanapi-wifi.patch` | Real macOS CoreWLAN adapter and scan data through WlanAPI and `Windows.Devices.WiFi`; the same adapter appears in `DeviceInformation` and opens through `FromIdAsync` |
+| `0015-macdrv-desktops-overlay.patch` | Only the input desktop's windows are visible (SwitchDesktop reaches all processes); kiosk desktops and borderless full-screen windows float above normal Mac apps, shrinkable with Virtual's shortcut |
+| `0016-chromium-browsers.patch` | Edge, Chrome, Electron and CEF work: `--in-process-gpu` and `--no-sandbox` for the browser process (no warning bar via policy), `SIO_ADDRESS_LIST_SORT` for Chromium's DNS client, no crash when the window starts maximized, custom title bars (tab strip) stay visible below the Mac title bar; Windows CJK font names map to the Mac's CJK fonts |
+| `0017-com-services-winhttp.patch` | COM classes in Windows services start (long service names, `ServiceParameters`), owners may set the DACL, typelib marshaler handles `LPWSTR`/`LPSTR`, WinHTTP keeps header lines up to 64 KB: Google's updater (Chrome installer) gets through |
+| `0018-macdrv-keyboard-locale-upstream.patch` | Upstream Wine fix (3b1ab640): keyboard layouts keep the current user locale, so activating a layout no longer fails with "Changing user locale is not supported"; layout comparison parenthesized |
+| `0019-macdrv-dxmt-bridge.patch` | Exports the dispatch table DXMT v0.80 expects from the Mac driver (adapted to Wine 11) and gives windows a client view on demand: DirectX 10/11 via DXMT → Metal, enabled per room by `setup-graphics.sh --dxmt` (DXVK stays the default) with `winemetal` from `scripts/install-dxmt-runtime.sh` |
+| `0020-services-object-security.patch` | `QueryServiceObjectSecurity`/`SetServiceObjectSecurity` store and return a service's descriptor (Windows default DACL otherwise) instead of stubs; Epic Games' updater service works |
 
 They are applied in this order on top of `WINE_TAG` (wine-11.0). Details, limits and
 tests: `winrt/README.md`.

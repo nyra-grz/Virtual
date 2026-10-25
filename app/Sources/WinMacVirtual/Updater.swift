@@ -38,6 +38,7 @@ final class Updater {
     }
 
     private var isWorking = false
+    private(set) var isInstalling = false
 
     // MARK: - Oberfläche
 
@@ -87,12 +88,14 @@ final class Updater {
             return
         }
         isWorking = true
+        isInstalling = true
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Result { try self.install(release) }
             DispatchQueue.main.async {
                 self.isWorking = false
                 switch result {
                 case .failure(let error):
+                    self.isInstalling = false
                     self.show("Update fehlgeschlagen", error.localizedDescription)
                 case .success(let scripts):
                     self.show("Update installiert", "Virtual \(release.version) startet jetzt neu.\(scripts.isEmpty ? "" : "\n\n" + scripts)")
@@ -193,7 +196,9 @@ final class Updater {
                 .first(where: { $0.pathExtension == "app" }),
               let bundle = Bundle(url: app),
               bundle.bundleIdentifier == Bundle.main.bundleIdentifier,
-              (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) == release.version
+              (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) == release.version,
+              fm.isExecutableFile(atPath: app.appendingPathComponent("Contents/Resources/Engine/runtime/bin/virtual").path),
+              fm.fileExists(atPath: app.appendingPathComponent("Contents/Resources/Engine/engine-version").path)
         else { throw UpdateError.badArchive }
         try? Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
 

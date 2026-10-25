@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.mainController.window?.makeKeyAndOrderFront(nil)
         }
         RoomWatcher.shared.start()
+        _ = OverlayController.shared   // Tastenkombination für Kiosk-Apps, solange Programme laufen
         let urls = pendingURLs
         pendingURLs.removeAll()
         urls.forEach { Handoff.shared.open($0) }
@@ -23,6 +24,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { mainController.window?.makeKeyAndOrderFront(nil) }
+        return true
+    }
+
+    private var isShuttingDown = false
+
+    /// Mit Virtual endet auch Wine: alle Räume werden komplett beendet, damit keine
+    /// Wine-Prozesse im Hintergrund weiterlaufen. Laufende Programme vorher nachfragen.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isShuttingDown else { return .terminateCancel }
+        let titles = Launcher.shared.runningTitles
+        if !titles.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "Virtual beenden?"
+            alert.informativeText = titles.count == 1
+                ? "„\(titles[0])“ läuft noch und wird geschlossen."
+                : "Diese Windows-Programme laufen noch und werden geschlossen: \(titles.joined(separator: ", "))."
+            alert.addButton(withTitle: "Beenden")
+            alert.addButton(withTitle: "Abbrechen")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                mainController.window?.makeKeyAndOrderFront(nil)
+                return .terminateCancel
+            }
+        }
+        isShuttingDown = true
+        Launcher.shared.stopAll(in: RoomStore.shared.rooms) {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
 
     private var pendingURLs: [URL] = []
 
@@ -45,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
         appItem.submenu = appMenu
         appMenu.addItem(withTitle: "Über Virtual", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "Kiosk-App verkleinern/vergrößern", action: #selector(toggleOverlay), keyEquivalent: "")
         appMenu.addItem(withTitle: "Nach Updates suchen…", action: #selector(checkForUpdates), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Einstellungen…", action: #selector(openSettings), keyEquivalent: ",")
@@ -70,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
+    @objc private func toggleOverlay() { OverlayController.shared.toggle() }
     @objc private func openSettings() { SettingsWindowController.shared.showWindow(nil) }
     @objc private func checkForUpdates() { Updater.shared.check(interactive: true) }
     @objc private func addFromMenu() { mainController.window?.makeKeyAndOrderFront(nil); mainController.addProgram() }

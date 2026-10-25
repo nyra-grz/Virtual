@@ -1,5 +1,7 @@
 # Generated runtime & user data — never committed, never deployed
 /runtime/
+/runtime-cx/
+*.dxvk-cache
 /prefix/
 /logs/
 /app/.build/
@@ -14,3 +16,4 @@ graphify-out/
 # Room metadata and Wine environments are local user data
 /rooms.json
 /rooms/
+__pycache__/

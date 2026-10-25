@@ -10,6 +10,7 @@ final class Launcher {
     static let didLog = Notification.Name("WinMacVirtual.launcher.didLog")
     /// userInfo: ["room": UUID] – ein Programm oder Werkzeug in diesem Raum ist beendet.
     static let didFinishInRoom = Notification.Name("WinMacVirtual.launcher.didFinishInRoom")
+    static let didFail = Notification.Name("WinMacVirtual.launcher.didFail")
 
     struct Running {
         let process: Process
@@ -18,20 +19,35 @@ final class Launcher {
 
     /// Laufende Prozesse nach Programm-ID.
     private var running: [UUID: Running] = [:]
+    private var preparing: [UUID: Program] = [:]
+    private var pendingTools: [UUID: UUID] = [:]
+    private var stopping: Set<UUID> = []
+    private var repaired: Set<UUID> = []
 
-    func isRunning(_ program: Program) -> Bool { running[program.id] != nil }
+    func isRunning(_ program: Program) -> Bool { running[program.id] != nil || preparing[program.id] != nil }
+    func isPreparing(_ program: Program) -> Bool { preparing[program.id] != nil }
 
     /// Läuft gerade irgendein Windows-Programm?
-    var hasRunning: Bool { !running.isEmpty || !tools.isEmpty }
+    var hasRunning: Bool { !running.isEmpty || !tools.isEmpty || !preparing.isEmpty || !pendingTools.isEmpty || PrefixSetup.hasRunning }
 
     private var recentLogs: [UUID: URL] = [:]
     private var processRooms: [UUID: UUID] = [:]
 
-    func hasRunning(in room: Room) -> Bool { processRooms.values.contains(room.id) }
+    func hasRunningProcesses(in room: Room) -> Bool { processRooms.values.contains(room.id) }
+    func hasRunning(in room: Room) -> Bool {
+        hasRunningProcesses(in: room) || preparing.values.contains { $0.room.id == room.id } || pendingTools.values.contains(room.id)
+    }
+
+    /// Namen aller laufenden Programme und Werkzeuge, z. B. für die Rückfrage beim Beenden.
+    var runningTitles: [String] {
+        let names = running.keys.compactMap { id in Library.shared.programs.first { $0.id == id }?.name }
+        return (names + preparing.values.map { $0.name + " (wird vorbereitet)" } + toolTitles.values).sorted()
+    }
     func logURL(for program: Program) -> URL? { running[program.id]?.logURL ?? recentLogs[program.id] }
 
     /// Startet ein Programm in seinem Raum. Wirft bei fehlender Runtime/Datei.
     func launch(_ program: Program) throws {
+        guard !Updater.shared.isInstalling else { throw LaunchError.updateInProgress }
         guard Settings.shared.runtimeIsInstalled else {
             throw LaunchError.runtimeMissing
         }
@@ -39,7 +55,22 @@ final class Launcher {
             throw LaunchError.fileMissing(program.path)
         }
         if isRunning(program) { return }
+        repaired.remove(program.id)
 
+        preparing[program.id] = program
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
+        PrefixSetup.prepare(program) { [self] error in
+            guard preparing.removeValue(forKey: program.id) != nil else { return }
+            do {
+                if let error { throw error }
+                guard program.exists else { throw LaunchError.fileMissing(program.path) }
+                try launchPrepared(program)
+            } catch { reportFailure(error, id: program.id, title: program.name) }
+            NotificationCenter.default.post(name: Self.didChange, object: nil)
+        }
+    }
+
+    private func launchPrepared(_ program: Program) throws {
         let room = program.room
         let arguments: [String]
         switch URL(fileURLWithPath: program.path).pathExtension.lowercased() {
@@ -54,8 +85,15 @@ final class Launcher {
         }
 
         let programID = program.id
-        let (process, logURL) = try start(arguments, in: room, title: program.name, id: programID, trackChildren: true) { [weak self] in
-            self?.running[programID] = nil
+        let (process, logURL) = try start(arguments, in: room, title: program.name, id: programID,
+                                        directory: program.url.deletingLastPathComponent(), trackChildren: true) { [weak self] status in
+            guard let self else { return }
+            self.running[programID] = nil
+            let stopped = self.stopping.remove(programID) != nil
+            let isMSI = program.url.pathExtension.lowercased() == "msi"
+            if !LaunchDiagnostics.installerSucceeded(status: status, isMSI: isMSI), !stopped, !(isMSI && (status == 1602 || status == 66)) {
+                self.repairOrReport(status, program: program)
+            }
         }
         recentLogs[programID] = logURL
         running[programID] = Running(process: process, logURL: logURL)
@@ -63,20 +101,71 @@ final class Launcher {
     }
 
     /// Startet ein Windows-Werkzeug (Explorer, Eingabeaufforderung, Installer …) in einem Raum.
-    func runTool(_ arguments: [String], in room: Room, title: String) throws {
+    func runTool(_ arguments: [String], in room: Room, title: String, directory: URL? = nil, trackChildren: Bool = false) throws {
+        guard !Updater.shared.isInstalling else { throw LaunchError.updateInProgress }
         guard Settings.shared.runtimeIsInstalled else { throw LaunchError.runtimeMissing }
         let id = UUID()
-        let (process, _) = try start(arguments, in: room, title: title, id: id) { [weak self] in
-            self?.tools[id] = nil
+        pendingTools[id] = room.id
+        toolTitles[id] = title
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
+        PrefixSetup.prepare(room) { [self] error in
+            guard pendingTools.removeValue(forKey: id) != nil else { return }
+            do {
+                if let error { throw error }
+                let (process, logURL) = try start(arguments, in: room, title: title, id: id,
+                                                  directory: directory, trackChildren: trackChildren) { [weak self] status in
+                    guard let self else { return }
+                    self.tools[id] = nil
+                    self.toolTitles[id] = nil
+                    let stopped = self.stopping.remove(id) != nil
+                    if status != 0, !stopped { self.reportExit(status, id: id, title: title) }
+                }
+                recentLogs[id] = logURL
+                tools[id] = process
+            } catch {
+                toolTitles[id] = nil
+                reportFailure(error, id: id, title: title)
+            }
+            NotificationCenter.default.post(name: Self.didChange, object: nil)
         }
-        tools[id] = process
     }
 
     /// Werkzeuge, die gerade laufen (hält die Process-Objekte am Leben).
     private var tools: [UUID: Process] = [:]
+    private var toolTitles: [UUID: String] = [:]
 
-    private func start(_ arguments: [String], in room: Room, title: String, id: UUID,
-                       trackChildren: Bool = false, ended: @escaping () -> Void) throws -> (Process, URL) {
+    /// Beendet Wine in diesen Räumen vollständig – Programme, Werkzeuge und Hintergrunddienste
+    /// (`wineserver -k`). Startet nichts neu, wo nichts läuft. `completion` kommt auf dem
+    /// Main-Thread, spätestens nach `timeout` Sekunden.
+    func stopAll(in rooms: [Room], timeout: TimeInterval = 6, completion: (() -> Void)? = nil) {
+        let ids = Set(rooms.map(\.id))
+        preparing = preparing.filter { !ids.contains($0.value.room.id) }
+        for (id, roomID) in pendingTools where ids.contains(roomID) { pendingTools[id] = nil; toolTitles[id] = nil }
+        stopping.formUnion(processRooms.filter { ids.contains($0.value) }.keys)
+        for room in rooms { PrefixSetup.current(in: room)?.cancel() }
+        let server = Settings.shared.virtualServer
+        let group = DispatchGroup()
+        if FileManager.default.isExecutableFile(atPath: server.path) {
+            for room in rooms where FileManager.default.fileExists(atPath: room.prefixPath) {
+                let process = Process()
+                process.executableURL = server
+                process.arguments = ["-k"]
+                process.environment = RoomStore.shared.environment(for: room)
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                group.enter()
+                process.terminationHandler = { _ in group.leave() }
+                do { try process.run() } catch { group.leave() }
+            }
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = group.wait(timeout: .now() + timeout)
+            DispatchQueue.main.async { completion?() }
+        }
+    }
+
+    private func start(_ arguments: [String], in room: Room, title: String, id: UUID, directory: URL? = nil,
+                       trackChildren: Bool = false, ended: @escaping (Int32) -> Void) throws -> (Process, URL) {
         let settings = Settings.shared
         try FileManager.default.createDirectory(at: settings.logsPath, withIntermediateDirectories: true)
 
@@ -97,6 +186,8 @@ final class Launcher {
             process.arguments = arguments
         }
         process.environment = RoomStore.shared.environment(for: room)
+        // Portable apps and installers often load files relative to their own folder.
+        process.currentDirectoryURL = directory ?? room.driveC
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -109,7 +200,8 @@ final class Launcher {
             output.finish(status: proc.terminationStatus) {
                 DispatchQueue.main.async {
                     self.processRooms[id] = nil
-                    ended()
+                    let status = LaunchDiagnostics.exitCode(status: proc.terminationStatus, output: Self.logTail(logURL))
+                    ended(status)
                     NotificationCenter.default.post(name: Launcher.didChange, object: nil)
                     NotificationCenter.default.post(name: Launcher.didFinishInRoom, object: nil, userInfo: ["room": roomID])
                 }
@@ -130,13 +222,60 @@ final class Launcher {
 
     /// Beendet ein laufendes Programm (sanft, dann hart).
     func stop(_ program: Program) {
+        if preparing.removeValue(forKey: program.id) != nil {
+            NotificationCenter.default.post(name: Self.didChange, object: nil)
+            return
+        }
         guard let r = running[program.id] else { return }
+        stopping.insert(program.id)
         r.process.terminate()
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             if r.process.isRunning {
                 kill(r.process.processIdentifier, SIGKILL)
             }
         }
+    }
+
+    private func reportFailure(_ error: Error, id: UUID, title: String) {
+        NotificationCenter.default.post(name: Self.didFail, object: nil,
+                                        userInfo: ["programID": id, "title": title, "message": error.localizedDescription])
+    }
+
+    private func reportExit(_ status: Int32, id: UUID, title: String) {
+        let log = recentLogs[id]
+        let text = log.map(Self.logTail) ?? ""
+        let detail = LaunchDiagnostics.message(status: status, output: text)
+        reportFailure(PrefixSetup.SetupError(detail + (log.map { "\n\nProtokoll: \($0.path)" } ?? "")), id: id, title: title)
+    }
+
+    private func repairOrReport(_ status: Int32, program: Program) {
+        let output = recentLogs[program.id].map(Self.logTail) ?? ""
+        let missing = LaunchDiagnostics.missingComponents(output: output).filter {
+            !FileManager.default.fileExists(atPath: program.room.prefixURL.appendingPathComponent(".virtual/components/\($0)").path)
+        }
+        guard !missing.isEmpty, repaired.insert(program.id).inserted else {
+            reportExit(status, id: program.id, title: program.name)
+            return
+        }
+        preparing[program.id] = program
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
+        PrefixSetup.repairDependencies(program, components: missing) { [self] error in
+            guard preparing.removeValue(forKey: program.id) != nil else { return }
+            do {
+                if let error { throw error }
+                guard program.exists else { throw LaunchError.fileMissing(program.path) }
+                try launchPrepared(program)
+            } catch { reportFailure(error, id: program.id, title: program.name) }
+            NotificationCenter.default.post(name: Self.didChange, object: nil)
+        }
+    }
+
+    private static func logTail(_ url: URL) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd() else { return "" }
+        try? handle.seek(toOffset: end > 32768 ? end - 32768 : 0)
+        return (try? handle.readToEnd()).map { String(decoding: $0, as: UTF8.self) } ?? ""
     }
 
     private static func timestamp() -> String {
@@ -168,13 +307,16 @@ final class Launcher {
     enum LaunchError: LocalizedError {
         case runtimeMissing
         case fileMissing(String)
+        case updateInProgress
 
         var errorDescription: String? {
             switch self {
             case .runtimeMissing:
-                return "Keine Runtime gefunden. Bitte zuerst build-wine.sh oder make-runtime-from-brew.sh ausführen und in den Einstellungen den Runtime-Pfad prüfen."
+                return "Die Windows-Runtime fehlt. Bitte installiere Virtual aus dem vollständigen App-Archiv erneut."
             case .fileMissing(let p):
                 return "Datei nicht gefunden: \(p)"
+            case .updateInProgress:
+                return "Virtual wird gerade aktualisiert. Bitte warte, bis die App neu gestartet ist."
             }
         }
     }

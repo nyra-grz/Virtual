@@ -9,6 +9,7 @@
 set -uo pipefail
 
 ROOT="${WINMAC_ROOT:-$HOME/WinMac_Virtual}"
+ASSETS="${WINMAC_ASSETS_ROOT:-$ROOT}"
 RUNTIME="${WINMAC_RUNTIME:-$ROOT/runtime}"
 export WINEPREFIX="${WINEPREFIX:-$ROOT/prefix}"
 VERSION="${1:-win10}"
@@ -54,6 +55,35 @@ run_logged "$BIN/virtualboot" -i || fail "virtualboot ist gescheitert (Exitcode 
 
 # wineboot arbeitet nach dem Rückkehren teils noch im Hintergrund weiter.
 wait_server 30
+
+# Module, die eine neuere Runtime mitbringt (winegstreamer für Video), legt Wine nur
+# beim Anlegen eines Raums nach system32. In bestehende Räume nur die fehlenden
+# übernehmen – vorhandene Dateien (auch native wie .NET) bleiben unberührt –
+# und neu übernommene Module registrieren (COM-Klassen wie Medien-Decoder).
+WINE_LIB="$RUNTIME/wine-build/lib/wine"
+ADDED64=() ADDED32=()
+for pair in "x86_64-windows:system32" "i386-windows:syswow64"; do
+    arch="${pair%%:*}" sys="$WINEPREFIX/drive_c/windows/${pair#*:}"
+    [ -d "$WINE_LIB/$arch" ] && [ -d "$sys" ] || continue
+    # Nur Module, die Virtual nach dem ersten Release ergänzt hat; andere legt Wine
+    # bewusst woanders ab (z. B. mscorwks, wbem, speech).
+    for name in winegstreamer.dll; do
+        dll="$WINE_LIB/$arch/$name"
+        [ -f "$dll" ] && [ ! -e "$sys/$name" ] || continue
+        cp "$dll" "$sys/$name" || continue
+        if [ "$arch" = x86_64-windows ]; then ADDED64+=("$name"); else ADDED32+=("$name"); fi
+    done
+done
+if [ "${#ADDED64[@]}" -gt 0 ] || [ "${#ADDED32[@]}" -gt 0 ]; then
+    echo "==> Neue Wine-Module übernommen: ${ADDED64[*]:-} ${ADDED32[*]:-}"
+    for name in "${ADDED64[@]:-}"; do
+        [ -n "$name" ] && "$BIN/virtual" regsvr32 /s "$name" >/dev/null 2>&1
+    done
+    for name in "${ADDED32[@]:-}"; do
+        [ -n "$name" ] && "$BIN/virtual" 'C:\windows\syswow64\regsvr32.exe' /s "$name" >/dev/null 2>&1
+    done
+    wait_server 30
+fi
 
 echo "==> Setze Version und Fingerprint-Registry (Windows 10 Pro / Build 19045)…"
 EXPECTED=()   # "Schlüssel|name Typ Wert", so wie reg query es (normalisiert) ausgibt
@@ -146,7 +176,8 @@ rm -f "$cursor_query"
 # .NET: nur anbieten, wenn eine Datei bereitliegt (kein Zwang, kein Download hier).
 DOTNET="${WINMAC_DOTNET:-$HOME/Downloads/dotnet-desktop.exe}"
 DOTNET_FAILED=0
-if [ -f "$DOTNET" ]; then
+# Do not guess or run an unrelated installer found in the user's Downloads.
+if [ -n "${WINMAC_DOTNET:-}" ] && [ -f "$DOTNET" ]; then
     echo "==> Installiere .NET Desktop Runtime ($DOTNET)…"
     run_logged "$BIN/virtual" "$DOTNET" /install /quiet /norestart
     status=$?
@@ -155,22 +186,19 @@ if [ -f "$DOTNET" ]; then
         echo "    Hinweis: Der .NET-Installer meldete Exitcode $status – .NET fehlt eventuell."
     fi
 else
-    echo "==> .NET-Installer nicht gefunden ($DOTNET) – übersprungen."
-    echo "    (Zum Mitinstallieren dotnet-desktop.exe dorthin legen oder WINMAC_DOTNET setzen.)"
+    echo "==> Wine Mono ist die Standard-.NET-Laufzeit; vorhandenes Microsoft .NET bleibt erhalten."
 fi
 
-# DirectX 10/11 wie im Standard-Raum über DXVK. Ohne DXVK scheitert in einem neuen
-# Raum schon D3D11CreateDevice (z. B. Epic Games Launcher stürzt sofort ab).
-# Nur aus dem bereits geladenen Paket, kein Download hier; schlägt es fehl, bleibt
+# DirectX 10/11 über DXVK (DXMT pro Raum mit setup-graphics.sh --dxmt). Ohne das scheitert in einem
+# neuen Raum schon D3D11CreateDevice (z. B. Epic Games Launcher stürzt sofort ab).
+# Nur aus den bereits geladenen Paketen, kein Download hier; schlägt es fehl, bleibt
 # der Raum bei WineD3D.
-if [ -s "$ROOT/thirdparty/graphics/dxvk.tar.gz" ] && [ -x "$ROOT/setup-graphics.sh" ]; then
-    echo "==> Richte DXVK (DirectX 10/11) ein…"
-    if ! run_logged "$ROOT/setup-graphics.sh"; then
-        echo "    Hinweis: DXVK-Einrichtung fehlgeschlagen – der Raum nutzt WineD3D."
-    fi
+if { [ -s "$ASSETS/thirdparty/graphics/dxmt.tar.gz" ] || [ -s "$ASSETS/thirdparty/graphics/dxvk.tar.gz" ]; } && [ -f "$ASSETS/setup-graphics.sh" ]; then
+    echo "==> Richte DirectX 10/11 ein…"
+    run_logged /bin/bash "$ASSETS/setup-graphics.sh" || fail "Grafikunterstützung konnte nicht eingerichtet werden. Bitte die Einrichtung erneut starten."
 else
-    echo "==> DXVK-Paket nicht geladen – übersprungen."
-    echo "    (Einmal ./setup-graphics.sh ausführen, dann bekommen neue Räume DXVK.)"
+    echo "==> Grafikpakete nicht geladen – übersprungen."
+    echo "    (Einmal ./setup-graphics.sh ausführen, dann bekommen neue Räume DXMT/DXVK.)"
 fi
 
 # Registry auf die Platte schreiben lassen (endet der Server, speichert er sie).

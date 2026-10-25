@@ -7,7 +7,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNTIME="$ROOT/runtime"
+RUNTIME="${WINMAC_RUNTIME:-$ROOT/runtime}"
 BINDIR="$RUNTIME/bin"
 
 # --- Wine-Installation finden -------------------------------------------------
@@ -43,49 +43,14 @@ echo "==> Nutze Wine aus: $WINE_BIN"
 # Wine-Installationen bringen Mono selbst mit und werden nicht verändert.
 if [ "$WINE_BIN" = "$RUNTIME/wine-build/bin" ]; then
     "$ROOT/scripts/setup-managed-runtime.sh"
+    # Braucht den msv1_0-Patch 0013; ohne uv bleibt nur die lokale Anmeldung aus.
+    "$ROOT/scripts/setup-local-auth.sh" || echo "    (lokale Windows-Anmeldung nicht eingerichtet)"
 fi
 
 mkdir -p "$BINDIR"
 
-# --- Wrapper erzeugen ---------------------------------------------------------
-# Jeder virtual*-Befehl setzt sinnvolle Vorgaben und ruft das echte Wine-Binary auf.
-make_wrapper() {
-    local name="$1" target="$2" prefixcmd="${3:-}"
-    cat > "$BINDIR/$name" <<WRAP
-#!/bin/bash
-# Virtual – umbenannter Front-End-Befehl ($name -> $target)
-set -uo pipefail
-WINE_BIN="\${WINMAC_WINE_BIN:-$WINE_BIN}"
-export WINEPREFIX="\${WINEPREFIX:-$HOME/WinMac_Virtual/prefix}"
-export WINEDEBUG="\${WINEDEBUG:-err+all}"
-# .NET und HTML nicht global deaktivieren; installierte Laufzeiten müssen laden können.
-export WINEDLLOVERRIDES="\${WINEDLLOVERRIDES-}"
-# Grafik-Runtime (MoltenVK/DXVK/VKD3D), falls eingerichtet
-[ -f "$RUNTIME/graphics-env.sh" ] && source "$RUNTIME/graphics-env.sh"
-exec "\$WINE_BIN/$target" $prefixcmd "\$@"
-WRAP
-    chmod +x "$BINDIR/$name"
-}
-
-make_wrapper virtual      wine
-make_wrapper virtualcfg   winecfg
-make_wrapper virtualpath  winepath
-make_wrapper virtualserver wineserver
-
-# virtualboot: eigener Befehl oder 'wine wineboot'
-if [ -x "$WINE_BIN/wineboot" ]; then
-    make_wrapper virtualboot wineboot
-else
-    cat > "$BINDIR/virtualboot" <<WRAP
-#!/bin/bash
-set -uo pipefail
-WINE_BIN="\${WINMAC_WINE_BIN:-$WINE_BIN}"
-export WINEPREFIX="\${WINEPREFIX:-$HOME/WinMac_Virtual/prefix}"
-export WINEDEBUG="\${WINEDEBUG:-err+all}"
-exec "\$WINE_BIN/wine" wineboot "\$@"
-WRAP
-    chmod +x "$BINDIR/virtualboot"
-fi
+# Use relocatable wrappers for both source builds and external development runtimes.
+"$ROOT/scripts/write-runtime-wrappers.sh" "$RUNTIME" "$WINE_BIN"
 
 # Herkunft dokumentieren
 cat > "$RUNTIME/RUNTIME.txt" <<INFO

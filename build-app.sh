@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APPDIR="$ROOT/app"
 NAME="Virtual"
-BUNDLE="$ROOT/build/$NAME.app"
+BUNDLE="${WINMAC_APP_BUNDLE:-$ROOT/build/$NAME.app}"
 CONTENTS="$BUNDLE/Contents"
 # Version aus VERSION (WINMAC_VERSION überschreibt, z. B. zum Testen des Auto-Updaters).
 VERSION="${WINMAC_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null || echo 0.0.0)}"
@@ -56,7 +56,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
             <key>CFBundleTypeRole</key><string>Shell</string>
             <key>LSHandlerRank</key><string>Alternate</string>
             <key>CFBundleTypeExtensions</key>
-            <array><string>exe</string><string>msi</string></array>
+            <array><string>exe</string><string>msi</string><string>lnk</string></array>
             <key>LSItemContentTypes</key>
             <array>
                 <string>com.microsoft.windows-executable</string>
@@ -87,10 +87,25 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
         -o "$CONTENTS/Resources/certimport.exe" -lcrypt32
     x86_64-w64-mingw32-gcc -municode -O2 -s "$ROOT/app/Helpers/program-runner.c" \
         -o "$CONTENTS/Resources/program-runner.exe" -lole32 -luuid
+elif [ "${WINMAC_BUNDLE_ENGINE:-0}" = 1 ]; then
+    echo "Release benötigt mingw-w64 für die Windows-Helfer." >&2
+    exit 1
+fi
+
+# Developer builds stay small; every public release includes its tested engine.
+if [ "${WINMAC_BUNDLE_ENGINE:-0}" = 1 ]; then
+    "$ROOT/scripts/package-engine.sh" "$CONTENTS/Resources/Engine"
 fi
 
 # Ad-hoc-Signatur, damit macOS die App ohne Gatekeeper-Murren lokal startet.
-codesign --force --deep --sign - "$BUNDLE" >/dev/null 2>&1 || echo "   (Signatur übersprungen)"
+# Finder display metadata is not code and is rejected by codesign. Keep security
+# attributes (including quarantine) intact; remove only the two disallowed forks.
+xattr -dr com.apple.FinderInfo "$BUNDLE" >/dev/null 2>&1 || true
+xattr -dr com.apple.ResourceFork "$BUNDLE" >/dev/null 2>&1 || true
+if ! codesign --force --deep --sign - "$BUNDLE" >/dev/null 2>&1; then
+    if [ "${WINMAC_BUNDLE_ENGINE:-0}" = 1 ]; then echo "Release-Signierung fehlgeschlagen." >&2; exit 1; fi
+    echo "   (Signatur übersprungen)"
+fi
 
 echo "==> Fertig: $BUNDLE  (Version $VERSION, Build $BUILD_NUMBER)"
 echo "   Starten mit:  open \"$BUNDLE\""

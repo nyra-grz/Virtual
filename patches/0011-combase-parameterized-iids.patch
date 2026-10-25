@@ -1,0 +1,341 @@
+combase: Implement RoGetParameterizedTypeInstanceIID.
+Generic WinRT interfaces (IVector<T>, IAsyncOperation<T>, TypedEventHandler<...>) are
+identified by a GUID derived from their type signature (SHA-1, UUID v5 as specified by
+the WinRT type system). The stub returned E_NOTIMPL, so the CLR and C++/WinRT could
+not build these interfaces. The signature is built through IRoMetaDataLocator /
+IRoSimpleMetaDataBuilder like on Windows. Test: winrt/tests/projection.c.
+
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index a88181ad..6237850c 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -205,19 +205,6 @@ done:
+     return hr;
+ }
+ 
+-/***********************************************************************
+- *      RoGetParameterizedTypeInstanceIID (combase.@)
+- */
+-HRESULT WINAPI RoGetParameterizedTypeInstanceIID(UINT32 name_element_count, const WCHAR **name_elements,
+-                                                 const IRoMetaDataLocator *meta_data_locator, GUID *iid,
+-                                                 ROPARAMIIDHANDLE *hiid)
+-{
+-    FIXME("stub: %d %p %p %p %p\n", name_element_count, name_elements, meta_data_locator, iid, hiid);
+-    if (iid) *iid = GUID_NULL;
+-    if (hiid) *hiid = INVALID_HANDLE_VALUE;
+-    return E_NOTIMPL;
+-}
+-
+ /***********************************************************************
+  *      RoActivateInstance (combase.@)
+  */
+diff --git a/dlls/combase/Makefile.in b/dlls/combase/Makefile.in
+index f0acc337..a335ae7e 100644
+--- a/dlls/combase/Makefile.in
++++ b/dlls/combase/Makefile.in
+@@ -14,6 +14,7 @@ SOURCES = \
+ 	malloc.c \
+ 	marshal.c \
+ 	roapi.c \
++	parameterized.c \
+ 	rpc.c \
+ 	string.c \
+ 	stubmanager.c \
+diff --git a/dlls/combase/combase.spec b/dlls/combase/combase.spec
+index 9018b013..d1891d58 100644
+--- a/dlls/combase/combase.spec
++++ b/dlls/combase/combase.spec
+@@ -291,7 +291,7 @@
+ @ stub RoCaptureErrorContext
+ @ stub RoClearError
+ @ stub RoFailFastWithErrorContext
+-@ stub RoFreeParameterizedTypeExtra
++@ stdcall RoFreeParameterizedTypeExtra(ptr)
+ @ stub RoGetActivatableClassRegistration
+ @ stdcall RoGetActivationFactory(ptr ptr ptr)
+ @ stdcall RoGetAgileReference(long ptr ptr ptr)
+@@ -306,7 +306,7 @@
+ @ stdcall RoOriginateError(long ptr)
+ @ stdcall RoOriginateErrorW(long long ptr)
+ @ stdcall RoOriginateLanguageException(long ptr ptr)
+-@ stub RoParameterizedTypeExtraGetTypeSignature
++@ stdcall RoParameterizedTypeExtraGetTypeSignature(ptr)
+ @ stdcall RoRegisterActivationFactories(ptr ptr long ptr)
+ @ stdcall RoRegisterForApartmentShutdown(ptr ptr ptr)
+ @ stub RoReportCapabilityCheckFailure
+diff --git a/dlls/combase/parameterized.c b/dlls/combase/parameterized.c
+new file mode 100644
+index 00000000..1eccef37
+--- /dev/null
++++ b/dlls/combase/parameterized.c
+@@ -0,0 +1,270 @@
++/* Parameterized WinRT interface identities, as specified by the WinRT type system.
++ * Copyright 2026 Virtual contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#define COBJMACROS
++#include "objbase.h"
++#include "roparameterizediid.h"
++#include "wincrypt.h"
++#include "wine/debug.h"
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++WINE_DEFAULT_DEBUG_CHANNEL(combase);
++
++struct signature_builder
++{
++    IRoSimpleMetaDataBuilder IRoSimpleMetaDataBuilder_iface;
++    const IRoMetaDataLocator *locator;
++    const WCHAR **elements;
++    UINT32 count, position, depth;
++    char *text;
++    SIZE_T length, capacity;
++    HRESULT error;
++    BOOL described;
++};
++
++static struct signature_builder *impl_from_builder(IRoSimpleMetaDataBuilder *iface)
++{
++    return CONTAINING_RECORD(iface, struct signature_builder, IRoSimpleMetaDataBuilder_iface);
++}
++
++static HRESULT append(struct signature_builder *b, const char *text)
++{
++    SIZE_T length = strlen(text), capacity;
++    char *next;
++    if (FAILED(b->error)) return b->error;
++    if (length > 16 * 1024 * 1024 || b->length > 16 * 1024 * 1024 - length)
++        return b->error = E_INVALIDARG;
++    if (b->length + length + 1 > b->capacity)
++    {
++        capacity = max(b->length + length + 1, b->capacity * 2 + 128);
++        if (!(next = realloc(b->text, capacity))) return b->error = E_OUTOFMEMORY;
++        b->text = next;
++        b->capacity = capacity;
++    }
++    memcpy(b->text + b->length, text, length + 1);
++    b->length += length;
++    return S_OK;
++}
++
++static HRESULT append_wide(struct signature_builder *b, const WCHAR *text)
++{
++    char *utf8;
++    int size;
++    HRESULT hr;
++    if (!text) return b->error = E_INVALIDARG;
++    if (!(size = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL))) return b->error = E_INVALIDARG;
++    if (!(utf8 = malloc(size))) return b->error = E_OUTOFMEMORY;
++    WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, size, NULL, NULL);
++    hr = append(b, utf8);
++    free(utf8);
++    return hr;
++}
++
++static HRESULT append_guid(struct signature_builder *b, const GUID *iid)
++{
++    char text[39];
++    if (!iid) return b->error = E_INVALIDARG;
++    snprintf(text, sizeof(text), "{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
++            iid->Data1, iid->Data2, iid->Data3, iid->Data4[0], iid->Data4[1],
++            iid->Data4[2], iid->Data4[3], iid->Data4[4], iid->Data4[5], iid->Data4[6], iid->Data4[7]);
++    return append(b, text);
++}
++
++static HRESULT append_type(struct signature_builder *b);
++
++static HRESULT append_named_type(struct signature_builder *b, UINT32 count, const WCHAR **elements)
++{
++    const WCHAR **saved_elements = b->elements;
++    UINT32 saved_count = b->count, saved_position = b->position;
++    HRESULT hr;
++    b->elements = elements;
++    b->count = count;
++    b->position = 0;
++    hr = append_type(b);
++    if (SUCCEEDED(hr) && b->position != count) hr = b->error = E_INVALIDARG;
++    b->elements = saved_elements;
++    b->count = saved_count;
++    b->position = saved_position;
++    return hr;
++}
++
++static HRESULT WINAPI builder_interface(IRoSimpleMetaDataBuilder *iface, GUID iid)
++{
++    struct signature_builder *b = impl_from_builder(iface);
++    b->described = TRUE;
++    return append_guid(b, &iid);
++}
++
++static HRESULT WINAPI builder_delegate(IRoSimpleMetaDataBuilder *iface, GUID iid)
++{
++    struct signature_builder *b = impl_from_builder(iface);
++    b->described = TRUE;
++    append(b, "delegate("); append_guid(b, &iid);
++    return append(b, ")");
++}
++
++static HRESULT simple_default(struct signature_builder *b, const char *prefix, const WCHAR *name,
++        const WCHAR *default_name, const GUID *iid)
++{
++    b->described = TRUE;
++    append(b, prefix); append_wide(b, name); append(b, ";");
++    if (iid) append_guid(b, iid);
++    else if (default_name) append_named_type(b, 1, &default_name);
++    else b->error = E_INVALIDARG;
++    return append(b, ")");
++}
++
++static HRESULT WINAPI builder_group(IRoSimpleMetaDataBuilder *iface, const WCHAR *name,
++        const WCHAR *default_name, const GUID *iid)
++{
++    return simple_default(impl_from_builder(iface), "ig(", name, default_name, iid);
++}
++
++static HRESULT WINAPI builder_class(IRoSimpleMetaDataBuilder *iface, const WCHAR *name,
++        const WCHAR *default_name, const GUID *iid)
++{
++    return simple_default(impl_from_builder(iface), "rc(", name, default_name, iid);
++}
++
++static HRESULT parameterized_default(struct signature_builder *b, const char *prefix,
++        const WCHAR *name, UINT32 count, const WCHAR **elements)
++{
++    b->described = TRUE;
++    append(b, prefix); append_wide(b, name); append(b, ";");
++    append_named_type(b, count, elements);
++    return append(b, ")");
++}
++
++static HRESULT WINAPI builder_parameterized_group(IRoSimpleMetaDataBuilder *iface,
++        const WCHAR *name, UINT32 count, const WCHAR **elements)
++{
++    return parameterized_default(impl_from_builder(iface), "ig(", name, count, elements);
++}
++
++static HRESULT WINAPI builder_parameterized_class(IRoSimpleMetaDataBuilder *iface,
++        const WCHAR *name, UINT32 count, const WCHAR **elements)
++{
++    return parameterized_default(impl_from_builder(iface), "rc(", name, count, elements);
++}
++
++static HRESULT WINAPI builder_struct(IRoSimpleMetaDataBuilder *iface, const WCHAR *name,
++        UINT32 count, const WCHAR **fields)
++{
++    struct signature_builder *b = impl_from_builder(iface);
++    UINT32 i;
++    b->described = TRUE;
++    if (count && !fields) return b->error = E_INVALIDARG;
++    append(b, "struct("); append_wide(b, name);
++    for (i = 0; i < count && SUCCEEDED(b->error); ++i)
++    {
++        append(b, ";");
++        append_named_type(b, 1, &fields[i]);
++    }
++    return append(b, ")");
++}
++
++static HRESULT WINAPI builder_enum(IRoSimpleMetaDataBuilder *iface, const WCHAR *name, const WCHAR *base)
++{
++    struct signature_builder *b = impl_from_builder(iface);
++    b->described = TRUE;
++    if (!base || (wcscmp(base, L"Int32") && wcscmp(base, L"UInt32"))) return b->error = E_INVALIDARG;
++    append(b, "enum("); append_wide(b, name); append(b, ";");
++    append_named_type(b, 1, &base);
++    return append(b, ")");
++}
++
++static HRESULT WINAPI builder_parameterized(IRoSimpleMetaDataBuilder *iface, GUID iid, UINT32 count)
++{
++    struct signature_builder *b = impl_from_builder(iface);
++    UINT32 i;
++    b->described = TRUE;
++    if (!count || count > b->count - b->position) return b->error = E_INVALIDARG;
++    append(b, "pinterface("); append_guid(b, &iid);
++    for (i = 0; i < count && SUCCEEDED(b->error); ++i)
++    {
++        append(b, ";");
++        append_type(b);
++    }
++    return append(b, ")");
++}
++
++static const IRoSimpleMetaDataBuilderVtbl builder_vtbl =
++{
++    builder_interface, builder_delegate, builder_group, builder_parameterized_group,
++    builder_class, builder_parameterized_class, builder_struct, builder_enum,
++    builder_parameterized, builder_parameterized
++};
++
++static HRESULT append_type(struct signature_builder *b)
++{
++    static const struct { const WCHAR *name; const char *signature; } primitives[] =
++    {
++        {L"UInt8", "u1"}, {L"Int16", "i2"}, {L"UInt16", "u2"}, {L"Int32", "i4"}, {L"UInt32", "u4"},
++        {L"Int64", "i8"}, {L"UInt64", "u8"}, {L"Single", "f4"}, {L"Double", "f8"}, {L"Boolean", "b1"},
++        {L"Char16", "c2"}, {L"String", "string"}, {L"Guid", "g16"}, {L"Object", "cinterface(IInspectable)"},
++    };
++    const WCHAR *name;
++    unsigned int i;
++    HRESULT hr;
++    if (FAILED(b->error)) return b->error;
++    if (!b->elements || b->position >= b->count || b->depth >= 64) return b->error = E_INVALIDARG;
++    if (!(name = b->elements[b->position++]) || !*name) return b->error = E_INVALIDARG;
++    TRACE("type %s\n", debugstr_w(name));
++    for (i = 0; i < ARRAY_SIZE(primitives); ++i)
++        if (!wcscmp(name, primitives[i].name)) return append(b, primitives[i].signature);
++    if (!b->locator) return b->error = E_INVALIDARG;
++    ++b->depth;
++    b->described = FALSE;
++    hr = IRoMetaDataLocator_Locate(b->locator, name, &b->IRoSimpleMetaDataBuilder_iface);
++    --b->depth;
++    if (FAILED(hr)) b->error = hr;
++    else if (!b->described) b->error = E_INVALIDARG;
++    if (FAILED(b->error)) WARN("type %s failed: %#lx\n", debugstr_w(name), b->error);
++    return b->error;
++}
++
++HRESULT WINAPI RoGetParameterizedTypeInstanceIID(UINT32 count, const WCHAR **elements,
++        const IRoMetaDataLocator *locator, GUID *iid, ROPARAMIIDHANDLE *extra)
++{
++    static const BYTE namespace_bytes[] = {0x11,0xf4,0x7a,0xd5,0x7b,0x73,0x42,0xc0,0xab,0xae,0x87,0x8b,0x1e,0x16,0xad,0xee};
++    struct signature_builder b = {{&builder_vtbl}, locator, elements, count};
++    HCRYPTPROV provider = 0;
++    HCRYPTHASH hash = 0;
++    BYTE digest[20];
++    DWORD size = sizeof(digest);
++    HRESULT hr;
++    if (iid) *iid = GUID_NULL;
++    if (extra) *extra = NULL;
++    if (!iid || !count || !elements || count > 65536) return E_INVALIDARG;
++    hr = append_type(&b);
++    if (SUCCEEDED(hr) && b.position != count) hr = E_INVALIDARG;
++    if (SUCCEEDED(hr))
++    {
++        if (!CryptAcquireContextW(&provider, NULL, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)
++                || !CryptCreateHash(provider, CALG_SHA1, 0, 0, &hash)
++                || !CryptHashData(hash, namespace_bytes, sizeof(namespace_bytes), 0)
++                || !CryptHashData(hash, (const BYTE *)b.text, b.length, 0)
++                || !CryptGetHashParam(hash, HP_HASHVAL, digest, &size, 0)) hr = HRESULT_FROM_WIN32(GetLastError());
++        else
++        {
++            iid->Data1 = ((DWORD)digest[0] << 24) | ((DWORD)digest[1] << 16) | ((DWORD)digest[2] << 8) | digest[3];
++            iid->Data2 = ((WORD)digest[4] << 8) | digest[5];
++            iid->Data3 = ((((WORD)digest[6] << 8) | digest[7]) & 0x0fff) | 0x5000;
++            memcpy(iid->Data4, digest + 8, 8);
++            iid->Data4[0] = (iid->Data4[0] & 0x3f) | 0x80;
++            TRACE("%s -> %s\n", b.text, debugstr_guid(iid));
++            if (extra) { *extra = b.text; b.text = NULL; }
++        }
++    }
++    if (hash) CryptDestroyHash(hash);
++    if (provider) CryptReleaseContext(provider, 0);
++    free(b.text);
++    if (FAILED(hr)) WARN("Parameterized IID failed: %#lx\n", hr);
++    return hr;
++}
++
++void WINAPI RoFreeParameterizedTypeExtra(ROPARAMIIDHANDLE extra) { free(extra); }
++const char *WINAPI RoParameterizedTypeExtraGetTypeSignature(ROPARAMIIDHANDLE extra) { return extra; }

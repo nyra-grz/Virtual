@@ -1,0 +1,392 @@
+ntdll, win32u, ws2_32, wine.inf: Chromium-based browsers (Edge, Chrome, Electron, CEF) work.
+- Chromium renders from a GPU process into the browser process' windows, which macOS does not
+  allow across processes (black/white page). Its sandbox needs Windows security features Wine
+  lacks, so no renderer starts and every tab stays empty. ntdll adds --in-process-gpu and
+  --no-sandbox to the browser process of Chromium-based programs (libcef.dll/chrome_elf.dll
+  next to the exe, Electron's icudtl.dat + resources.pak, or msedge/chrome/... exe names), both
+  for processes started by other Windows programs and for the first process of a prefix;
+  subprocesses (--type=) are left alone. VIRTUAL_CHROMIUM_GPU_PROCESS=1 disables it.
+  wine.inf sets the browsers' CommandLineFlagSecurityWarningsEnabled policy to 0, so no
+  warning bar about the flag appears.
+- ws2_32 implements SIO_ADDRESS_LIST_SORT (order kept as given). Chromium's built-in DNS client
+  failed every lookup with WSAEOPNOTSUPP, so no page loaded.
+- DefWindowProc's SC_MAXIMIZE shows a hidden top-level window without activating it. Chromium
+  maximizes its window in the middle of construction and crashed on the early WM_ACTIVATE
+  (BrowserView::OnWidgetActivationChanged on a null keybinding registry); it activates the
+  window itself when it shows it.
+- Windows that extend their client area into the caption (custom title bars: Chromium's tab
+  strip, Electron, Office) keep that area visible below the Mac title bar instead of having it
+  cut off: the visible rect always contains the client rect.
+- wine.inf maps the Windows CJK font names (MS UI Gothic, SimSun, PMingLiU, Gulim, Meiryo,
+  Microsoft YaHei/JhengHei, Malgun Gothic ...) to the Mac's Hiragino Sans, Hiragino Sans GB,
+  Heiti TC and Apple SD Gothic Neo, so the default font links of Tahoma & Co. find glyphs and
+  Japanese/Chinese/Korean text is no longer drawn as boxes.
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+index 0fb7c59e..826cd93a 100644
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1879,6 +1879,10 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
+  *
+  * Build process parameters from scratch, for processes without a parent.
+  */
++#ifdef __APPLE__
++static void add_chromium_switches( RTL_USER_PROCESS_PARAMETERS *params, WCHAR *dst );
++#endif
++
+ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
+ {
+     static const WCHAR valueW[] = {'1',0};
+@@ -1960,6 +1964,9 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
+             + (wcslen( cmdline ) + 1) * sizeof(WCHAR)  /* command line */
+             + (wcslen( main_wargv[0] ) + 1) * sizeof(WCHAR) * 2 /* image path + window title */
+             + env_pos * sizeof(WCHAR));
++#ifdef __APPLE__
++    size += (wcslen( cmdline ) + 64) * sizeof(WCHAR);  /* room for add_chromium_switches */
++#endif
+ 
+     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&params, 0, &size,
+                                       MEM_COMMIT, PAGE_READWRITE );
+@@ -1988,6 +1995,9 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
+     params->EnvironmentSize = env_pos * sizeof(WCHAR);
+     memcpy( dst, env, env_pos * sizeof(WCHAR) );
+     free( env );
++#ifdef __APPLE__
++    add_chromium_switches( params, dst + env_pos );
++#endif
+ 
+     get_initial_console( params );
+ 
+@@ -1995,6 +2005,94 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
+ }
+ 
+ 
++#ifdef __APPLE__
++/* Chromium (Chrome, Edge, Electron, CEF) draws from a separate GPU process into the
++ * browser process' windows. On macOS a process cannot draw into another process'
++ * windows, so the page stays black; with the GPU thread in the browser process it
++ * works. Done for Chromium-based programs; VIRTUAL_CHROMIUM_GPU_PROCESS=1 keeps
++ * Chromium's default. */
++static BOOL is_chromium_program( const UNICODE_STRING *image )
++{
++    static const char *exe_names[] = { "msedge.exe", "chrome.exe", "msedgewebview2.exe", "brave.exe",
++                                       "vivaldi.exe", "opera.exe" };
++    static const char *markers[] = { "libcef.dll", "chrome_elf.dll" };
++    char *unix_name = NULL, *slash, *path;
++    struct stat st;
++    BOOL ret = FALSE;
++    unsigned int i;
++    size_t dir_len;
++
++    if (getenv( "VIRTUAL_CHROMIUM_GPU_PROCESS" )) return FALSE;
++    if (!image->Buffer || ntdll_get_unix_file_name( image->Buffer, &unix_name, FILE_OPEN ) || !unix_name) return FALSE;
++    if (!(slash = strrchr( unix_name, '/' )) || !(path = malloc( strlen( unix_name ) + 32 )))
++    {
++        free( unix_name );
++        return FALSE;
++    }
++    dir_len = slash + 1 - unix_name;
++    memcpy( path, unix_name, dir_len );
++    for (i = 0; i < ARRAY_SIZE(exe_names) && !ret; i++) ret = !strcasecmp( slash + 1, exe_names[i] );
++    for (i = 0; i < ARRAY_SIZE(markers) && !ret; i++)
++    {
++        strcpy( path + dir_len, markers[i] );
++        ret = !stat( path, &st );
++    }
++    if (!ret)
++    {
++        /* Electron: icudtl.dat next to resources.pak */
++        strcpy( path + dir_len, "icudtl.dat" );
++        if (!stat( path, &st ))
++        {
++            strcpy( path + dir_len, "resources.pak" );
++            ret = !stat( path, &st );
++        }
++    }
++    free( path );
++    free( unix_name );
++    return ret;
++}
++
++/* appends the switches behind the environment, in the room reserved for it */
++static void add_chromium_switches( RTL_USER_PROCESS_PARAMETERS *params, WCHAR *dst )
++{
++    /* --no-sandbox: Chromium's sandbox needs Windows security features Wine doesn't have;
++     * without it no renderer starts and every tab stays empty. */
++    static const WCHAR gpu[] = {' ','-','-','i','n','-','p','r','o','c','e','s','s','-','g','p','u',0};
++    static const WCHAR sandbox[] = {' ','-','-','n','o','-','s','a','n','d','b','o','x',0};
++    static const WCHAR *switches[] = { gpu, sandbox };
++    static const WCHAR type[] = {'-','-','t','y','p','e','=',0};
++    UNICODE_STRING *cmdline = &params->CommandLine;
++    size_t i, j, len, type_len = ARRAY_SIZE(type) - 1, count = cmdline->Length / sizeof(WCHAR);
++    BOOL present[ARRAY_SIZE(switches)] = {0};
++    WCHAR *p;
++
++    /* Only the browser process; subprocesses (--type=...) like crashpad parse strictly. */
++    for (i = 0; i + type_len <= count; i++)
++        if (!memcmp( cmdline->Buffer + i, type, type_len * sizeof(WCHAR) )) return;
++    for (j = 0; j < ARRAY_SIZE(switches); j++)
++    {
++        for (len = 0; switches[j][len + 1]; len++) ;
++        for (i = 0; i + len <= count && !present[j]; i++)
++            present[j] = !memcmp( cmdline->Buffer + i, switches[j] + 1, len * sizeof(WCHAR) );
++    }
++    if (present[0] && present[1]) return;
++    if (!is_chromium_program( &params->ImagePathName )) return;
++    memcpy( dst, cmdline->Buffer, cmdline->Length );
++    p = dst + count;
++    for (j = 0; j < ARRAY_SIZE(switches); j++)
++    {
++        if (present[j]) continue;
++        for (len = 0; switches[j][len]; len++) ;
++        memcpy( p, switches[j], len * sizeof(WCHAR) );
++        p += len;
++    }
++    *p = 0;
++    cmdline->Buffer = dst;
++    cmdline->Length = (p - dst) * sizeof(WCHAR);
++    cmdline->MaximumLength = cmdline->Length + sizeof(WCHAR);
++}
++#endif
++
+ /*************************************************************************
+  *		init_startup_info
+  */
+@@ -2045,7 +2143,8 @@ void init_startup_info(void)
+             + info->desktop_len + sizeof(WCHAR)
+             + info->shellinfo_len + sizeof(WCHAR)
+             + info->runtime_len + sizeof(WCHAR)
+-            + env_pos * sizeof(WCHAR));
++            + env_pos * sizeof(WCHAR)
++            + info->cmdline_len + 64 * sizeof(WCHAR)); /* room for add_chromium_switches */
+ 
+     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&params, 0, &size,
+                                       MEM_COMMIT, PAGE_READWRITE );
+@@ -2099,6 +2198,7 @@ void init_startup_info(void)
+     params->Environment = dst;
+     params->EnvironmentSize = env_pos * sizeof(WCHAR);
+     memcpy( dst, env, env_pos * sizeof(WCHAR) );
++    dst += env_pos;
+     free( env );
+     free( info );
+ 
+@@ -2108,6 +2208,9 @@ void init_startup_info(void)
+         MESSAGE( "wine: failed to start %s: %x\n", debugstr_us(&params->ImagePathName), status );
+         NtTerminateProcess( GetCurrentProcess(), status );
+     }
++#ifdef __APPLE__
++    add_chromium_switches( params, dst );
++#endif
+     rebuild_argv();
+     main_wargv = build_wargv( params->ImagePathName.Buffer );
+     free( nt_name.Buffer );
+diff --git a/dlls/win32u/defwnd.c b/dlls/win32u/defwnd.c
+index 885af182..3d458046 100644
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -994,7 +994,14 @@ static LRESULT handle_sys_command( HWND hwnd, WPARAM wparam, LPARAM lparam )
+ 
+     case SC_MAXIMIZE:
+         if (is_iconic(hwnd)) NtUserShowOwnedPopups( hwnd, TRUE );
+-        NtUserShowWindow( hwnd, SW_MAXIMIZE );
++        /* Virtual: Ein noch unsichtbares Fenster beim Maximieren nicht schon aktivieren.
++         * Chromium (Edge, Chrome, CEF) maximiert sein Fenster mitten im Aufbau und stürzt ab,
++         * wenn dabei schon WM_ACTIVATE kommt; aktiviert wird es danach beim Anzeigen. */
++        if (!(get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE) &&
++            NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())
++            show_window_no_activate( hwnd, SW_MAXIMIZE );
++        else
++            NtUserShowWindow( hwnd, SW_MAXIMIZE );
+         break;
+ 
+     case SC_CLOSE:
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 71b49760..1a09eeb2 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -276,6 +276,7 @@ extern BOOL is_window_enabled( HWND hwnd );
+ extern BOOL is_window_unicode( HWND hwnd );
+ extern BOOL is_window_visible( HWND hwnd );
+ extern BOOL is_zoomed( HWND hwnd );
++extern BOOL show_window_no_activate( HWND hwnd, INT cmd );
+ extern BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal );
+ extern int get_window_pixel_format( HWND hwnd );
+ extern DWORD get_window_long( HWND hwnd, INT offset );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 4bceb90f..3b18fe67 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2011,6 +2011,17 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
+     visible_rect.right  -= rect.right;
+     visible_rect.top    -= rect.top;
+     visible_rect.bottom -= rect.bottom;
++    /* Virtual: Programme mit eigener Titelleiste (Chromium/Edge, Electron, Office …) legen den
++     * Client-Bereich per WM_NCCALCSIZE bis in die Windows-Titelleiste. Diesen Teil nicht
++     * hinter der Mac-Titelleiste abschneiden (sonst fehlt z. B. die Tableiste); die
++     * Mac-Titelleiste kommt darüber. */
++    if (!IsRectEmpty( &rects->client ))
++    {
++        if (rects->client.left < visible_rect.left) visible_rect.left = max( rects->client.left, rects->window.left );
++        if (rects->client.top < visible_rect.top) visible_rect.top = max( rects->client.top, rects->window.top );
++        if (rects->client.right > visible_rect.right) visible_rect.right = min( rects->client.right, rects->window.right );
++        if (rects->client.bottom > visible_rect.bottom) visible_rect.bottom = min( rects->client.bottom, rects->window.bottom );
++    }
+     if (visible_rect.top >= visible_rect.bottom) visible_rect.bottom = visible_rect.top + 1;
+     if (visible_rect.left >= visible_rect.right) visible_rect.right = visible_rect.left + 1;
+ 
+@@ -4729,7 +4740,7 @@ void update_window_state( HWND hwnd )
+  *
+  * Implementation of ShowWindow and ShowWindowAsync.
+  */
+-static BOOL show_window( HWND hwnd, INT cmd )
++static BOOL show_window_flags( HWND hwnd, INT cmd, UINT extra_swp )
+ {
+     WND *win;
+     HWND parent;
+@@ -4818,6 +4829,8 @@ static BOOL show_window( HWND hwnd, INT cmd )
+         goto done;
+     }
+ 
++    swp |= extra_swp;
++
+     if ((show_flag != was_visible || cmd == SW_SHOWNA) && cmd != SW_SHOWMAXIMIZED && !(swp & SWP_STATECHANGED))
+     {
+         send_message( hwnd, WM_SHOWWINDOW, show_flag, 0 );
+@@ -4918,6 +4931,17 @@ done:
+     return was_visible;
+ }
+ 
++static BOOL show_window( HWND hwnd, INT cmd )
++{
++    return show_window_flags( hwnd, cmd, 0 );
++}
++
++/* Virtual: Zeigt ein Fenster des eigenen Threads, ohne es zu aktivieren. */
++BOOL show_window_no_activate( HWND hwnd, INT cmd )
++{
++    return show_window_flags( hwnd, cmd, SWP_NOACTIVATE );
++}
++
+ /***********************************************************************
+  *           NtUserShowWindowAsync (win32u.@)
+  *
+diff --git a/dlls/ws2_32/socket.c b/dlls/ws2_32/socket.c
+index d4223e93..396a2d26 100644
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -2208,6 +2208,7 @@ static const char *debugstr_wsaioctl(DWORD code)
+         /* IOCTL_NAME(SIO_ACQUIRE_PORT_RESERVATION); */
+         IOCTL_NAME(SIO_ADDRESS_LIST_CHANGE);
+         IOCTL_NAME(SIO_ADDRESS_LIST_QUERY);
++        IOCTL_NAME(SIO_ADDRESS_LIST_SORT);
+         IOCTL_NAME(SIO_ASSOCIATE_HANDLE);
+         /* IOCTL_NAME(SIO_ASSOCIATE_PORT_RESERVATION);
+         IOCTL_NAME(SIO_BASE_HANDLE);
+@@ -2551,6 +2552,50 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID
+         }
+     }
+ 
++    case SIO_ADDRESS_LIST_SORT:
++    {
++        /* Virtual: Chromiums eigener DNS-Client (Edge, Chrome, CEF) bricht ohne diese
++         * Sortierung jede Namensauflösung ab. Die Reihenfolge bleibt wie geliefert;
++         * Chromium probiert die Adressen ohnehin nacheinander durch. */
++        const SOCKET_ADDRESS_LIST *list = in_buff;
++        NTSTATUS status = STATUS_SUCCESS;
++        DWORD ret;
++        int i;
++
++        TRACE("-> SIO_ADDRESS_LIST_SORT request\n");
++
++        if (!in_buff || in_size < FIELD_OFFSET(SOCKET_ADDRESS_LIST, Address[0]) || list->iAddressCount < 0 ||
++            in_size < FIELD_OFFSET(SOCKET_ADDRESS_LIST, Address[list->iAddressCount]))
++        {
++            SetLastError( WSAEINVAL );
++            return -1;
++        }
++        if (!out_buff || out_size < in_size)
++        {
++            *ret_size = in_size;
++            SetLastError( WSAEFAULT );
++            return -1;
++        }
++        if (out_buff != in_buff)
++        {
++            SOCKET_ADDRESS_LIST *out = out_buff;
++
++            memcpy( out_buff, in_buff, in_size );
++            /* Zeiger in den Eingabepuffer auf den Ausgabepuffer umbiegen */
++            for (i = 0; i < out->iAddressCount; i++)
++            {
++                char *addr = (char *)out->Address[i].lpSockaddr;
++                if (addr >= (char *)in_buff && addr < (char *)in_buff + in_size)
++                    out->Address[i].lpSockaddr = (SOCKADDR *)((char *)out_buff + (addr - (char *)in_buff));
++            }
++        }
++        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
++                                 NULL, 0, ret_size, overlapped, completion );
++        *ret_size = in_size;
++        SetLastError( ret );
++        return ret ? -1 : 0;
++    }
++
+     case SIO_GET_EXTENSION_FUNCTION_POINTER:
+     {
+ #define EXTENSION_FUNCTION(x, y) { x, y, #y },
+diff --git a/include/winsock2.h b/include/winsock2.h
+index f7b88322..d8b50d07 100644
+--- a/include/winsock2.h
++++ b/include/winsock2.h
+@@ -378,6 +378,7 @@ extern "C" {
+ #define WS_SIO_ADDRESS_LIST_QUERY             _WSAIOR(WS_IOC_WS2,22)
+ #define WS_SIO_ADDRESS_LIST_CHANGE            _WSAIO(WS_IOC_WS2,23)
+ #define WS_SIO_QUERY_TARGET_PNP_HANDLE        _WSAIOR(WS_IOC_WS2,24)
++#define WS_SIO_ADDRESS_LIST_SORT              _WSAIORW(WS_IOC_WS2,25)
+ #define WS_SIO_GET_INTERFACE_LIST             WS__IOR('t', 127, ULONG)
+ #else /* USE_WS_PREFIX */
+ #undef IOC_VOID
+@@ -426,6 +427,7 @@ extern "C" {
+ #define SIO_ADDRESS_LIST_QUERY     _WSAIOR(IOC_WS2,22)
+ #define SIO_ADDRESS_LIST_CHANGE    _WSAIO(IOC_WS2,23)
+ #define SIO_QUERY_TARGET_PNP_HANDLE _WSAIOR(IOC_WS2,24)
++#define SIO_ADDRESS_LIST_SORT      _WSAIORW(IOC_WS2,25)
+ #define SIO_GET_INTERFACE_LIST     _IOR ('t', 127, ULONG)
+ #endif /* USE_WS_PREFIX */
+ 
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 80a4a062..e6045fb7 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -592,6 +592,33 @@ HKLM,Software\Microsoft\Transaction Server,,16
+ HKLM,Software\Microsoft\WBEM,"Installation Directory",2,"%11%\wbem"
+ HKLM,Software\Microsoft\Windows Messaging Subsystem,"MAPI",2,"1"
+ HKLM,Software\Policies,,16
++; Virtual: Chromium-Browser laufen mit --no-sandbox (siehe ntdll env.c), ohne Warnleiste
++HKLM,Software\Policies\BraveSoftware\Brave,"CommandLineFlagSecurityWarningsEnabled",0x10001,0
++HKLM,Software\Policies\Chromium,"CommandLineFlagSecurityWarningsEnabled",0x10001,0
++HKLM,Software\Policies\Google\Chrome,"CommandLineFlagSecurityWarningsEnabled",0x10001,0
++HKLM,Software\Policies\Microsoft\Edge,"CommandLineFlagSecurityWarningsEnabled",0x10001,0
++; Virtual: Windows-CJK-Schriften auf die des Macs abbilden (Schriftverknüpfung von Tahoma & Co.)
++HKCU,Software\Wine\Fonts\Replacements,"MS UI Gothic",,"Hiragino Sans"
++HKCU,Software\Wine\Fonts\Replacements,"MS Gothic",,"Hiragino Sans"
++HKCU,Software\Wine\Fonts\Replacements,"MS PGothic",,"Hiragino Sans"
++HKCU,Software\Wine\Fonts\Replacements,"Meiryo",,"Hiragino Sans"
++HKCU,Software\Wine\Fonts\Replacements,"Meiryo UI",,"Hiragino Sans"
++HKCU,Software\Wine\Fonts\Replacements,"Yu Gothic",,"Hiragino Sans"
++HKCU,Software\Wine\Fonts\Replacements,"Yu Gothic UI",,"Hiragino Sans"
++HKCU,Software\Wine\Fonts\Replacements,"SimSun",,"Hiragino Sans GB"
++HKCU,Software\Wine\Fonts\Replacements,"NSimSun",,"Hiragino Sans GB"
++HKCU,Software\Wine\Fonts\Replacements,"SimHei",,"Hiragino Sans GB"
++HKCU,Software\Wine\Fonts\Replacements,"Microsoft YaHei",,"Hiragino Sans GB"
++HKCU,Software\Wine\Fonts\Replacements,"Microsoft YaHei UI",,"Hiragino Sans GB"
++HKCU,Software\Wine\Fonts\Replacements,"PMingLiU",,"Heiti TC"
++HKCU,Software\Wine\Fonts\Replacements,"MingLiU",,"Heiti TC"
++HKCU,Software\Wine\Fonts\Replacements,"Microsoft JhengHei",,"Heiti TC"
++HKCU,Software\Wine\Fonts\Replacements,"Microsoft JhengHei UI",,"Heiti TC"
++HKCU,Software\Wine\Fonts\Replacements,"Gulim",,"Apple SD Gothic Neo"
++HKCU,Software\Wine\Fonts\Replacements,"GulimChe",,"Apple SD Gothic Neo"
++HKCU,Software\Wine\Fonts\Replacements,"Dotum",,"Apple SD Gothic Neo"
++HKCU,Software\Wine\Fonts\Replacements,"Batang",,"Apple SD Gothic Neo"
++HKCU,Software\Wine\Fonts\Replacements,"Malgun Gothic",,"Apple SD Gothic Neo"
+ HKLM,Software\Registered Applications,,16
+ HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisable8dot3NameCreation",0x10003,0
+ HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisableLastAccessUpdate",0x10003,0x80000002

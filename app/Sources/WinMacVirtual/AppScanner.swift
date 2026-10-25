@@ -9,6 +9,15 @@ enum AppScanner {
                                        "help", "hilfe", "manual", "handbuch", "documentation", "dokumentation",
                                        "website", "web site", "homepage", "license", "lizenz", "release notes", "changelog"]
 
+    private static func isAuxiliaryName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        if lower.hasPrefix("deinstall") { return true }
+        let words = Set(lower.split { !$0.isLetter && !$0.isNumber }.map(String.init))
+        return ignoredWords.contains { word in
+            word.contains(" ") ? lower.contains(word) : words.contains(word)
+        }
+    }
+
     /// Ordner, in denen Installer Verknüpfungen ablegen. Benutzer-Desktops sind in Wine meist
     /// Links auf den Mac-Schreibtisch und bleiben deshalb außen vor.
     static func folders(of room: Room) -> [URL] {
@@ -33,12 +42,64 @@ enum AppScanner {
             for case let url as URL in walker where url.pathExtension.lowercased() == "lnk" {
                 let name = url.deletingPathExtension().lastPathComponent
                 let lower = name.lowercased()
-                guard !ignoredWords.contains(where: { lower.contains($0) }) else { continue }
+                guard !isAuxiliaryName(name) else { continue }
                 // Dieselbe App im Startmenü und auf dem Desktop nur einmal zeigen.
                 guard seenNames.insert(lower).inserted else { continue }
                 if let target = WindowsIcon.shortcutTarget(url), !target.lowercased().hasSuffix(".exe") { continue }
                 found.append((name, url.path))
             }
+        }
+        // Some installers only register App Paths / Uninstall and never create
+        // a Start menu shortcut. Do not expose every helper .exe in Program Files.
+        var targets = Set(found.compactMap { WindowsIcon.shortcutTarget(URL(fileURLWithPath: $0.path)) }
+            .compactMap { WindowsIcon.unixPath($0, in: room)?.standardizedFileURL.path.lowercased() })
+        for item in registeredApps(in: room) {
+            guard targets.insert(item.path.lowercased()).inserted,
+                  seenNames.insert(item.name.lowercased()).inserted else { continue }
+            found.append(item)
+        }
+        return found
+    }
+
+    static func registeredApps(in room: Room) -> [(name: String, path: String)] {
+        var found: [(name: String, path: String)] = []
+        for file in ["system.reg", "user.reg"] {
+            guard let text = try? String(contentsOf: room.prefixURL.appendingPathComponent(file), encoding: .utf8) else { continue }
+            var section = "", values: [String: String] = [:]
+            func finish() {
+                let appPath = section.contains("\\currentversion\\app paths\\")
+                let uninstall = section.contains("\\currentversion\\uninstall\\")
+                guard appPath || uninstall, var path = appPath ? values[""] : values["displayicon"] else { return }
+                path = path.trimmingCharacters(in: .whitespaces)
+                if path.hasPrefix("\""), let end = path.dropFirst().firstIndex(of: "\"") { path = String(path[path.index(after: path.startIndex)..<end]) }
+                else if let suffix = path.range(of: #",-?\d+$"#, options: .regularExpression) { path.removeSubrange(suffix) }
+                guard path.lowercased().hasSuffix(".exe"), let url = WindowsIcon.unixPath(path, in: room),
+                      FileManager.default.fileExists(atPath: url.path),
+                      !url.path.lowercased().hasPrefix(room.driveC.appendingPathComponent("windows").path.lowercased() + "/") else { return }
+                if uninstall {
+                    // DisplayIcon is not necessarily the app's launch target: runtime
+                    // packages point at a repair installer in ProgramData/Package Cache.
+                    guard let location = values["installlocation"], let directory = WindowsIcon.unixPath(location, in: room),
+                          url.resolvingSymlinksInPath().path.hasPrefix(directory.resolvingSymlinksInPath().path + "/") else { return }
+                }
+                let name = values["displayname"] ?? url.deletingPathExtension().lastPathComponent
+                guard !isAuxiliaryName(name), !isAuxiliaryName(url.deletingPathExtension().lastPathComponent) else { return }
+                found.append((name, url.standardizedFileURL.path))
+            }
+            for raw in text.components(separatedBy: .newlines) {
+                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if line.hasPrefix("["), let end = line.firstIndex(of: "]") {
+                    finish()
+                    section = String(line[line.index(after: line.startIndex)..<end]).replacingOccurrences(of: "\\\\", with: "\\").lowercased()
+                    values = [:]
+                } else if let equal = line.firstIndex(of: "=") {
+                    let key = String(line[..<equal])
+                    let encoded = String(line[line.index(after: equal)...])
+                    let name = key == "@" ? "" : (try? JSONDecoder().decode(String.self, from: Data(key.utf8)))?.lowercased()
+                    if let name, let value = try? JSONDecoder().decode(String.self, from: Data(encoded.utf8)) { values[name] = value }
+                }
+            }
+            finish()
         }
         return found
     }
@@ -97,8 +158,9 @@ final class RoomWatcher {
 
     private func watch(_ room: Room) {
         // Startmenü-Ordner fehlen, bis der Raum eingerichtet ist; dann reicht das C:-Laufwerk.
-        let paths = AppScanner.folders(of: room).map(\.path)
-        let watched = paths.isEmpty ? [room.driveC.path] : paths
+        // Watch the prefix root too: new Start menu folders and App Paths registry
+        // registrations can appear after the watcher was first started.
+        let watched = [room.prefixURL.path]
         guard FileManager.default.fileExists(atPath: watched[0]) else { return }
 
         var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
@@ -127,7 +189,6 @@ final class RoomWatcher {
             let rooms = self.pending
             self.pending.removeAll()
             for id in rooms { AppScanner.refresh(RoomStore.shared.room(id: id)) }
-            self.restart()
         }
     }
 }

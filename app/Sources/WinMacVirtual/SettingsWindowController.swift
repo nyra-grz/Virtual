@@ -11,6 +11,8 @@ final class SettingsWindowController: NSWindowController {
     private var setupButton: NSButton!
     private var setupLog: NSTextView!
     private var autoUpdateBox: NSButton!
+    private var overlayBox: NSButton!
+    private var shortcutRecorder: ShortcutRecorder!
 
     private let versions = ["win11", "win10", "win81", "win8", "win7", "winxp"]
     /// Hält die laufende Einrichtung, solange sie läuft.
@@ -18,7 +20,7 @@ final class SettingsWindowController: NSWindowController {
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 440),
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Einstellungen"
         self.init(window: window)
@@ -80,6 +82,17 @@ final class SettingsWindowController: NSWindowController {
         autoUpdateBox.state = Settings.shared.autoUpdate ? .on : .off
         autoUpdateBox.translatesAutoresizingMaskIntoConstraints = false
 
+        overlayBox = NSButton(checkboxWithTitle: "Kiosk-Apps als Overlay über anderen Apps", target: nil, action: nil)
+        overlayBox.state = Settings.shared.overlayEnabled ? .on : .off
+        overlayBox.translatesAutoresizingMaskIntoConstraints = false
+        let overlayHelp = NSTextField(wrappingLabelWithString: "Programme, die den ganzen Bildschirm verlangen (etwa Prüfungs- oder Kiosk-Apps), liegen als großes Fenster über normalen Apps, statt den Mac zu sperren. Normale Programme bleiben normale Fenster. Gilt ab dem nächsten Start eines Programms.")
+        overlayHelp.font = .systemFont(ofSize: 11)
+        overlayHelp.textColor = .secondaryLabelColor
+        overlayHelp.translatesAutoresizingMaskIntoConstraints = false
+        let shortcutLabel = label("Verkleinern / Vergrößern:")
+        shortcutRecorder = ShortcutRecorder()
+        shortcutRecorder.translatesAutoresizingMaskIntoConstraints = false
+
         let save = NSButton(title: "Sichern", target: self, action: #selector(saveAndClose))
         save.keyEquivalent = "\r"
         save.bezelStyle = .rounded
@@ -87,7 +100,7 @@ final class SettingsWindowController: NSWindowController {
 
         [runtimeLabel, runtimeField, runtimePick, runtimeStatus,
          prefixLabel, prefixField, prefixPick, versionLabel, versionPopup,
-         setupButton, logScroll, autoUpdateBox, save].forEach { v.addSubview($0) }
+         setupButton, logScroll, overlayBox, overlayHelp, shortcutLabel, shortcutRecorder, autoUpdateBox, save].forEach { v.addSubview($0) }
 
         let m: CGFloat = 20
         NSLayoutConstraint.activate([
@@ -125,7 +138,17 @@ final class SettingsWindowController: NSWindowController {
             logScroll.topAnchor.constraint(equalTo: setupButton.bottomAnchor, constant: 10),
             logScroll.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
             logScroll.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -m),
-            logScroll.bottomAnchor.constraint(equalTo: save.topAnchor, constant: -12),
+            logScroll.bottomAnchor.constraint(equalTo: overlayBox.topAnchor, constant: -16),
+            overlayBox.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
+            overlayHelp.topAnchor.constraint(equalTo: overlayBox.bottomAnchor, constant: 5),
+            overlayHelp.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
+            overlayHelp.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -m),
+            shortcutLabel.topAnchor.constraint(equalTo: overlayHelp.bottomAnchor, constant: 12),
+            shortcutLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
+            shortcutRecorder.centerYAnchor.constraint(equalTo: shortcutLabel.centerYAnchor),
+            shortcutRecorder.leadingAnchor.constraint(equalTo: shortcutLabel.trailingAnchor, constant: 12),
+            shortcutRecorder.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
+            shortcutRecorder.bottomAnchor.constraint(equalTo: save.topAnchor, constant: -16),
             logScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 90),
 
             autoUpdateBox.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
@@ -173,7 +196,13 @@ final class SettingsWindowController: NSWindowController {
         setup.run(RoomStore.shared.defaultRoom)
     }
 
-    private func apply() {
+    @discardableResult private func apply() -> Bool {
+        do {
+            if overlayBox.state == .on { try OverlayController.shared.configure(shortcutRecorder.shortcut) }
+        } catch { NSAlert(error: error).runModal(); return false }
+        Settings.shared.overlayEnabled = overlayBox.state == .on
+        Settings.shared.overlayShortcut = shortcutRecorder.shortcut
+        OverlayController.shared.update()
         Settings.shared.runtimePath = URL(fileURLWithPath: (runtimeField.stringValue as NSString).expandingTildeInPath)
         Settings.shared.prefixPath = URL(fileURLWithPath: (prefixField.stringValue as NSString).expandingTildeInPath)
         // Das Feld beschreibt den Standard-Raum.
@@ -184,10 +213,11 @@ final class SettingsWindowController: NSWindowController {
         NotificationCenter.default.post(name: RoomStore.didChange, object: nil)
         Settings.shared.autoUpdate = autoUpdateBox.state == .on
         updateRuntimeStatus()
+        return true
     }
 
     @objc private func saveAndClose() {
-        apply()
+        guard apply() else { return }
         window?.performClose(nil)
     }
 

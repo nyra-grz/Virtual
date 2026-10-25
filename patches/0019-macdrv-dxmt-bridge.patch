@@ -1,0 +1,143 @@
+From: Virtual compatibility integration
+Subject: [PATCH] winemac: expose DXMT v0.80 driver ABI safely on Wine 11.
+
+ABI: https://github.com/3Shain/dxmt/blob/v0.80/src/winemetal/unix/winemetal_unix.c
+
+diff --git a/dlls/winemac.drv/Makefile.in b/dlls/winemac.drv/Makefile.in
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -27,6 +27,7 @@
+ 	cocoa_window.m \
+ 	display.c \
+ 	dllmain.c \
++	dxmt_bridge.c \
+ 	event.c \
+ 	gdi.c \
+ 	image.c \
+diff --git a/dlls/winemac.drv/dxmt_bridge.c b/dlls/winemac.drv/dxmt_bridge.c
+--- /dev/null
++++ b/dlls/winemac.drv/dxmt_bridge.c
+@@ -0,0 +1,123 @@
++/* DXMT's public Wine driver bridge, adapted to Wine 11's client_view layout.
++ * ABI: 3Shain/dxmt v0.80, src/winemetal/unix/winemetal_unix.c.
++ * LGPL-2.1-or-later, like the surrounding Wine driver. */
++#if 0
++#pragma makedep unix
++#endif
++#include "config.h"
++#include <stdlib.h>
++#include <pthread.h>
++#include "macdrv.h"
++#include "wine/list.h"
++
++/* Wine 11 only gives a window a client view once GL or Vulkan made a client
++ * surface; DXMT expects one on every window. Make one on demand and keep it
++ * until the window is destroyed. */
++struct dxmt_surface
++{
++    struct list entry;
++    HWND hwnd;
++    struct macdrv_client_surface *surface;
++};
++
++static struct list dxmt_surfaces = LIST_INIT(dxmt_surfaces);
++static pthread_mutex_t dxmt_surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void dxmt_ensure_client_view(HWND hwnd)
++{
++    struct macdrv_win_data *data;
++    struct dxmt_surface *entry;
++    BOOL found = FALSE;
++
++    if (!(data = get_win_data(hwnd))) return;
++    found = data->client_view != NULL;
++    release_win_data(data);
++    if (found) return;
++
++    pthread_mutex_lock(&dxmt_surfaces_lock);
++    LIST_FOR_EACH_ENTRY(entry, &dxmt_surfaces, struct dxmt_surface, entry)
++    {
++        if (entry->hwnd != hwnd) continue;
++        client_surface_present(&entry->surface->client);
++        found = TRUE;
++        break;
++    }
++    if (!found && (entry = calloc(1, sizeof(*entry))))
++    {
++        if ((entry->surface = macdrv_client_surface_create(hwnd)))
++        {
++            entry->hwnd = hwnd;
++            list_add_tail(&dxmt_surfaces, &entry->entry);
++        }
++        else free(entry);
++    }
++    pthread_mutex_unlock(&dxmt_surfaces_lock);
++}
++
++void dxmt_destroy_window(HWND hwnd)
++{
++    struct dxmt_surface *entry, *next;
++
++    pthread_mutex_lock(&dxmt_surfaces_lock);
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &dxmt_surfaces, struct dxmt_surface, entry)
++    {
++        if (entry->hwnd != hwnd) continue;
++        list_remove(&entry->entry);
++        client_surface_release(&entry->surface->client);
++        free(entry);
++    }
++    pthread_mutex_unlock(&dxmt_surfaces_lock);
++}
++
++struct dxmt_win_data
++{
++    HWND hwnd;
++    macdrv_window cocoa_window;
++    macdrv_view cocoa_view;
++    macdrv_view client_cocoa_view;
++    struct macdrv_win_data *original;
++};
++
++static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct dxmt_win_data *data = calloc(1, sizeof(*data));
++    if (!data) return NULL;
++    data->hwnd = hwnd;
++    dxmt_ensure_client_view(hwnd);
++    if ((data->original = get_win_data(hwnd)))
++    {
++        data->cocoa_window = data->original->cocoa_window;
++        data->cocoa_view = data->original->client_view;
++        data->client_cocoa_view = data->original->client_view;
++    }
++    return data;
++}
++
++static void dxmt_release_win_data(struct dxmt_win_data *data)
++{
++    if (!data) return;
++    if (data->original) release_win_data(data->original);
++    free(data);
++}
++
++/* Export the version-pinned dispatch table instead of exposing Wine's private
++ * macdrv_win_data struct. Wine 11 removed one of its leading view fields. */
++const struct dxmt_macdrv_functions
++{
++    void (*init_display_devices)(BOOL);
++    struct dxmt_win_data *(*get_win_data)(HWND);
++    void (*release_win_data)(struct dxmt_win_data *);
++    macdrv_window (*get_cocoa_window)(HWND, BOOL);
++    macdrv_metal_device (*create_metal_device)(void);
++    void (*release_metal_device)(macdrv_metal_device);
++    macdrv_metal_view (*create_metal_view)(macdrv_view, macdrv_metal_device);
++    macdrv_metal_layer (*get_metal_layer)(macdrv_metal_view);
++    void (*release_metal_view)(macdrv_metal_view);
++    void *on_main_thread;
++} macdrv_functions __attribute__((visibility("default"))) =
++{
++    NULL, dxmt_get_win_data, dxmt_release_win_data, macdrv_get_cocoa_window,
++    macdrv_create_metal_device, macdrv_release_metal_device,
++    macdrv_view_create_metal_view, macdrv_view_get_metal_layer,
++    macdrv_view_release_metal_view, NULL
++};

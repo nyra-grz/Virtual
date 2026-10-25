@@ -1,0 +1,5 @@
+# Exact runtime dependencies for the room-local NTLMv2 helper.
+pyspnego==0.12.4
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.12

@@ -1,0 +1,36 @@
+{
+  "winetricks": {
+    "commit": "f3890f670867b5ffbc3938726db45c0f7d16c8ba",
+    "sha256": "672a1ff4442e8691a3ffc0e6860137e201a1d1227e9b3044245f1731e9e9837e",
+    "url": "https://raw.githubusercontent.com/Winetricks/winetricks/f3890f670867b5ffbc3938726db45c0f7d16c8ba/src/winetricks",
+    "license": "LGPL-2.1-or-later"
+  },
+  "dxmt": {
+    "version": "0.80",
+    "sha256": "8f260e36b5739e68f3bad613381441385c4dc7b85b78ba8de653d5a6a264529d",
+    "url": "https://github.com/3Shain/dxmt/releases/download/v0.80/dxmt-v0.80-builtin.tar.gz",
+    "license": "LGPL-2.1-or-later"
+  },
+  "keyboard": {
+    "commit": "3b1ab64042d214b3516fabdbca052a412da57f70",
+    "url": "https://github.com/wine-mirror/wine/commit/3b1ab64042d214b3516fabdbca052a412da57f70",
+    "license": "LGPL-2.1-or-later"
+  },
+  "libinotify": {
+    "version": "20240724",
+    "sha256": "5cc3fb7af407b17b7daa871cc98bb882716c4b5c296fadfb66bfe86c37cc599c",
+    "url": "https://github.com/libinotify-kqueue/libinotify-kqueue/releases/download/20240724/libinotify-20240724.tar.gz",
+    "license": "MIT"
+  },
+  "crossover": {
+    "version": "26.1.0",
+    "url": "https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.1.0.tar.gz",
+    "sha256": "e4ec87d5821a009dd1f1d2e36ffe2e24b8fcbae9516375ea42f95a16928ab8fa",
+    "license": "Wine LGPL-2.1-or-later"
+  },
+  "gstreamer_sdk": {
+    "version": "1.26.7",
+    "url": "https://gstreamer.freedesktop.org/data/pkg/osx/1.26.7/gstreamer-1.0-devel-1.26.7-universal.pkg",
+    "sha256": "acdfede97877e8ece42eac40897a6975c199389d9474528f27d1cfcc95864a8a"
+  }
+}

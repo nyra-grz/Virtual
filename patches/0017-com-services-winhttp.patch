@@ -1,0 +1,217 @@
+combase, server, rpcrt4, winhttp: COM services and Google's updater (Chrome installer) work.
+- combase: a COM class served by a Windows service (AppID LocalService) is started even when
+  the service name is longer than a GUID (the buffer only held 38 characters, e.g.
+  "GoogleUpdaterInternalService157.0.8089.0" was not found), and its parameters are read from
+  "ServiceParameters" as on Windows ("ServiceParams" still as fallback), split at spaces.
+- server: the owner of an object may set its DACL even through a handle without WRITE_DAC
+  (implicit owner right); Google's updater service adds an ACE to the registry key it just
+  created with KEY_WRITE.
+- rpcrt4: the typelib marshaler handles VT_LPWSTR/VT_LPSTR ([unique, string] pointers, also
+  [out] LPWSTR *) instead of failing the stub with E_NOTIMPL, so such interfaces work across
+  processes.
+- winhttp: response header lines are read up to 64 KB instead of being cut at 1460 bytes
+  (Google's CUP signature header is about 5 KB; long cookies and tokens were cut too).
+
+diff --git a/dlls/combase/rpc.c b/dlls/combase/rpc.c
+index c51b59de..b167e66e 100644
+--- a/dlls/combase/rpc.c
++++ b/dlls/combase/rpc.c
+@@ -424,7 +424,7 @@ static DWORD start_local_service(const WCHAR *name, DWORD num, LPCWSTR *params)
+ static HRESULT create_local_service(REFCLSID rclsid)
+ {
+     HRESULT hr;
+-    WCHAR buf[CHARS_IN_GUID];
++    WCHAR buf[257]; /* Virtual: Dienstnamen haben bis zu 256 Zeichen, nicht nur GUID-Länge */
+     HKEY hkey;
+     LONG r;
+     DWORD type, sz;
+@@ -436,32 +436,38 @@ static HRESULT create_local_service(REFCLSID rclsid)
+         return hr;
+ 
+     /* read the LocalService and ServiceParameters values from the AppID key */
+-    sz = sizeof buf;
++    sz = sizeof(buf) - sizeof(WCHAR);
+     r = RegQueryValueExW(hkey, L"LocalService", NULL, &type, (LPBYTE)buf, &sz);
+     if (r == ERROR_SUCCESS && type == REG_SZ)
+     {
++        const WCHAR *value = L"ServiceParameters";
+         DWORD num_args = 0;
+-        LPWSTR args[1] = { NULL };
+-
+-        /*
+-         * FIXME: I'm not really sure how to deal with the service parameters.
+-         *        I suspect that the string returned from RegQueryValueExW
+-         *        should be split into a number of arguments by spaces.
+-         *        It would make more sense if ServiceParams contained a
+-         *        REG_MULTI_SZ here, but it's a REG_SZ for the services
+-         *        that I'm interested in for the moment.
+-         */
+-        r = RegQueryValueExW(hkey, L"ServiceParams", NULL, &type, NULL, &sz);
+-        if (r == ERROR_SUCCESS && type == REG_SZ && sz)
++        LPWSTR args[16], params = NULL, p;
++
++        buf[sz / sizeof(WCHAR)] = 0;
++        /* Windows names the value ServiceParameters; older Wine read ServiceParams.
++         * The parameters reach ServiceMain split at spaces. */
++        r = RegQueryValueExW(hkey, value, NULL, &type, NULL, &sz);
++        if (r != ERROR_SUCCESS || type != REG_SZ)
+         {
+-            args[0] = calloc(1, sz);
+-            num_args++;
+-            RegQueryValueExW(hkey, L"ServiceParams", NULL, &type, (LPBYTE)args[0], &sz);
++            value = L"ServiceParams";
++            r = RegQueryValueExW(hkey, value, NULL, &type, NULL, &sz);
++        }
++        if (r == ERROR_SUCCESS && type == REG_SZ && sz && (params = calloc(1, sz + sizeof(WCHAR))))
++        {
++            RegQueryValueExW(hkey, value, NULL, &type, (LPBYTE)params, &sz);
++            for (p = params; *p && num_args < ARRAY_SIZE(args);)
++            {
++                while (*p == ' ') *p++ = 0;
++                if (!*p) break;
++                args[num_args++] = p;
++                while (*p && *p != ' ') p++;
++            }
+         }
+         r = start_local_service(buf, num_args, (LPCWSTR *)args);
+         if (r != ERROR_SUCCESS)
+             hr = REGDB_E_CLASSNOTREG; /* FIXME: check retval */
+-        free(args[0]);
++        free(params);
+     }
+     else
+     {
+diff --git a/dlls/rpcrt4/ndr_typelib.c b/dlls/rpcrt4/ndr_typelib.c
+index 1006bf1d..744818d2 100644
+--- a/dlls/rpcrt4/ndr_typelib.c
++++ b/dlls/rpcrt4/ndr_typelib.c
+@@ -181,6 +181,8 @@ static unsigned int type_memsize(ITypeInfo *typeinfo, TYPEDESC *desc, unsigned i
+     case VT_PTR:
+     case VT_UNKNOWN:
+     case VT_DISPATCH:
++    case VT_LPSTR:
++    case VT_LPWSTR:
+         size = align = sizeof(void *);
+         break;
+     case VT_VARIANT:
+@@ -774,7 +776,8 @@ static size_t write_pointer_tfs(ITypeInfo *typeinfo, unsigned char *str,
+         ref = write_type_tfs(typeinfo, str, len, desc, FALSE, FALSE);
+ 
+         if (onstack) flags |= FC_ALLOCED_ON_STACK;
+-        if (desc->vt == VT_PTR || desc->vt == VT_UNKNOWN || desc->vt == VT_DISPATCH)
++        if (desc->vt == VT_PTR || desc->vt == VT_UNKNOWN || desc->vt == VT_DISPATCH ||
++            desc->vt == VT_LPSTR || desc->vt == VT_LPWSTR)
+             flags |= FC_POINTER_DEREF;
+ 
+         off = *len;
+@@ -806,6 +809,15 @@ static size_t write_type_tfs(ITypeInfo *typeinfo, unsigned char *str,
+         return write_pointer_tfs(typeinfo, str, len, desc->lptdesc, toplevel, onstack);
+     case VT_CARRAY:
+         return write_array_tfs(typeinfo, str, len, desc->lpadesc);
++    case VT_LPSTR:
++    case VT_LPWSTR:
++        /* Virtual: [unique, string] char / WCHAR pointer */
++        off = *len;
++        WRITE_CHAR(str, *len, FC_UP);
++        WRITE_CHAR(str, *len, FC_SIMPLE_POINTER);
++        WRITE_CHAR(str, *len, desc->vt == VT_LPWSTR ? FC_C_WSTRING : FC_C_CSTRING);
++        WRITE_CHAR(str, *len, FC_PAD);
++        break;
+     case VT_USERDEFINED:
+         ITypeInfo_GetRefTypeInfo(typeinfo, desc->hreftype, &refinfo);
+         ITypeInfo_GetTypeAttr(refinfo, &attr);
+@@ -939,6 +951,12 @@ static HRESULT get_param_pointer_info(ITypeInfo *typeinfo, TYPEDESC *tdesc, int
+         *server_size = type_memsize(typeinfo, tdesc, NULL);
+         *tfs_tdesc = tdesc;
+         break;
++    case VT_LPSTR:
++    case VT_LPWSTR:
++        /* pointer to a string pointer, e.g. [out] LPWSTR * */
++        *flags |= MustFree;
++        *server_size = sizeof(void *);
++        break;
+     case VT_USERDEFINED:
+         ITypeInfo_GetRefTypeInfo(typeinfo, tdesc->hreftype, &refinfo);
+         ITypeInfo_GetTypeAttr(refinfo, &attr);
+@@ -1016,6 +1034,8 @@ static HRESULT get_param_info(ITypeInfo *typeinfo, TYPEDESC *tdesc, int is_in,
+     case VT_UNKNOWN:
+     case VT_DISPATCH:
+     case VT_CARRAY:
++    case VT_LPSTR:
++    case VT_LPWSTR:
+         *flags |= MustFree;
+         break;
+     case VT_PTR:
+diff --git a/dlls/winhttp/request.c b/dlls/winhttp/request.c
+index 60aff3ee..1d52f7ee 100644
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -2619,12 +2619,13 @@ static DWORD read_line( struct request *request, char *buffer, DWORD *len )
+     return ERROR_SUCCESS;
+ }
+ 
+-#define MAX_REPLY_LEN   1460
++/* Virtual: war 1460 – längere Kopfzeilen (CUP-Signaturen von Google Update, lange
++ * Cookies, Tokens) wurden abgeschnitten. Windows liest Zeilen bis 64 KB. */
++#define MAX_REPLY_LEN   65536
+ #define INITIAL_HEADER_BUFFER_LEN  512
+ 
+-static DWORD read_reply( struct request *request )
++static DWORD read_reply_buffer( struct request *request, char *buffer )
+ {
+-    char buffer[MAX_REPLY_LEN];
+     DWORD ret, buflen, len, offset, crlf_len = 2; /* lstrlenW(crlf) */
+     const char *status_text, *ptr;
+     WCHAR *versionW, *status_textW, *raw_headers;
+@@ -2740,6 +2741,17 @@ static DWORD read_reply( struct request *request )
+     return ret;
+ }
+ 
++static DWORD read_reply( struct request *request )
++{
++    char *buffer;
++    DWORD ret;
++
++    if (!(buffer = malloc( MAX_REPLY_LEN ))) return ERROR_OUTOFMEMORY;
++    ret = read_reply_buffer( request, buffer );
++    free( buffer );
++    return ret;
++}
++
+ static void record_cookies( struct request *request )
+ {
+     unsigned int i;
+diff --git a/server/handle.c b/server/handle.c
+index ddcf03ac..32932b04 100644
+--- a/server/handle.c
++++ b/server/handle.c
+@@ -752,7 +752,28 @@ DECL_HANDLER(set_security_object)
+     if (req->security_info & DACL_SECURITY_INFORMATION)
+         access |= WRITE_DAC;
+ 
+-    if (!(obj = get_handle_obj( current->process, req->handle, access, NULL ))) return;
++    if (!(obj = get_handle_obj( current->process, req->handle, access, NULL )))
++    {
++        /* Virtual: Der Besitzer eines Objekts darf dessen DACL immer setzen (implizites
++         * WRITE_DAC des Besitzers), auch über ein Handle ohne WRITE_DAC – z. B. Googles
++         * Updater-Dienst auf seinem frisch angelegten Registry-Schlüssel (KEY_WRITE). */
++        const struct security_descriptor *obj_sd;
++        const struct sid *owner;
++        struct token *token;
++
++        if (get_error() != STATUS_ACCESS_DENIED || access != WRITE_DAC) return;
++        clear_error();
++        if (!(obj = get_handle_obj( current->process, req->handle, 0, NULL ))) return;
++        token = current->token ? current->token : current->process->token;
++        obj_sd = obj->ops->get_sd( obj );
++        owner = obj_sd ? sd_get_owner( obj_sd ) : NULL;
++        if (!token || !owner || !token_sid_present( token, owner, FALSE ))
++        {
++            release_object( obj );
++            set_error( STATUS_ACCESS_DENIED );
++            return;
++        }
++    }
+ 
+     obj->ops->set_sd( obj, sd, req->security_info );
+     release_object( obj );

@@ -35,6 +35,7 @@ final class Program: Codable {
 /// Verwaltet die Programmliste und speichert sie als JSON unter ~/WinMac_Virtual/library.json.
 final class Library {
     static let shared = Library()
+    static let supportedExtensions: Set<String> = ["exe", "msi", "lnk"]
 
     private(set) var programs: [Program] = []
 
@@ -84,7 +85,9 @@ final class Library {
     @discardableResult
     func add(url: URL, to room: Room) -> Program? {
         let ext = url.pathExtension.lowercased()
-        guard ext == "exe" || ext == "msi" else { return nil }
+        guard Self.supportedExtensions.contains(ext),
+              (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { return nil }
+        let url = url.standardizedFileURL
         if let existing = programs.first(where: { $0.path == url.path && $0.room.id == room.id }) { return existing }
 
         let bookmark = try? url.bookmarkData(options: .withSecurityScope,
@@ -104,7 +107,7 @@ final class Library {
         let before = programs.count
         programs.removeAll { $0.detected == true && $0.room.id == room.id && !foundPaths.contains($0.path) }
         var added: [Program] = []
-        for item in found where !programs.contains(where: { $0.path == item.path }) {
+        for item in found where !programs.contains(where: { $0.path == item.path && $0.room.id == room.id }) {
             let program = Program(name: item.name, path: item.path, bookmark: nil, roomID: room.id, detected: true)
             programs.append(program)
             added.append(program)

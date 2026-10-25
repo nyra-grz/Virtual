@@ -71,6 +71,17 @@ runtime/bin/virtual build/network.exe
 runtime/bin/virtual build/devices.exe
 ```
 
+`tests/audio.c` checks `IAudioEndpointVolume` on the default speakers and microphone
+(channel count from the real mix format, levels, balance, mute, steps, notifications,
+a second process seeing the same volume) and restores the previous volume; it is part
+of `scripts/smoke-test.sh`. `tests/projection.c` covers patches 0010/0011; a small
+ABI declaration header supports MinGW versions without the SDK header.
+The smoke suite also runs network, device enumeration and read-only Wi-Fi checks.
+
+The local NTLMv2 helper has positive and negative tests (wrong password, tampered
+proof, room isolation, file permissions, unavailable keys before authentication):
+`runtime/sspi/venv/bin/python -I -m unittest discover -s winrt/sspi`.
+
 Result on 23 October 2026 on a MacBook Pro (Apple M5 Pro), compared with unpatched
 wine-11.0:
 
@@ -79,14 +90,31 @@ wine-11.0:
 | `network.exe` | 43 of 63 checks failed | 115 checks, 0 failed |
 | `devices.exe` | 35 of 56 checks failed | 106 checks, 0 failed |
 
-## Windows.Devices.WiFi template
+## Windows.Devices.WiFi
 
-`src/windows.devices.wifi.c` is a factory template for `Windows.Devices.WiFi`, which
-Wine does not provide at all. `ActivateInstance` returns `E_NOTIMPL` and
-`FindAllAdaptersAsync` is not implemented yet (hook for CoreWLAN: `TODO CoreWLAN`).
-It is built inside the Wine tree (it uses `wine/debug.h`); `src/test_wifi.c` is its
-factory smoke test:
+Patch 0014 implements Wi-Fi in the source runtime using macOS CoreWLAN, loaded
+through the Objective-C runtime. WlanAPI and WinRT expose the host adapter, radio
+state, network report, scans and change events. DeviceInformation queries using
+`WiFiAdapter.GetDeviceSelector()` return that same adapter; `FromIdAsync` accepts its
+actual device ID. An absent adapter stays absent. The current host bridge exposes
+the primary Wi-Fi interface.
+
+macOS location privacy can hide SSIDs and BSSIDs. Empty names remain empty; Virtual
+does not make them up or grant itself location access. Connecting is implemented
+as a request with a result; it does not claim success if the host operation fails.
 
 ```sh
-x86_64-w64-mingw32-gcc winrt/src/test_wifi.c -o build/test_wifi.exe -lruntimeobject -lole32
+x86_64-w64-mingw32-gcc winrt/tests/wifi.c -o build/wifi.exe -lruntimeobject -lole32 -luuid
+runtime/bin/virtual build/wifi.exe
 ```
+
+The default test only reads and scans, and checks DeviceInformation → FromIdAsync.
+`--change-network` explicitly opts into connecting to the first reported network
+and disconnecting; do not use it on an active connection. The old `src/` Wi-Fi
+factory template is retained for reference and is not the runtime implementation.
+
+Native .NET Framework applications need the room's **.NET Framework 4.8** tile
+(or `WINEPREFIX=/path/to/prefix scripts/setup-dotnet48.sh win10`). This downloads
+Microsoft installers with pinned checksums, replaces Mono in that room, installs
+the WinRT projection bridge and SDK metadata, and restores the Windows version.
+WPF uses software rendering. Each room remains separate.

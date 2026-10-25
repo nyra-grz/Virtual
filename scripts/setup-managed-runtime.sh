@@ -3,7 +3,7 @@
 # Only generated files inside this project's runtime are written; no prefix is opened.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNTIME="$ROOT/runtime"
+RUNTIME="${WINMAC_RUNTIME:-$ROOT/runtime}"
 VERSION=10.4.1
 SHA256=a16606ef0724202e6a6848ece6e0cbba64d11e2f11aefe744af1d93c6d9f99bb
 NAME="wine-mono-$VERSION"

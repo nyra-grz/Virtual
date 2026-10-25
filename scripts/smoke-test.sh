@@ -86,7 +86,11 @@ export WINEDEBUG=-all
 export WINEDLLOVERRIDES='mscoree,mshtml=d;winedbg.exe=d'
 export DXVK_LOG_PATH="$SCRATCH"
 export DXVK_STATE_CACHE_PATH="$SCRATCH"
-export WINMAC_ROOT="$ROOT"
+export WINMAC_ROOT="$SCRATCH/data"
+export WINMAC_ASSETS_ROOT="$WINMAC_HOME"
+if [ -x "$WINMAC_HOME/runtime/wine-build/bin/wine" ]; then
+    export WINMAC_WINE_BIN="$WINMAC_HOME/runtime/wine-build/bin"
+fi
 # Nie automatisch einen vorhandenen Installer aus ~/Downloads ausführen.
 export WINMAC_DOTNET="$SCRATCH/kein-dotnet-installer.exe"
 printf 'Wegwerf-Prefix: %s\n\n' "$WINEPREFIX"
@@ -94,8 +98,8 @@ printf 'Wegwerf-Prefix: %s\n\n' "$WINEPREFIX"
 # a) App nur in diesem Checkout bauen, nicht im gemeinsamen WINMAC_HOME.
 if [ "$(uname -s)" != Darwin ] || ! command -v swift >/dev/null 2>&1; then
     report übersprungen "App-Build und Info.plist" "macOS mit Swift erforderlich"
-elif /bin/bash "$ROOT/build-app.sh" >"$SCRATCH/app-build.log" 2>&1; then
-    BUNDLE="$ROOT/build/Virtual.app"
+elif [ "${WINMAC_SMOKE_SKIP_BUILD:-0}" = 1 ] || /bin/bash "$ROOT/build-app.sh" >"$SCRATCH/app-build.log" 2>&1; then
+    BUNDLE="${WINMAC_SMOKE_BUNDLE:-$ROOT/build/Virtual.app}"
     if [ -x "$BUNDLE/Contents/MacOS/Virtual" ]; then
         report ok "App-Build" "$BUNDLE"
     else
@@ -152,7 +156,7 @@ set -uo pipefail
 tool="${0##*/}"
 perl -e 'alarm shift; exec @ARGV; die "exec: $!\n"' 60 "$WINMAC_SMOKE_RUNTIME/bin/$tool" "$@"
 status=$?
-if [ "$status" != 0 ]; then
+if [ "$status" != 0 ] && [ "${WINMAC_EXPECT_NONZERO:-0}" != 1 ]; then
     printf '%s: Exitcode %s\n' "$tool" "$status" >>"$WINMAC_SMOKE_FAILURES"
 fi
 exit "$status"
@@ -291,6 +295,25 @@ console_test() {
 console_test 64 x86_64-w64-mingw32-gcc
 console_test 32 i686-w64-mingw32-gcc
 
+# Exercise the same Windows job helper shipped in the app, including its real
+# child exit code. A runtime-only test would miss failures in the launch bridge.
+if [ "$PREFIX_READY" = 1 ] && command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    if x86_64-w64-mingw32-gcc -municode -O2 "$ROOT/app/Helpers/program-runner.c" \
+        -o program-runner.exe -lole32 -luuid >runner-build.log 2>&1; then
+        "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/program-runner.exe" "$SCRATCH/console-64.exe" >runner.log 2>&1
+        runner_status=$?
+        if [ "$runner_status" = 37 ] && grep -q 'VIRTUAL_EXIT_CODE=37' runner.log; then
+            report ok "Programmstart über App-Helfer" "Kindprozess und Windows-Exitcode 37"
+        else
+            report FEHLER "Programmstart über App-Helfer" "Status $runner_status"
+            show_log runner.log
+        fi
+    else
+        report FEHLER "App-Helfer kompilieren"
+        show_log runner-build.log
+    fi
+fi
+
 # e) Ausschließlich Hardware-Gerät; kein stiller WARP-/Software-Fallback.
 cat >d3d11.c <<'C'
 #define COBJMACROS
@@ -331,6 +354,8 @@ C
 
 d3d_test() {
     local dxvk="$WINMAC_HOME/thirdparty/graphics/dxvk" src="" candidate count=0
+    # Bundled apps carry the archive; init-prefix extracts it into the writable cache.
+    [ ! -d "$WINMAC_ROOT/thirdparty/graphics/dxvk" ] || dxvk="$WINMAC_ROOT/thirdparty/graphics/dxvk"
     local dll minimum=0 overrides="$WINEDLLOVERRIDES" system32="$WINEPREFIX/drive_c/windows/system32"
     if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
         report übersprungen "D3D11" "x86_64-w64-mingw32-gcc fehlt"
@@ -385,5 +410,66 @@ d3d_test() {
     fi
 }
 d3d_test
+
+# f) Geräte-Lautstärke (IAudioEndpointVolume, Patch 0012): echte Kanalzahl, Pegel,
+# Stummschaltung, Benachrichtigungen und ein zweiter Prozess, der dieselbe Lautstärke sieht.
+audio_test() {
+    if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+        report übersprungen "Audio" "x86_64-w64-mingw32-gcc fehlt"
+    elif ! x86_64-w64-mingw32-gcc -Wall "$ROOT/winrt/tests/audio.c" -o audio.exe -lole32 -luuid >compile-audio.log 2>&1; then
+        report FEHLER "Audio-Test kompilieren"
+        show_log compile-audio.log
+    elif [ "$PREFIX_READY" != 1 ]; then
+        report übersprungen "Geräte-Lautstärke" "Prefix-Einrichtung fehlgeschlagen"
+    elif "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/audio.exe" >audio.out 2>audio.err; then
+        report ok "Geräte-Lautstärke" "$(tr -d '\r' <audio.out | tail -1)"
+    else
+        report FEHLER "Geräte-Lautstärke" "Exitcode $?"
+        show_log audio.out
+    fi
+}
+audio_test
+# WinRT-Projektion und echte Geräte einschließlich des SEB-Suchwegs für WLAN.
+# wifi.c verändert ohne ausdrückliches --change-network keine Netzwerkverbindung.
+for probe in projection network devices wifi; do
+    if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+        report übersprungen "WinRT: $probe" "MinGW fehlt"
+    elif ! x86_64-w64-mingw32-gcc -Wall "$ROOT/winrt/tests/$probe.c" -o "$probe.exe" -lruntimeobject -lole32 -luuid >"compile-$probe.log" 2>&1; then
+        report FEHLER "WinRT: $probe kompilieren"
+        show_log "compile-$probe.log"
+    elif [ "$PREFIX_READY" != 1 ]; then
+        report übersprungen "WinRT: $probe" "Prefix-Einrichtung fehlgeschlagen"
+    elif "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/$probe.exe" >"$probe.out" 2>"$probe.err"; then
+        report ok "WinRT: $probe" "$(tr -d '\r' <"$probe.out" | tail -1)"
+    else
+        report FEHLER "WinRT: $probe" "Exitcode $?"
+        show_log "$probe.out"
+        show_log "$probe.err"
+    fi
+done
+# Upstream integration regressions: activate the native Mac layout, observe an
+# actual async file notification, and decode an H.264 frame through Media Foundation.
+for probe in keyboard change; do
+    if x86_64-w64-mingw32-gcc "$ROOT/winrt/tests/$probe.c" -o "$probe.exe" -luser32 >"compile-$probe.log" 2>&1 &&
+       "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/$probe.exe" >"$probe.out" 2>"$probe.err"; then
+        report ok "Integration: $probe" "$(tr -d '\r' <"$probe.out" | tail -1)"
+    else
+        report FEHLER "Integration: $probe"
+        show_log "$probe.err"
+    fi
+done
+if x86_64-w64-mingw32-gcc -municode "$ROOT/winrt/tests/media.c" -o media.exe -lmfreadwrite -lmfplat -lmfuuid -lole32 >compile-media.log 2>&1; then
+    media_path="Z:${ROOT//\//\\}\\winrt\\tests\\blue-h264.mp4"
+    if "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/media.exe" "$media_path" >media.out 2>media.err && grep -q 'decoded-blue=1' media.out; then
+        report ok "Integration: Media Foundation" "$(tr -d '\r' <media.out | tail -1)"
+    else
+        report FEHLER "Integration: Media Foundation"
+        show_log media.out
+        show_log media.err
+    fi
+else
+    report FEHLER "Media-Test kompilieren"
+    show_log compile-media.log
+fi
 # EXIT-Trap beendet den Prefix-Server, löscht die temporären Dateien und bilanziert.
 exit 0

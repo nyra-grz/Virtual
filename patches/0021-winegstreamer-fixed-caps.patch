@@ -1,0 +1,26 @@
+From: Virtual compatibility integration
+Subject: [PATCH] winegstreamer: validate fixed caps before converting media formats.
+
+GStreamer audio/video info conversion requires fixed caps. Incomplete media
+types remain unknown while Media Foundation negotiates a supported format.
+
+diff --git a/dlls/winegstreamer/wg_format.c b/dlls/winegstreamer/wg_format.c
+--- a/dlls/winegstreamer/wg_format.c
++++ b/dlls/winegstreamer/wg_format.c
+@@ -624,14 +624,14 @@
+     {
+         GstAudioInfo info;
+ 
+-        if (gst_audio_info_from_caps(&info, caps))
++        if (gst_caps_is_fixed(caps) && gst_audio_info_from_caps(&info, caps))
+             wg_format_from_audio_info(format, &info);
+     }
+     else if (!strcmp(name, "video/x-raw"))
+     {
+         GstVideoInfo info;
+ 
+-        if (gst_video_info_from_caps(&info, caps))
++        if (gst_caps_is_fixed(caps) && gst_video_info_from_caps(&info, caps))
+             wg_format_from_video_info(format, &info);
+     }
+     else if (!strcmp(name, "audio/mpeg") && gst_structure_get_boolean(structure, "parsed", &parsed) && parsed)

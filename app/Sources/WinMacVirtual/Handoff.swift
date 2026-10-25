@@ -188,8 +188,9 @@ final class Handoff {
         let name = url.lastPathComponent
         let ready = RoomStore.shared.rooms.filter(\.isReady)
 
-        if ext == "exe" || ext == "msi" {
-            guard let room = chooseRoom(RoomStore.shared.rooms, message: "„\(name)“ starten in …"),
+        if Library.supportedExtensions.contains(ext) {
+            let owner = RoomStore.shared.rooms.first { url.path.hasPrefix($0.driveC.path + "/") }
+            guard let room = owner ?? chooseRoom(RoomStore.shared.rooms, message: "„\(name)“ starten in …"),
                   let program = Library.shared.add(url: url, to: room) else { return }
             NotificationCenter.default.post(name: Self.didSelectProgram, object: nil, userInfo: ["program": program.id])
             do { try Launcher.shared.launch(program) } catch { show("Start nicht möglich", error.localizedDescription) }

@@ -8,6 +8,7 @@ let package = Package(
         .executableTarget(
             name: "WinMacVirtual",
             path: "Sources/WinMacVirtual"
-        )
+        ),
+        .testTarget(name: "WinMacVirtualTests", dependencies: ["WinMacVirtual"])
     ]
 )

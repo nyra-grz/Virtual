@@ -20,9 +20,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-SRC="$ROOT/thirdparty/wine"
-BUILD="$ROOT/thirdparty/wine-build-tree"
-RUNTIME="$ROOT/runtime"
+SRC="${WINMAC_WINE_SOURCE:-$ROOT/thirdparty/wine}"
+BUILD="${WINMAC_WINE_BUILD:-$ROOT/thirdparty/wine-build-tree}"
+RUNTIME="${WINMAC_RUNTIME:-$ROOT/runtime}"
 PREFIX_INSTALL="$RUNTIME/wine-build"
 WINE_GIT="https://gitlab.winehq.org/wine/wine.git"
 WINE_TAG="${WINE_TAG:-wine-11.0}"   # aktuelles Stable; per Umgebungsvariable überschreibbar
@@ -70,7 +70,9 @@ export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
 
 # --- 2. Quellen holen --------------------------------------------------------
 mkdir -p "$ROOT/thirdparty"
-if [ ! -d "$SRC/.git" ]; then
+if [ "${WINMAC_SOURCE_PREPARED:-0}" = 1 ]; then
+    [ -f "$SRC/configure" ] || { echo "Vorbereitete Wine-Quelle fehlt." >&2; exit 1; }
+elif [ ! -d "$SRC/.git" ]; then
     echo "==> Klone Wine ($WINE_TAG)…"
     git clone --depth 1 --branch "$WINE_TAG" "$WINE_GIT" "$SRC"
 else
@@ -79,12 +81,12 @@ else
 fi
 
 # --- 3. Eigene Patches anwenden ---------------------------------------------
-if compgen -G "$ROOT/patches/*.patch" >/dev/null; then
+if [ "${WINMAC_SOURCE_PREPARED:-0}" != 1 ] && compgen -G "$ROOT/patches/*.patch" >/dev/null; then
     echo "==> Wende eigene Patches an…"
     for p in "$ROOT"/patches/*.patch; do
         echo "    - $(basename "$p")"
         ( cd "$SRC" && git apply --check "$p" 2>/dev/null && git apply "$p" ) \
-            || echo "      (übersprungen – passt nicht auf $WINE_TAG, siehe patches/README.md)"
+            || { echo "FEHLER: $(basename "$p") passt nicht auf $WINE_TAG – Build abgebrochen." >&2; exit 1; }
     done
 fi
 
@@ -136,6 +138,30 @@ copy_x86_libs "$BUILD"
 # Kein pkg-config: dessen Homebrew-Einträge zeigen auf arm64-Bibliotheken.
 # Kein --with-opengl: Das verlangt ab Wine 11 EGL, das es auf macOS nicht gibt.
 # OpenGL läuft hier über winemac.drv und das OpenGL-Framework (CGL) und wird immer gebaut.
+# Medienwiedergabe (winegstreamer) über das offizielle GStreamer.framework (Runtime +
+# Development, gstreamer.freedesktop.org); dessen x86_64-Teil wird nach dem Bauen
+# von scripts/bundle-gstreamer.sh in die Runtime gebündelt. Header aus dem Framework
+# oder einem entpackten Development-Paket (WINMAC_GSTREAMER_SDK).
+GST_FW="${WINMAC_GSTREAMER_FRAMEWORK:-/Library/Frameworks/GStreamer.framework/Versions/Current}"
+GST_SDK="${WINMAC_GSTREAMER_SDK:-$GST_FW}"
+if [ -f "$GST_FW/lib/libgstreamer-1.0.0.dylib" ] && [ ! -f "$GST_SDK/include/gstreamer-1.0/gst/gst.h" ]; then
+    bash "$ROOT/scripts/prepare-gstreamer-sdk.sh"
+    GST_SDK="$ROOT/thirdparty/gstreamer-sdk/merged"
+fi
+GST_ARGS=(--without-gstreamer)
+if [ -f "$GST_FW/lib/libgstreamer-1.0.0.dylib" ] && [ -f "$GST_SDK/include/gstreamer-1.0/gst/gst.h" ]; then
+    echo "==> GStreamer gefunden – Medienwiedergabe wird mitgebaut."
+    GST_ARGS=(--with-gstreamer
+        "GSTREAMER_CFLAGS=-I$GST_SDK/include/gstreamer-1.0 -I$GST_SDK/include/glib-2.0 -I$GST_SDK/lib/glib-2.0/include"
+        "GSTREAMER_LIBS=-L$GST_FW/lib -lgstvideo-1.0 -lgstaudio-1.0 -lgsttag-1.0 -lgstbase-1.0 -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0")
+else
+    echo "==> Kein GStreamer (Runtime + Development) – Video in Windows-Programmen bleibt aus."
+fi
+
+# Dateiänderungs-Benachrichtigungen: inotify-API über kqueue (wie Wine auf FreeBSD).
+bash "$ROOT/scripts/build-libinotify.sh"
+INOTIFY_DIR="$ROOT/thirdparty/inotify/install"
+
 echo "==> configure (dies kann dauern)…"
 mkdir -p "$BUILD/kein-pkgconfig"
 ( cd "$BUILD" && PKG_CONFIG_LIBDIR="$BUILD/kein-pkgconfig" PKG_CONFIG_PATH="" "$SRC/configure" \
@@ -145,7 +171,8 @@ mkdir -p "$BUILD/kein-pkgconfig"
     --disable-tests \
     --with-coreaudio --with-freetype --with-gnutls --with-sdl \
     --with-vulkan \
-    --without-gstreamer --without-x --without-oss \
+    "${GST_ARGS[@]}" --with-inotify --without-x --without-oss \
+    INOTIFY_CFLAGS="-I$INOTIFY_DIR/include" INOTIFY_LIBS="-L$INOTIFY_DIR/lib -linotify" \
     CC="clang -arch x86_64" OBJC="clang -arch x86_64" \
     LDFLAGS="-L$X86_LINK -Wl,-rpath,@loader_path/../../" \
     FREETYPE_CFLAGS="-I$BREW/opt/freetype/include/freetype2" FREETYPE_LIBS="-L$X86_LINK -lfreetype" \
@@ -177,6 +204,12 @@ rm -rf "$PREFIX_INSTALL"
 ( cd "$BUILD" && make install )
 # Die Unix-Module finden sie über @loader_path/../../ (= lib/), setup-graphics.sh MoltenVK dort.
 copy_x86_libs "$PREFIX_INSTALL/lib"
+# DirectX 10/11 über Metal: DXMTs Brücke winemetal (setup-graphics.sh nutzt sie pro Raum).
+bash "$ROOT/scripts/install-dxmt-runtime.sh" "$PREFIX_INSTALL"
+# Video/Audio: GStreamer-Bibliotheken und Plugins zu winegstreamer legen.
+if [ -f "$PREFIX_INSTALL/lib/wine/x86_64-unix/winegstreamer.so" ]; then
+    bash "$ROOT/scripts/bundle-gstreamer.sh" "$PREFIX_INSTALL" "$GST_FW"
+fi
 
 # --- 6. Umbenannten Front-End-Befehlssatz erzeugen ---------------------------
 if [ -d "$RUNTIME/bin" ]; then

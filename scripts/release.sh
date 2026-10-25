@@ -25,7 +25,7 @@ git add VERSION
 git diff --cached --quiet || git commit -q -m "Version $VERSION"
 git tag -a "v$VERSION" -m "Virtual $VERSION"
 
-./build-app.sh
+WINMAC_BUNDLE_ENGINE=1 ./build-app.sh
 ZIP="build/Virtual-$VERSION.zip"
 rm -f "$ZIP"
 ditto -c -k --keepParent "build/Virtual.app" "$ZIP"

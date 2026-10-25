@@ -36,8 +36,25 @@ English translation.
 
 ## Quick start (works right away, no source build)
 
-The project folder must be `~/WinMac_Virtual` – the app looks for scripts,
-runtime and prefix there.
+For users, releases now contain the Wine engine, Wine Mono, DXVK, setup scripts
+and the local authentication helper inside `Virtual.app`. Move the app to
+Applications, open it, and choose a Windows installer or program. No checkout,
+Homebrew, Python, terminal commands or agent is needed. User data stays in
+`~/WinMac_Virtual`; the bundled engine is separate from rooms and installed apps.
+
+Before a program or installer starts, Virtual prepares its room automatically.
+Existing rooms receive setup updates once per engine version. Concurrent starts
+share one setup job; an unsuccessful setup is reported and can be retried.
+EXE, MSI and LNK imports share this launch path, including Finder's Open With.
+Portable applications retain their working directory and must keep their complete
+folder. Installers are tracked with their child processes, and newly installed
+apps are discovered from shortcuts and App Paths/Uninstall registrations.
+Missing Windows components and nonzero exits are reported in the app with a log.
+Microsoft .NET Framework 4.8 remains available in the room's Windows tools for
+applications that need it instead of Wine Mono. Wine still cannot run every app.
+On Apple Silicon, the x64 Wine engine also requires Rosetta 2.
+
+For development, the source checkout is expected at `~/WinMac_Virtual`:
 
 ```bash
 git clone https://github.com/nyra-grz/Virtual.git ~/WinMac_Virtual
@@ -58,10 +75,15 @@ open "build/Virtual.app"
 ## Reproducible source build
 
 ```bash
-WINMAC_AUTO_DEPS=1 ./build-wine.sh          # clones Wine, patches, builds, installs
+WINMAC_AUTO_DEPS=1 ./build-wine-cx.sh       # pinned CrossOver FOSS + Virtual patch set
                                             # → runtime/wine-build + runtime/bin/virtual*
 ```
-Builds `wine-11.0` (change with `WINE_TAG`) for **x86_64**, which runs under
+The complete app uses the CrossOver 26.1.0 FOSS Wine source base plus Virtual's
+ported changes. `build-wine-cx.sh` verifies the source archive, applies the
+versioned patch set and invokes the shared build pipeline. The ordinary upstream
+Wine variant remains available through `build-wine.sh` and `WINE_TAG`.
+
+Builds the Wine 11.0 base for **x86_64**, which runs under
 Rosetta 2 just like Wine Staging.app; 32-bit programs run through WoW64
 (`--enable-archs=i386,x86_64`, mingw-w64 from Homebrew). Homebrew only provides
 the headers – the x86_64 libraries (FreeType, GnuTLS, SDL2, MoltenVK) are taken
@@ -78,19 +100,50 @@ one is not touched):
 ./scripts/smoke-test.sh      # app build, prefix, 32/64-bit programs, D3D11 via DXVK
 ```
 
+Launcher regression tests (requires full Xcode for XCTest):
+
+```bash
+cd app && swift test
+```
+
+Compatibility additions include automatic inspection of EXE/DLL imports and .NET
+runtime configuration, shared component setup before queued launches, and one
+automatic repair/retry for recognized missing runtime DLLs. Unknown failures are
+reported instead of repeatedly relaunching the app. Winetricks handles the pinned
+legacy recipes; current .NET runtime installers come from Microsoft's verified
+release metadata. Native .NET 4.8 is selected for detected classic WPF/WinRT apps.
+
+GStreamer supports media decoding; the runtime tests include an actual H.264 frame
+decoded to RGB32. A keyboard regression checks Mac layout/user-locale handling,
+and asynchronous directory notifications are tested through the kqueue bridge.
+Choose per-room DXVK or experimental DXMT in the room's **… → Grafik** menu.
+Component download/setup output is visible in the selected program's log.
+
+To build the complete app locally without publishing:
+
+```bash
+WINMAC_BUNDLE_ENGINE=1 ./build-app.sh
+```
+
 ## Rooms and programs
 
 The native sidebar groups programs by **room** (an independent Wine prefix with its
 own C: drive and Windows registry). **Standard** keeps the existing `prefix/`,
 including previously added programs. Use **+ → Neuer Raum…** (New room), select it,
-and click **Raum einrichten** (Set up room); setup progress appears live. Additional
+and click **Jetzt einrichten** (Set up now); setup progress appears live. Additional
 rooms live under `rooms/`, and their metadata is saved in `rooms.json`.
+
+A room's page shows its state (ready, running, not set up), its apps as tiles with a
+start/stop button, and the Windows tools grouped into **Dateien** (files) and
+**System**. **Alles beenden** (Stop everything) appears while something runs and ends
+every program and Wine service of that room.
 
 - **Add:** **+ → Programm hinzufügen…** (Add program) adds an `.exe` or `.msi` to
   the selected room. Drop files directly onto a room in the sidebar, double-click
   a file in Finder, or drop it onto the Dock icon; external files prompt for a room.
-- **Install:** the room's **Programm installieren…** (Install program) tool runs
-  an EXE installer or `msiexec /i` in that room.
+- **Install:** the room's **Programm installieren…** (Install program) button runs
+  an EXE installer or `msiexec /i` in that room. `.exe`/`.msi` files can also be
+  dropped onto the room page.
 - **Discovery:** Start Menu and public Desktop shortcuts appear automatically,
   with icons read from their Windows executables. Virtual watches shortcut folders
   and rescans after a program or tool exits. **Apps suchen** (Find apps) rescans
@@ -109,6 +162,18 @@ rooms live under `rooms/`, and their metadata is saved in `rooms.json`.
   the next scan. Removing a room also removes its library entries.
 - **Settings:** choose the shared runtime and the **Standard-Raum (WINEPREFIX)**
   path, Windows version, and update preferences.
+- **Quit:** closing Virtual ends Wine in every room (`wineserver -k`), so no Wine
+  processes stay in the background. If programs are still running, Virtual asks first.
+- **Sound:** programs can read and change the device volume (`IAudioEndpointVolume`);
+  it is shared by all programs of a room and kept across restarts. Program, session and
+  channel volume work on macOS and never change the Mac's own volume (patch 0012).
+- **Wi-Fi:** real macOS adapter and scan data are available through Windows WLAN and
+  WinRT APIs, including device enumeration. macOS may withhold SSIDs and BSSIDs
+  according to location privacy settings (patch 0014).
+- **Windows sign-in inside a room:** programs that protect their own connections with
+  Windows authentication (NegotiateStream, WCF, local HTTP) work without a domain. Each
+  room gets its own random identity on first use (patch 0013,
+  `scripts/setup-local-auth.sh` installs the helper once).
 
 ## Links, files and certificates
 
@@ -165,14 +230,27 @@ support. A modern **.NET Desktop Runtime** (such as .NET 8) is a separate produc
 and does not replace the .NET Framework 4.8 dependency of older applications.
 Compatibility still depends on each application's Windows APIs.
 
+For applications requiring native .NET Framework 4.8 and WinRT (such as the Windows
+SEB client), use the room's **.NET Framework 4.8** tile. It stops the room's Windows
+programs, replaces Wine Mono in that room, downloads verified Microsoft installers
+and Windows SDK metadata, and installs the native WinRT bridge. Installation takes
+several minutes. Other rooms keep their current managed runtime. Command-line:
+`WINEPREFIX=/path/to/prefix scripts/setup-dotnet48.sh win10`.
+
+This adds API compatibility. Exam deployment still depends on the school's SEB
+configuration and supported platforms; Virtual does not alter SEB or its checks.
+
+
 ## Updates
 
 On launch (at most once a day) the app checks
 [Releases](https://github.com/nyra-grz/Virtual/releases) for a newer version; you
 can also check manually via **Virtual → Nach Updates suchen…** (Check for updates).
 It only **suggests** the update – nothing is installed until you click
-"Jetzt aktualisieren" (Update now). The update downloads the app archive, replaces
-the app and restarts it. If `~/WinMac_Virtual` is an unmodified git checkout, the
+"Jetzt aktualisieren" (Update now). The update downloads the complete app archive,
+including its engine and setup assets, replaces the app and restarts it. Runtime
+fixes therefore reach other users as part of the update. Rooms are prepared for
+the new engine on their next launch. If `~/WinMac_Virtual` is an unmodified git checkout, the
 scripts are updated with `git pull --ff-only` as well. The check can be turned off
 in the settings; without a window: `"Virtual.app/Contents/MacOS/Virtual" --update`.
 
@@ -185,10 +263,16 @@ Publish a new version (requires the GitHub CLI `gh`):
 ## Graphics (3D)
 
 ```bash
-./setup-graphics.sh        # set up DXVK for DirectX 10/11
+./setup-graphics.sh        # set up DXVK for DirectX 10/11 (or the room's last choice)
+./setup-graphics.sh --dxmt # DXMT instead: DirectX 10/11 straight to Metal
 ./setup-graphics.sh --dx12 # additionally VKD3D-Proton for DirectX 12 (experimental)
 ./setup-graphics.sh --off  # back to WineD3D, the original DLLs are restored
 ```
+- **DXMT** (3Shain/dxmt v0.80, `scripts/install-dxmt-runtime.sh`) is faster and reports the
+  real GPU, but aborts on D3D11 functions it does not implement yet (e.g.
+  `SwapDeviceContextState`), so DXVK stays the default. The choice is stored per room.
+- Without either, Wine's own `d3d12` (vkd3d over MoltenVK) already handles basic
+  DirectX 12 (device, swap chain, present).
 - Path: DirectX → DXVK/VKD3D → Vulkan → **MoltenVK** → Metal. MoltenVK comes from
   the Wine installation itself (x86_64). Homebrew's `molten-vk` package is arm64
   only and does not fit the x86_64 Wine running under Rosetta.
@@ -200,6 +284,26 @@ Publish a new version (requires the GitHub CLI `gh`):
   as a separate, optional Vulkan layer – never forced.
 - **Fallback:** without a GPU runtime set up, Wine renders by itself (WineD3D,
   software if necessary). That always keeps working.
+
+## Media and file notifications
+
+- **Video/audio** (Media Foundation, DirectShow): Wine is built with GStreamer
+  (`build-wine.sh` when the GStreamer.framework with development files is present);
+  `scripts/bundle-gstreamer.sh` puts 52 MB of x86_64 GStreamer libraries and LGPL/BSD
+  plugins (FFmpeg via gst-libav, dav1d, vpx, opus …) into `lib/gst` of the runtime.
+- **File change notifications** (`ReadDirectoryChangesW`, `FindFirstChangeNotification`):
+  the Wine server uses libinotify-kqueue (`scripts/build-libinotify.sh`, MIT), as on FreeBSD.
+
+## Compatibility test
+
+```bash
+uv run scripts/compat-test.py                      # default list of popular apps
+uv run scripts/compat-test.py Mozilla.Firefox 7zip.7zip --out logs/compat-x
+```
+Downloads installers from the public winget manifests (checksums verified), installs
+each app silently in its own clone of a freshly set up room, starts it and records
+whether a window appears or it crashes, with a screenshot per window
+(`report.md`, `results.json`). The apps' windows briefly appear on screen.
 
 ## Limits (honest, not worked around)
 
