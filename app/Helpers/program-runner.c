@@ -2,9 +2,146 @@
  * Wine's start /wait can return before a .lnk target exits. Closing this helper's
  * job handle terminates only this launch, including detached shortcut children. */
 #include <windows.h>
+#include <winternl.h>
 #include <stdio.h>
 #include <exdisp.h>
 #include <wchar.h>
+
+#define JOB_KEY 1
+
+/* Result rule: the start process decides, unless it reported success while
+ * processes it handed over were still running (a bootstrapper or shortcut stub
+ * starting the real installer or app). A job process whose parent had already
+ * exited is such an orphan: nobody is left to judge its exit code, so the last
+ * orphan that fails decides instead. Helpers that end while their parent still
+ * runs are left out; their parent judged them (installers routinely run probes
+ * such as reg query that fail on purpose). */
+struct member
+{
+    DWORD pid, parent;
+    HANDLE process;
+};
+
+struct launch
+{
+    HANDLE job;
+    DWORD starter;
+    BOOL starter_exited;
+    struct member *members;
+    SIZE_T count, capacity;
+    DWORD failed_pid, failed_status;
+};
+
+static BOOL succeeded(DWORD code)
+{
+    return code == 0 || code == ERROR_SUCCESS_REBOOT_REQUIRED || code == ERROR_SUCCESS_REBOOT_INITIATED;
+}
+
+static SSIZE_T find_member(const struct launch *launch, DWORD pid)
+{
+    SIZE_T i;
+    for (i = 0; i < launch->count; ++i) if (launch->members[i].pid == pid) return i;
+    return -1;
+}
+
+static DWORD parent_id(HANDLE process)
+{
+    typedef NTSTATUS (WINAPI *query_fn)(HANDLE, PROCESSINFOCLASS, void *, ULONG, ULONG *);
+    static query_fn query;
+    PROCESS_BASIC_INFORMATION info;
+    if (!query) query = (query_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    if (!query || query(process, ProcessBasicInformation, &info, sizeof(info), NULL) < 0) return 0;
+    return (DWORD)info.InheritedFromUniqueProcessId;
+}
+
+/* Open each new job process at once: the held handle keeps its exit code readable
+ * after it ends, which a later OpenProcess on the reported PID cannot promise. */
+static void add_member(struct launch *launch, DWORD pid)
+{
+    struct member member = { pid, 0, OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid) };
+    BOOL in_job = FALSE;
+    if (member.process && (!IsProcessInJob(member.process, launch->job, &in_job) || !in_job))
+    {
+        CloseHandle(member.process);   /* PID already reused by an unrelated process */
+        member.process = NULL;
+    }
+    if (member.process) member.parent = parent_id(member.process);
+    if (launch->count == launch->capacity)
+    {
+        SIZE_T capacity = launch->capacity ? 2 * launch->capacity : 16;
+        struct member *grown = launch->members
+            ? HeapReAlloc(GetProcessHeap(), 0, launch->members, capacity * sizeof(*grown))
+            : HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(*grown));
+        if (!grown)
+        {
+            if (member.process) CloseHandle(member.process);
+            return;
+        }
+        launch->members = grown;
+        launch->capacity = capacity;
+    }
+    launch->members[launch->count++] = member;
+}
+
+static void member_exited(struct launch *launch, DWORD pid)
+{
+    struct member member;
+    DWORD code = STILL_ACTIVE;
+    SSIZE_T i;
+    BOOL parent_alive;
+    if (pid == launch->starter)
+    {
+        launch->starter_exited = TRUE;
+        return;
+    }
+    if ((i = find_member(launch, pid)) < 0) return;
+    member = launch->members[i];
+    launch->members[i] = launch->members[--launch->count];
+    if (!member.process) return;
+    if (WaitForSingleObject(member.process, 1000) == WAIT_OBJECT_0) GetExitCodeProcess(member.process, &code);
+    CloseHandle(member.process);
+    parent_alive = member.parent == launch->starter ? !launch->starter_exited : find_member(launch, member.parent) >= 0;
+    if (member.parent && !parent_alive && code != STILL_ACTIVE && !succeeded(code))
+    {
+        launch->failed_pid = pid;
+        launch->failed_status = code;
+    }
+}
+
+static BOOL job_is_empty(HANDLE job)
+{
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+    return QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), NULL)
+           && !accounting.ActiveProcesses;
+}
+
+/* Job messages arrive in event order, so the member list always shows which
+ * processes were alive when a message was posted. */
+static void wait_for_job(struct launch *launch, HANDLE port, HANDLE starter)
+{
+    BOOL idle = FALSE;
+    for (;;)
+    {
+        DWORD message;
+        ULONG_PTR key;
+        OVERLAPPED *data;
+        if (port && GetQueuedCompletionStatus(port, &message, &key, &data, idle ? 0 : 50))
+        {
+            if (key != JOB_KEY) continue;
+            if (message == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO) idle = TRUE;
+            else if (message == JOB_OBJECT_MSG_NEW_PROCESS && (DWORD)(ULONG_PTR)data != launch->starter)
+                add_member(launch, (DWORD)(ULONG_PTR)data);
+            else if (message == JOB_OBJECT_MSG_EXIT_PROCESS || message == JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS)
+                member_exited(launch, (DWORD)(ULONG_PTR)data);
+            continue;
+        }
+        if (idle) break;   /* remaining messages read after the job became empty */
+        if (!port) Sleep(50);
+        /* Without job messages: a shell shortcut can spawn another process and exit
+         * immediately, so wait until the whole job is empty. */
+        if (WaitForSingleObject(starter, 0) == WAIT_OBJECT_0 && job_is_empty(launch->job)) idle = TRUE;
+    }
+}
 
 static WCHAR *command_line(int argc, WCHAR **argv)
 {
@@ -46,10 +183,11 @@ static WCHAR *command_line(int argc, WCHAR **argv)
 int wmain(int argc, WCHAR **argv)
 {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+    JOBOBJECT_ASSOCIATE_COMPLETION_PORT completion = {0};
     STARTUPINFOW startup = {0};
     PROCESS_INFORMATION child = {0};
-    HANDLE job;
+    struct launch launch = {0};
+    HANDLE job, port;
     WCHAR *line;
     DWORD status = 1;
     if (argc < 2 || !(line = command_line(argc, argv))) return 2;
@@ -71,6 +209,17 @@ int wmain(int argc, WCHAR **argv)
         HeapFree(GetProcessHeap(), 0, line);
         return 1;
     }
+    /* Before the first assignment, so no process message is missed. Without a
+     * port the launch still works, only handed-over failures go unnoticed. */
+    port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+    completion.CompletionKey = (void *)JOB_KEY;
+    completion.CompletionPort = port;
+    if (port && !SetInformationJobObject(job, JobObjectAssociateCompletionPortInformation, &completion, sizeof(completion)))
+    {
+        CloseHandle(port);
+        port = NULL;
+    }
+    launch.job = job;
     startup.cb = sizeof(startup);
     if (!CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &startup, &child))
         fprintf(stderr, "Programmstart fehlgeschlagen (Windows-Fehler %lu).\n", GetLastError());
@@ -81,16 +230,27 @@ int wmain(int argc, WCHAR **argv)
     }
     else
     {
+        launch.starter = child.dwProcessId;
         ResumeThread(child.hThread);
-        WaitForSingleObject(child.hProcess, INFINITE);
+        wait_for_job(&launch, port, child.hProcess);
         GetExitCodeProcess(child.hProcess, &status);
-        /* A shell shortcut can spawn another process and exit immediately. */
-        while (QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), NULL)
-               && accounting.ActiveProcesses) Sleep(50);
+        if (succeeded(status) && launch.failed_pid)
+        {
+            printf("\nStartprozess meldete Erfolg, der uebergebene Prozess %lu endete aber mit Fehler %lu.\n",
+                   launch.failed_pid, launch.failed_status);
+            status = launch.failed_status;
+        }
     }
+    while (launch.count)
+    {
+        HANDLE process = launch.members[--launch.count].process;
+        if (process) CloseHandle(process);
+    }
+    if (launch.members) HeapFree(GetProcessHeap(), 0, launch.members);
     if (child.hThread) CloseHandle(child.hThread);
     if (child.hProcess) CloseHandle(child.hProcess);
     CloseHandle(job);
+    if (port) CloseHandle(port);
     HeapFree(GetProcessHeap(), 0, line);
     /* Preserve Windows' 32-bit result; the host process exit status only keeps
      * the low byte (for example, MSI success-with-reboot 3010 becomes 194). */

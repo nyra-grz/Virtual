@@ -206,7 +206,9 @@ access Mac files through mapped drives. Discovery relies on installer shortcuts;
 portable apps without shortcuts must be added manually. User Desktop symlinks to
 the Mac Desktop are skipped, as are obvious uninstall/help/documentation links.
 Some shortcut formats or PE icons may fall back to a generic icon. The bundled `program-runner.exe` tracks a launch and its descendants in a Windows
-job, so **Beenden** also stops detached shortcut children. Builds without
+job, so **Beenden** also stops detached shortcut children. If the started process
+reports success but a process it handed over (for example the real installer
+behind a bootstrapper) fails after it, that failure is reported. Builds without
 mingw-w64 fall back to tracking the initial process.
 File and URL handoff depends on valid Windows associations and Wine support.
 Registered open commands are launched directly, including per-user registrations

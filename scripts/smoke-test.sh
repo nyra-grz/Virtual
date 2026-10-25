@@ -313,6 +313,51 @@ if [ "$PREFIX_READY" = 1 ] && command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1;
             report FEHLER "Programmstart über App-Helfer" "Status $runner_status"
             show_log runner.log
         fi
+        # Bootstrapper-Fall: Der Startprozess endet mit 0, der übergebene Prozess
+        # scheitert danach. Ein Fehler, den der Startprozess selbst abwartet, zählt nicht.
+        cat >handoff.c <<'C'
+#include <windows.h>
+#include <wchar.h>
+static int spawn(const WCHAR *mode, BOOL wait)
+{
+    WCHAR self[MAX_PATH], line[MAX_PATH + 32];
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION child;
+    ZeroMemory(&startup, sizeof(startup));
+    startup.cb = sizeof(startup);
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    swprintf(line, MAX_PATH + 32, L"\"%ls\" %ls", self, mode);
+    if (!CreateProcessW(NULL, line, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) return 1;
+    if (wait) WaitForSingleObject(child.hProcess, INFINITE);
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    return 0;
+}
+int wmain(int argc, WCHAR **argv)
+{
+    if (argc < 2) return 2;
+    if (!wcscmp(argv[1], L"handoff")) return spawn(L"late", FALSE);
+    if (!wcscmp(argv[1], L"supervised")) return spawn(L"fail", TRUE);
+    if (!wcscmp(argv[1], L"late")) Sleep(500);
+    return 41;
+}
+C
+        if x86_64-w64-mingw32-gcc -municode -Wall -Wextra -Werror handoff.c -o handoff.exe >handoff-build.log 2>&1; then
+            for handoff in handoff:41 supervised:0; do
+                mode="${handoff%%:*}" expected="${handoff#*:}"
+                "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/program-runner.exe" "$SCRATCH/handoff.exe" "$mode" >"runner-$mode.log" 2>&1
+                runner_status=$?
+                if [ "$runner_status" = "$expected" ] && grep -q "VIRTUAL_EXIT_CODE=$expected" "runner-$mode.log"; then
+                    report ok "App-Helfer: $mode" "Windows-Exitcode $expected"
+                else
+                    report FEHLER "App-Helfer: $mode" "Status $runner_status statt $expected"
+                    show_log "runner-$mode.log"
+                fi
+            done
+        else
+            report FEHLER "Übergabe-Test kompilieren"
+            show_log handoff-build.log
+        fi
     else
         report FEHLER "App-Helfer kompilieren"
         show_log runner-build.log

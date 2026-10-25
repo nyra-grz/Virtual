@@ -26,6 +26,10 @@ final class ImportAndLaunchTests: XCTestCase {
         printf '%s\\n' "$@" > "$WINEPREFIX/launched-args"
         if [ -f "$WINMAC_ROOT/fail-unknown" ]; then echo 'err:module:import_dll Library vendor_private.dll not found'; exit 4; fi
         if [ -f "$WINMAC_ROOT/fail-launch" ]; then echo 'err:module:import_dll Library VCRUNTIME140.dll not found'; exit 4; fi
+        if [ -f "$WINMAC_ROOT/fail-handoff" ]; then
+            printf '\\nStartprozess meldete Erfolg, der uebergebene Prozess 42 endete aber mit Fehler 1603.\\n\\nVIRTUAL_EXIT_CODE=1603\\n'
+            exit 67
+        fi
         """, to: runtime.appendingPathComponent("bin/virtual"), executable: true)
     }
 
@@ -255,6 +259,19 @@ final class ImportAndLaunchTests: XCTestCase {
         XCTAssertTrue(LaunchDiagnostics.installerSucceeded(status: 194, isMSI: true))
         XCTAssertFalse(LaunchDiagnostics.installerSucceeded(status: 194, isMSI: false))
         XCTAssertFalse(LaunchDiagnostics.installerSucceeded(status: 1603, isMSI: true))
+    }
+
+    /// program-runner meldet den Fehler eines übergebenen Prozesses (Bootstrapper endet mit 0,
+    /// der eigentliche Installer scheitert); vom Mac-Status bleibt nur das untere Byte (67).
+    func testHandedOverFailureIsReportedWithFullWindowsCode() throws {
+        try write("fail", to: root.appendingPathComponent("fail-handoff"))
+        let room = room(), app = try program(in: room, filename: "Setup.exe")
+        let failed = observe(Launcher.didFail) { note in
+            XCTAssertTrue((note.userInfo?["message"] as? String)?.contains("Status 1603") == true)
+        }
+        try Launcher.shared.launch(app)
+        wait(for: [failed], timeout: 5)
+        XCTAssertFalse(Launcher.shared.isRunning(app))
     }
 
     func testParallelAppsInstallDependencyUnionBeforeEitherStarts() throws {
