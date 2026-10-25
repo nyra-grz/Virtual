@@ -86,13 +86,17 @@ if [ "${#ADDED64[@]}" -gt 0 ] || [ "${#ADDED32[@]}" -gt 0 ]; then
 fi
 
 # Windows-System-ICU (icu.dll + Weiterleitungen icuuc/icuin, scripts/build-icu.sh), wie
-# sie Windows 10 seit 1903 hat. Nur fehlende kopieren: eigene DLLs eines Raums bleiben.
+# sie Windows 10 seit 1903 hat. Ersetzt nur fehlende Dateien und Wine-Platzhalter (ältere
+# Wine-Versionen legten ein icu.dll ohne Daten an); echte DLLs eines Raums bleiben.
+is_wine_placeholder() { [ "$(dd if="$1" bs=1 skip=64 count=16 2>/dev/null)" = "Wine builtin DLL" ]; }
 ICU_LIB="$RUNTIME/wine-build/lib/icu"
 for pair in "x86_64-windows:system32" "i386-windows:syswow64"; do
     arch="${pair%%:*}" sys="$WINEPREFIX/drive_c/windows/${pair#*:}"
     [ -d "$ICU_LIB/$arch" ] && [ -d "$sys" ] || continue
     for name in icu.dll icuuc.dll icuin.dll; do
-        [ -f "$ICU_LIB/$arch/$name" ] && [ ! -e "$sys/$name" ] || continue
+        [ -f "$ICU_LIB/$arch/$name" ] || continue
+        [ ! -e "$sys/$name" ] || is_wine_placeholder "$sys/$name" || continue
+        rm -f "$sys/$name"
         cp -c "$ICU_LIB/$arch/$name" "$sys/$name" 2>/dev/null || cp "$ICU_LIB/$arch/$name" "$sys/$name"
     done
 done

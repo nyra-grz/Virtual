@@ -210,6 +210,16 @@ bash "$ROOT/scripts/install-dxmt-runtime.sh" "$PREFIX_INSTALL"
 if [ -f "$PREFIX_INSTALL/lib/wine/x86_64-unix/winegstreamer.so" ]; then
     bash "$ROOT/scripts/bundle-gstreamer.sh" "$PREFIX_INSTALL" "$GST_FW"
 fi
+# Windows-System-ICU (scripts/build-icu.sh); init-prefix.sh kopiert sie in die Räume.
+if [ -f "$ROOT/thirdparty/icu/out/x86_64-windows/icu.dll" ]; then
+    for arch in x86_64 i386; do
+        mkdir -p "$PREFIX_INSTALL/lib/icu/$arch-windows"
+        cp "$ROOT/thirdparty/icu/out/$arch-windows/"{icu,icuuc,icuin}.dll "$PREFIX_INSTALL/lib/icu/$arch-windows/"
+    done
+    cp "$(ls -d "$ROOT"/thirdparty/icu/icu-*/LICENSE | tail -1)" "$PREFIX_INSTALL/lib/icu/LICENSE"
+else
+    echo "    Hinweis: ohne Windows-ICU (scripts/build-icu.sh) – Qt-6-Apps starten dann nicht."
+fi
 
 # --- 6. Umbenannten Front-End-Befehlssatz erzeugen ---------------------------
 if [ -d "$RUNTIME/bin" ]; then
