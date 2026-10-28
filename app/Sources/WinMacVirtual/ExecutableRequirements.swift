@@ -35,12 +35,17 @@ struct ExecutableRequirements {
         var libraries = image.names
         var pending = image.names.map { ($0, 0) }
         var visited = Set<String>()
+        var inspectedLibraries = 0
         let folder = target.deletingLastPathComponent().resolvingSymlinksInPath()
-        while !pending.isEmpty && visited.count < 32 {
+        // System imports do not consume the local-DLL inspection budget. Large
+        // programs commonly import 32+ system DLLs before their own Qt/plugin
+        // library, which can be the only place a VC runtime dependency appears.
+        while !pending.isEmpty && inspectedLibraries < 32 {
             let (name, depth) = pending.removeFirst()
             guard !name.contains("/"), !name.contains("\\"), !name.contains(":"), visited.insert(name.lowercased()).inserted else { continue }
             let sibling = folder.appendingPathComponent(name).resolvingSymlinksInPath()
             guard sibling.path.hasPrefix(folder.path + "/"), let bytes = try? Data(contentsOf: sibling, options: .mappedIfSafe) else { continue }
+            inspectedLibraries += 1
             let imports = PEImports(data: bytes).names
             libraries.append(contentsOf: imports)
             if depth < 2 { pending.append(contentsOf: imports.map { ($0, depth + 1) }) }

@@ -1,0 +1,97 @@
+# Virtual: implement documented parent-background drawing for modern controls.
+# Reference: https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-drawthemeparentbackgroundex
+diff --git a/include/uxtheme.h b/include/uxtheme.h
+--- a/include/uxtheme.h
++++ b/include/uxtheme.h
+@@ -55,6 +55,11 @@
+ THEMEAPI DrawThemeEdge(HTHEME,HDC,int,int,const RECT*,UINT,UINT, RECT*);
+ THEMEAPI DrawThemeIcon(HTHEME,HDC,int,int,const RECT*,HIMAGELIST,int);
+ THEMEAPI DrawThemeParentBackground(HWND,HDC,RECT*);
++
++#define DTPB_WINDOWDC          0x00000001
++#define DTPB_USECTLCOLORSTATIC 0x00000002
++#define DTPB_USEERASEBKGND     0x00000004
++THEMEAPI DrawThemeParentBackgroundEx(HWND,HDC,DWORD,const RECT*);
+ THEMEAPI DrawThemeText(HTHEME,HDC,int,int,LPCWSTR,int,DWORD,DWORD, const RECT*);
+ 
+ #define DTT_GRAYED      0x1
+diff --git a/dlls/uxtheme/uxtheme.spec b/dlls/uxtheme/uxtheme.spec
+--- a/dlls/uxtheme/uxtheme.spec
++++ b/dlls/uxtheme/uxtheme.spec
+@@ -65,6 +65,7 @@
+ @ stdcall DrawThemeEdge(ptr ptr long long ptr long long ptr)
+ @ stdcall DrawThemeIcon(ptr ptr long long ptr ptr long)
+ @ stdcall DrawThemeParentBackground(ptr ptr ptr)
++@ stdcall DrawThemeParentBackgroundEx(ptr ptr long ptr)
+ @ stdcall DrawThemeText(ptr ptr long long wstr long long long ptr)
+ @ stdcall DrawThemeTextEx(ptr ptr long long wstr long long ptr ptr)
+ @ stdcall EnableThemeDialogTexture(ptr long)
+diff --git a/dlls/uxtheme/draw.c b/dlls/uxtheme/draw.c
+--- a/dlls/uxtheme/draw.c
++++ b/dlls/uxtheme/draw.c
+@@ -141,6 +141,65 @@
+     return S_OK;
+ }
+ 
++
++/* Unlike DrawThemeParentBackground, the extended entry point reports whether
++ * the parent supplied a background and can fall back to WM_CTLCOLORSTATIC.
++ * WM_PRINTCLIENT has no meaningful return value; use GDI drawing bounds to
++ * distinguish a painted client from an unhandled message. */
++HRESULT WINAPI DrawThemeParentBackgroundEx(HWND hwnd, HDC hdc, DWORD flags, const RECT *rect)
++{
++    HWND parent;
++    RECT area, window, old_bounds, painted;
++    POINT origin = {0, 0};
++    UINT old_bounds_type, old_bounds_flags;
++    HBRUSH brush;
++    HRESULT result = S_FALSE;
++    int saved;
++
++    TRACE("(%p,%p,%#lx,%s)\n", hwnd, hdc, flags, wine_dbgstr_rect(rect));
++    if (!IsWindow(hwnd) || !(parent = GetParent(hwnd)) || !(saved = SaveDC(hdc))) return S_FALSE;
++
++    old_bounds_type = GetBoundsRect(hdc, &old_bounds, 0);
++    old_bounds_flags = SetBoundsRect(hdc, NULL, DCB_ENABLE | DCB_RESET);
++    if (flags & DTPB_WINDOWDC)
++    {
++        GetWindowRect(hwnd, &window);
++        origin.x = window.left;
++        origin.y = window.top;
++        MapWindowPoints(NULL, parent, &origin, 1);
++        SetRect(&area, 0, 0, window.right - window.left, window.bottom - window.top);
++    }
++    else
++    {
++        MapWindowPoints(hwnd, parent, &origin, 1);
++        GetClientRect(hwnd, &area);
++    }
++    if (rect) area = *rect;
++    IntersectClipRect(hdc, area.left, area.top, area.right, area.bottom);
++    OffsetViewportOrgEx(hdc, -origin.x, -origin.y, NULL);
++    OffsetRect(&area, origin.x, origin.y);
++
++    if (SendMessageW(parent, WM_ERASEBKGND, (WPARAM)hdc, 0) && (flags & DTPB_USEERASEBKGND))
++        result = S_OK;
++    else
++    {
++        SetBoundsRect(hdc, NULL, DCB_ENABLE | DCB_RESET);
++        SendMessageW(parent, WM_PRINTCLIENT, (WPARAM)hdc, PRF_CLIENT);
++        if (GetBoundsRect(hdc, &painted, DCB_RESET) == DCB_SET && !IsRectEmpty(&painted))
++            result = S_OK;
++        else if (flags & DTPB_USECTLCOLORSTATIC)
++        {
++            brush = (HBRUSH)SendMessageW(parent, WM_CTLCOLORSTATIC, (WPARAM)hdc, (LPARAM)hwnd);
++            if (!brush) brush = GetSysColorBrush(COLOR_BTNFACE);
++            if (FillRect(hdc, &area, brush)) result = S_OK;
++        }
++    }
++
++    RestoreDC(hdc, saved);
++    SetBoundsRect(hdc, &old_bounds, DCB_RESET | (old_bounds_flags & (DCB_ENABLE | DCB_DISABLE)) |
++                 (old_bounds_type == DCB_SET ? DCB_ACCUMULATE : 0));
++    return result;
++}
+ 
+ /***********************************************************************
+  *      DrawThemeBackground                                 (UXTHEME.@)

@@ -12,7 +12,8 @@ final class ExecutableRequirementsTests: XCTestCase {
     override func tearDownWithError() throws { try FileManager.default.removeItem(at: directory) }
 
     static func fixtureData(imports: [String], clr: Bool = false, x64: Bool = true) -> Data {
-        var bytes = [UInt8](repeating: 0, count: 2048)
+        let namesOffset = max(768, ((512 + (imports.count + 1) * 20 + 127) / 128) * 128)
+        var bytes = [UInt8](repeating: 0, count: max(2048, namesOffset + imports.count * 128))
         func word(_ offset: Int, _ value: UInt16) { bytes[offset] = UInt8(truncatingIfNeeded: value); bytes[offset + 1] = UInt8(truncatingIfNeeded: value >> 8) }
         func dword(_ offset: Int, _ value: UInt32) { word(offset, UInt16(truncatingIfNeeded: value)); word(offset + 2, UInt16(truncatingIfNeeded: value >> 16)) }
         word(0, 0x5a4d); dword(0x3c, 0x80); dword(0x80, 0x4550)
@@ -22,9 +23,10 @@ final class ExecutableRequirementsTests: XCTestCase {
         dword(directories + 8, 0x1000)
         if clr { dword(directories + 14 * 8, 0x1400) }
         let section = 0x98 + (x64 ? 240 : 224)
-        dword(section + 8, 1536); dword(section + 12, 0x1000); dword(section + 16, 1536); dword(section + 20, 512)
+        dword(section + 8, UInt32(bytes.count - 512)); dword(section + 12, 0x1000)
+        dword(section + 16, UInt32(bytes.count - 512)); dword(section + 20, 512)
         for (index, name) in imports.enumerated() {
-            let offset = 768 + index * 128
+            let offset = namesOffset + index * 128
             dword(512 + index * 20 + 12, UInt32(0x1000 + offset - 512))
             for (i, byte) in name.utf8.enumerated() { bytes[offset + i] = byte }
         }
@@ -106,6 +108,12 @@ final class ExecutableRequirementsTests: XCTestCase {
 
     func testDependenciesInAdjacentDllAreDiscovered() throws {
         let url = try fixture(imports: ["engine.dll"])
+        try Self.fixtureData(imports: ["vcruntime140_1.dll"]).write(to: directory.appendingPathComponent("engine.dll"))
+        XCTAssertEqual(ExecutableRequirements.inspect(url, in: room).components, ["vcrun2026"])
+    }
+
+    func testSystemImportsDoNotHideDependenciesInALaterLocalLibrary() throws {
+        let url = try fixture(imports: (0..<40).map { "system\($0).dll" } + ["engine.dll"])
         try Self.fixtureData(imports: ["vcruntime140_1.dll"]).write(to: directory.appendingPathComponent("engine.dll"))
         XCTAssertEqual(ExecutableRequirements.inspect(url, in: room).components, ["vcrun2026"])
     }

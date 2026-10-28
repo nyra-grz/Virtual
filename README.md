@@ -312,7 +312,7 @@ bash scripts/check-core.sh
 ```
 
 It checks the launcher, concurrent dependency installation and the real runtime
-(32/64-bit execution, process handoff, timers, graphics, files, media and devices).
+(32/64-bit execution, process handoff, timers, control backgrounds, graphics, files, media and devices).
 It downloads no test applications and removes its temporary Windows environment.
 This is the first check after a shared fix; the app matrix is a later check.
 

@@ -505,6 +505,22 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
         show_log "timer$bits.err"
     fi
 done
+# Modern controls draw their parent's background through this Vista+ API. Check
+# actual memory-DC pixels, clipping, window/client coordinates and saved DC state.
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    if [ "$PREFIX_READY" != 1 ] || ! command -v "$cc" >/dev/null 2>&1; then
+        report übersprungen "Integration: Parent-Hintergrund $bits Bit" "Prefix oder Compiler fehlt"
+    elif "$cc" -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/theme_parent.c" -o "theme$bits.exe" -luser32 -lgdi32 >"compile-theme$bits.log" 2>&1 &&
+         "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/theme$bits.exe" >"theme$bits.out" 2>"theme$bits.err"; then
+        report ok "Integration: Parent-Hintergrund $bits Bit" "$(tr -d '\r' <"theme$bits.out" | tail -1)"
+    else
+        report FEHLER "Integration: Parent-Hintergrund $bits Bit"
+        show_log "compile-theme$bits.log"
+        show_log "theme$bits.out"
+        show_log "theme$bits.err"
+    fi
+done
 # Windows-System-ICU (icu.dll + Weiterleitungen), 64 und 32 Bit; der Test ist mit -licu
 # gelinkt und startet ohne icu.dll gar nicht.
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
