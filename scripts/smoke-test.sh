@@ -337,6 +337,54 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
     done
 done
 
+# Browser options must follow Electron's image identity, not its executable name
+# or the location of its assets. Plain Node, renderers and Node-mode CLIs stay plain.
+cat >electron-options.def <<'DEF'
+EXPORTS
+napi_module_register=probe_napi_register
+"?IsRunAsNodeEnabled@fuses@electron@@YA_NXZ"=probe_electron_fuse
+DEF
+cat >node-options.def <<'DEF'
+EXPORTS
+napi_module_register=probe_napi_register
+DEF
+chromium_options_test() {
+    local label="$1"; shift
+    if "$WINMAC_RUNTIME/bin/virtual" "$@" >"chromium-$bits-$label.out" 2>"chromium-$bits-$label.err"; then
+        report ok "Chromium $bits Bit: $label" "$(tr -d '\r' <"chromium-$bits-$label.out" | tail -1)"
+    else
+        report FEHLER "Chromium $bits Bit: $label"
+        show_log "chromium-$bits-$label.out"
+        show_log "chromium-$bits-$label.err"
+    fi
+}
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    if [ "$PREFIX_READY" != 1 ] || ! command -v "$cc" >/dev/null 2>&1; then
+        report übersprungen "Chromium $bits Bit" "Prefix oder Compiler fehlt"
+        continue
+    fi
+    mkdir -p "electron$bits" "node$bits" "ordinary$bits" "legacy$bits"
+    if ! "$cc" -municode -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/chromium_options.c" electron-options.def -o "electron$bits/probe.exe" >"compile-chromium$bits.log" 2>&1 ||
+       ! "$cc" -municode -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/chromium_options.c" node-options.def -o "node$bits/probe.exe" >>"compile-chromium$bits.log" 2>&1 ||
+       ! "$cc" -municode -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/chromium_options.c" -o "ordinary$bits/probe.exe" >>"compile-chromium$bits.log" 2>&1; then
+        report FEHLER "Chromium $bits Bit kompilieren"
+        show_log "compile-chromium$bits.log"
+        continue
+    fi
+    cp "ordinary$bits/probe.exe" "legacy$bits/probe.exe"
+    touch "legacy$bits/icudtl.dat" "legacy$bits/resources.pak"
+    chromium_options_test modern "$SCRATCH/electron$bits/probe.exe" --expect-compat
+    chromium_options_test explicit "$SCRATCH/electron$bits/probe.exe" --expect-compat --in-process-gpu --no-sandbox
+    chromium_options_test renderer "$SCRATCH/electron$bits/probe.exe" --expect-plain --type=renderer
+    VIRTUAL_CHROMIUM_GPU_PROCESS=1 chromium_options_test opt-out "$SCRATCH/electron$bits/probe.exe" --expect-plain
+    ELECTRON_RUN_AS_NODE=1 chromium_options_test node-mode "$SCRATCH/electron$bits/probe.exe" --expect-plain
+    chromium_options_test windows-node-child "$SCRATCH/electron$bits/probe.exe" --expect-compat --spawn-node
+    chromium_options_test plain-node "$SCRATCH/node$bits/probe.exe" --expect-plain
+    chromium_options_test ordinary "$SCRATCH/ordinary$bits/probe.exe" --expect-plain
+    chromium_options_test legacy "$SCRATCH/legacy$bits/probe.exe" --expect-compat
+done
+
 # e) Ausschließlich Hardware-Gerät; kein stiller WARP-/Software-Fallback.
 cat >d3d11.c <<'C'
 #define COBJMACROS

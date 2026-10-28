@@ -18,6 +18,7 @@
 0021-Virtual-0022-kernelbase-process-group-affinity.patch
 0022-Virtual-0023-threadpool-timer-ex.patch
 0023-Virtual-0024-uxtheme-parent-background-ex.patch
+0024-Virtual-0025-electron-image-detection.patch
 
 # frozen: WinRT networking/devices for Safe Exam Browser. Carried along
 # mechanically on rebases; dropped (with their smoke probes) if they conflict.
