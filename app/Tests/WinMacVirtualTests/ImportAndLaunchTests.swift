@@ -315,6 +315,19 @@ final class ImportAndLaunchTests: XCTestCase {
         XCTAssertTrue(Launcher.stopFailureMessage([stuck]).contains("„\(stuck.name)“"))
     }
 
+    func testStopAllCannotConfirmEndWithoutServerExecutable() throws {
+        let room = room()
+        try FileManager.default.createDirectory(at: room.prefixURL, withIntermediateDirectories: true)
+        XCTAssertEqual(stopAll([room]), [room.id])
+    }
+
+    func testStopAllReportsKillCommandErrors() throws {
+        try write("#!/bin/bash\nexit 2\n", to: Settings.shared.virtualServer, executable: true)
+        let room = room()
+        try FileManager.default.createDirectory(at: room.prefixURL, withIntermediateDirectories: true)
+        XCTAssertEqual(stopAll([room]), [room.id])
+    }
+
     func testStopAllWaitsForTheRoomsOwnPrograms() throws {
         try fakeServer()
         try write("""

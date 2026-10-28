@@ -176,11 +176,12 @@ final class Launcher {
     }
 
     /// `-k` beendet den Wine-Server des Raums (Status 1 heißt nur: es lief keiner), `-w` bestätigt,
-    /// dass er wirklich weg ist. Ohne Server-Programm konnte im Raum nichts laufen.
+    /// dass er wirklich weg ist. Ein fehlender Server lässt keine Bestätigung zu.
     private static func stopServer(_ server: URL, environment: [String: String], deadline: Date) -> Bool {
-        guard FileManager.default.isExecutableFile(atPath: server.path) else { return true }
-        return run(server, ["-k"], environment: environment, until: deadline) != nil
-            && run(server, ["-w"], environment: environment, until: deadline) == 0
+        guard FileManager.default.isExecutableFile(atPath: server.path),
+              let status = run(server, ["-k"], environment: environment, until: deadline),
+              status == 0 || status == 1 else { return false }
+        return run(server, ["-w"], environment: environment, until: deadline) == 0
     }
 
     /// Wartet auf einen Hilfsbefehl; nil, wenn er nicht startet oder die Frist überschreitet

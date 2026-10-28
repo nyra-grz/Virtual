@@ -305,8 +305,19 @@ Publish a new version (requires the GitHub CLI `gh`):
 
 ## Compatibility test
 
+Start with the small shared-function regression gate:
+
 ```bash
-uv run scripts/compat-test.py                      # default list of popular apps
+bash scripts/check-core.sh
+```
+
+It checks the launcher, concurrent dependency installation and the real runtime
+(32/64-bit execution, process handoff, timers, graphics, files, media and devices).
+It downloads no test applications and removes its temporary Windows environment.
+This is the first check after a shared fix; the app matrix is a later check.
+
+```bash
+uv run scripts/compat-test.py                      # six representatives: Win32, Gecko, Electron, Qt, media, .NET
 uv run scripts/compat-test.py Mozilla.Firefox 7zip.7zip --out logs/compat-x
 uv run scripts/compat-test.py --list support/compat-apps.txt --jobs 3 --out logs/compat-broad
 ```
@@ -325,6 +336,11 @@ when downloaded. A full run downloads and installs substantial amounts of softwa
 start with a small group of IDs to check a new runtime first. Each worker gets its
 own cloned prefix, and only that prefix is stopped during cleanup. These Wine
 prefixes are not security sandboxes.
+
+By default all stopped test installations, including failed ones, their downloaded
+installers and the base prefix are deleted. Logs, screenshots and reports remain.
+Use `--keep-rooms` and/or `--keep-downloads` only for a targeted investigation.
+A room whose shutdown cannot be confirmed is retained and reported for cleanup.
 
 `causes.md` groups failures for triage. An unimplemented API is reported explicitly;
 nearby Wine stubs are only diagnostic clues, not proof of a crash's cause. Window

@@ -9,9 +9,9 @@ Holt Installer über die öffentlichen winget-Manifeste (mit Prüfsumme), instal
 jede App still in einem eigenen, frisch geklonten Raum, startet sie und hält fest,
 ob ein Fenster erscheint oder sie abstürzt (mit Bildschirmfoto des Fensters).
 
-    uv run scripts/compat-test.py [winget-IDs …] [--out ORDNER] [--runtime runtime]
+    uv run scripts/compat-test.py [winget-IDs …] [--out ORDNER] [--engine ORDNER]
 
-Ohne IDs wird die Standardliste getestet. Ergebnis: ORDNER/report.md + results.json.
+Ohne IDs werden sechs Vertreter verschiedener Technik getestet. Ergebnis: ORDNER/report.md + results.json.
 Die Fenster der getesteten Apps erscheinen kurz auf dem Bildschirm.
 """
 import argparse, hashlib, json, os, re, shlex, shutil, subprocess, sys, time, urllib.request
@@ -23,13 +23,12 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_APPS = [
-    "Google.Chrome", "Mozilla.Firefox", "Brave.Brave", "VideoLAN.VLC", "7zip.7zip",
-    "Notepad++.Notepad++", "Discord.Discord", "Valve.Steam", "EpicGames.EpicGamesLauncher",
-    "Microsoft.VisualStudioCode", "Telegram.TelegramDesktop", "Audacity.Audacity",
-    "GIMP.GIMP.3", "KeePassXCTeam.KeePassXC", "TheDocumentFoundation.LibreOffice",
-    "OBSProject.OBSStudio", "GOG.Galaxy", "ElectronicArts.EADesktop", "Ubisoft.Connect",
-    "Python.Python.3.13", "Git.Git", "Zoom.Zoom", "Obsidian.Obsidian", "Spotify.Spotify",
-    "qBittorrent.qBittorrent", "Blizzard.BattleNet",
+    "7zip.7zip",                     # Win32 controls and files
+    "Mozilla.Firefox",               # Gecko, browser rendering
+    "Microsoft.VisualStudioCode",    # Electron/Chromium
+    "KeePassXCTeam.KeePassXC",        # Qt
+    "VideoLAN.VLC",                  # Audio/video
+    "HandBrake.HandBrake",           # .NET desktop
 ]
 ENGINE = ROOT / "build" / "Virtual.app" / "Contents" / "Resources" / "Engine"
 # Fehlerdialoge zählen nicht als „läuft“; kleine Fenster sind meist Start-/Update-Fenster.
@@ -51,7 +50,12 @@ def run(cmd, **kw):
 
 def gh_list(path):
     r = run(["gh", "api", f"repos/microsoft/winget-pkgs/contents/{path}"])
-    return json.loads(r.stdout) if r.returncode == 0 else []
+    if r.returncode:
+        # Rate limits, authentication and network errors do not prove absence.
+        if "HTTP 404" in r.stderr:
+            return []
+        raise RuntimeError("winget-Abfrage fehlgeschlagen: " + r.stderr.strip())
+    return json.loads(r.stdout)
 
 
 def version_key(name):
@@ -89,10 +93,16 @@ def download(url, sha, dest):
     if dest.exists() and hashlib.sha256(dest.read_bytes()).hexdigest().lower() == sha.lower():
         return True
     req = urllib.request.Request(url, headers={"User-Agent": "Virtual-compat-test"})
-    with urllib.request.urlopen(req, timeout=300) as f, open(dest.with_suffix(".part"), "wb") as out:
-        shutil.copyfileobj(f, out)
-    dest.with_suffix(".part").rename(dest)
-    return hashlib.sha256(dest.read_bytes()).hexdigest().lower() == sha.lower()
+    part = dest.with_suffix(".part")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as f, open(part, "wb") as out:
+            shutil.copyfileobj(f, out)
+        if hashlib.sha256(part.read_bytes()).hexdigest().lower() != sha.lower():
+            return False
+        part.replace(dest)
+        return True
+    finally:
+        part.unlink(missing_ok=True)
 
 
 def pid_in_room(pid, room):
@@ -184,16 +194,22 @@ def registered_apps(prefix):
 
 
 def uniform(png):
-    """True, wenn der Fensterinhalt praktisch einfarbig ist (schwarzes/weißes Fenster)."""
+    """True/False for a checked image; None when rendering could not be checked."""
     bmp = png.with_suffix(".bmp")
-    if run(["sips", "-s", "format", "bmp", str(png), "--out", str(bmp)]).returncode or not bmp.exists():
-        return False
-    data = bmp.read_bytes()
-    bmp.unlink()
+    try:
+        if run(["sips", "-s", "format", "bmp", str(png), "--out", str(bmp)]).returncode or not bmp.exists():
+            return None
+        data = bmp.read_bytes()
+    finally:
+        bmp.unlink(missing_ok=True)
+    if len(data) < 54 or data[:2] != b"BM":
+        return None
     off = int.from_bytes(data[10:14], "little")
     w, h = int.from_bytes(data[18:22], "little", signed=True), abs(int.from_bytes(data[22:26], "little", signed=True))
     step = int.from_bytes(data[28:30], "little") // 8
     row = (w * step + 3) & ~3
+    if w <= 0 or h <= 0 or step not in (3, 4) or off < 54 or off + row * h > len(data):
+        return None
     counts = {}
     # Titelleisten oben (bzw. unten bei Bottom-up-BMPs) auslassen
     for y in range(h // 8, h - h // 8, 4):
@@ -203,7 +219,7 @@ def uniform(png):
             counts[px] = counts.get(px, 0) + 1
     total = sum(counts.values())
     # 7-Zip mit leerer Dateiliste liegt bei 99,3 %, ein leeres Electron-Fenster bei 100 %.
-    return total > 0 and max(counts.values()) / total > 0.998
+    return max(counts.values()) / total > 0.998 if total else None
 
 
 def missing_dlls(prefix, *logs):
@@ -327,7 +343,8 @@ def main():
     ap.add_argument("--winlist", default=str(ROOT / "build" / "winlist"))
     ap.add_argument("--install-timeout", type=positive_int, default=420)
     ap.add_argument("--launch-wait", type=positive_int, default=60, help="Sekunden bis zur Prüfung; Launcher mit kleinem Startfenster bekommen bis zum Dreifachen")
-    ap.add_argument("--keep-rooms", action="store_true", help="auch Räume laufender Apps behalten (sonst nur gescheiterte)")
+    ap.add_argument("--keep-rooms", action="store_true", help="Testinstallationen und Vorlage zur gezielten Fehlersuche behalten")
+    ap.add_argument("--keep-downloads", action="store_true", help="heruntergeladene Testinstaller im Cache behalten")
     ap.add_argument("--guest-windows", action="store_true", help="Only query windows inside the isolated Wine instance; no macOS window capture")
     args = ap.parse_args()
     apps = list(args.apps)
@@ -374,7 +391,7 @@ def main():
     base_links = {p.relative_to(base) for p in shortcuts(base)}
     base_apps = set(registered_apps(base))
 
-    def test_app(app, res):
+    def test_app(app, res, artifacts):
         try:
             version, m = manifest(app)
         except Exception as e:
@@ -396,6 +413,7 @@ def main():
         if not name.lower().endswith((".exe", ".msi")):
             name += ".exe"
         dl = cache / f"{app}-{version}-{name}"
+        artifacts["installer"] = dl
         try:
             if not download(url, inst["InstallerSha256"], dl):
                 res["result"] = "Prüfsumme des Downloads stimmt nicht"
@@ -481,7 +499,9 @@ def main():
                     shot = out / "rooms" / app / f"window-{wid}.png"
                     if run(["screencapture", "-x", "-o", "-l", wid, str(shot)]).returncode == 0 and shot.exists():
                         entry["file"] = str(shot.relative_to(out))
-                        entry["uniform"] = uniform(shot)
+                        checked = uniform(shot)
+                        if checked is not None:
+                            entry["uniform"] = checked
                 shots.append(entry)
             text = launch_log.read_text(errors="replace")
             crashed = bool(UNIMPLEMENTED.search(text) or re.search(r"Unhandled (page fault|exception)|wine: Unhandled|unhandled exception", text, re.I))
@@ -529,25 +549,39 @@ def main():
         # Active workers own their mutable dictionaries. Published snapshots
         # contain completed copies only, never dictionaries another worker edits.
         res = {"app": apps[index]}
+        artifacts = {}
         print(f"==> {res['app']}", flush=True)
         try:
-            test_app(res["app"], res)
+            test_app(res["app"], res, artifacts)
         except Exception as e:  # ein kaputter Fall soll den Lauf nicht beenden
             res["status"] = res["result"] = f"Testfehler: {e}"
-        # Installierte Apps brauchen viel Platz; nur gescheiterte Räume bleiben zur Fehlersuche.
+        # Logs and screenshots suffice for triage; keep installations only on request.
         room = out / "rooms" / res["app"] / "prefix"
-        if res.get("status") == "läuft" and not args.keep_rooms and room.exists():
-            shutil.rmtree(room, ignore_errors=True)
+        try:
+            if not args.keep_rooms and room.exists() and not res.get("cleanup_error"):
+                shutil.rmtree(room)
+            if not args.keep_downloads and "installer" in artifacts:
+                artifacts["installer"].unlink(missing_ok=True)
+        except OSError as e:
+            res["cleanup_error"] = f"Testdateien konnten nicht gelöscht werden: {e}"
         write_results(out / "results.json", results, results_lock, (index, res))
         print(f"    {res['app']}: {res.get('status') or res.get('result')}", flush=True)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        list(pool.map(guarded, range(len(apps))))
+    try:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            list(pool.map(guarded, range(len(apps))))
+    finally:
+        if not args.keep_rooms and stop_room(server, env):
+            shutil.rmtree(base, ignore_errors=True)
 
     write_results(out / "results.json", results, results_lock)
     ok = sum(1 for r in results if r.get("status") == "läuft")
+    attempted = sum("install_exit" in r for r in results)
+    not_attempted = len(results) - attempted
     lines = [f"# Kompatibilitätstest {time.strftime('%Y-%m-%d %H:%M')}", "", f"Engine: `{engine}`", "",
-             f"{ok} von {len(results)} Apps bestehen die Fensterprüfung (Hauptfenster nach {args.launch_wait} s noch offen, kein Fehlerdialog, Aufnahme nicht einfarbig).", "",
+             f"{ok} bestandene Fensterprüfungen; {attempted} Installationsversuche bei {len(results)} angeforderten Apps.", "",
+             f"{not_attempted} Einträge wurden vor einem Installationsversuch gestoppt (etwa Manifest, Download oder Testfehler); sie belegen keine App-Inkompatibilität.", "",
+             f"Fensterprüfung: Hauptfenster nach {args.launch_wait} s noch offen, kein Fehlerdialog, Aufnahme nicht einfarbig.", "",
              "Ohne erfolgreiche Fensteraufnahme bleibt die Darstellung ungeprüft; diese Fälle zählen nicht als bestanden. Die Prüfung belegt keine vollständige App-Funktion.", "",
              "| App | Version | Installer | Ergebnis | Ursache | Fenster | Fehlende DLLs |", "|---|---|---|---|---|---|---|"]
     for r in results:
@@ -562,7 +596,7 @@ def main():
         groups.setdefault(r.get("cause") or r.get("result") or "?", []).append(r["app"])
         for stub in r.get("last_stubs", []):
             stub_hits.setdefault(stub, []).append(r["app"])
-    causes = [f"# Ursachen {time.strftime('%Y-%m-%d %H:%M')}", "", f"{len(results) - ok} von {len(results)} Apps bestehen die Fensterprüfung nicht.", "",
+    causes = [f"# Ursachen {time.strftime('%Y-%m-%d %H:%M')}", "", f"{len(results) - ok} Einträge ohne bestandene Fensterprüfung, davon {not_attempted} ohne Installationsversuch.", "",
               "| Ursache | Apps | Anzahl |", "|---|---|---|"]
     for c, names in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         causes.append(f"| {c} | {', '.join(names)} | {len(names)} |")

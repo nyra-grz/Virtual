@@ -23,7 +23,8 @@ SPEC.loader.exec_module(compat)
 
 class CompatibilityRunTests(unittest.TestCase):
     def simulate(self, *, clone_failure=False, installer_timeout=False,
-                 launch_failure=False, installed=True, capture=True, guest_windows=False):
+                 launch_failure=False, installed=True, capture=True, guest_windows=False,
+                 keep_rooms=False, keep_downloads=False, uniform_result=False, shutdown_failure=False):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name).resolve()
@@ -49,6 +50,8 @@ class CompatibilityRunTests(unittest.TestCase):
                 Path(cmd[cmd.index("-o") + 1]).touch()
             elif cmd[0].endswith("virtualserver"):
                 server_calls.append((cmd[1], kwargs["env"]["WINEPREFIX"], kwargs.get("timeout")))
+                if shutdown_failure and "/rooms/" in kwargs["env"]["WINEPREFIX"] and cmd[1] == "-w":
+                    return subprocess.CompletedProcess(cmd, 1, "", "not stopped")
             return subprocess.CompletedProcess(cmd, 1 if cmd[0] == "screencapture" and not capture else 0, "", "")
 
         def fake_links(prefix):
@@ -65,6 +68,13 @@ class CompatibilityRunTests(unittest.TestCase):
                 "--engine", str(engine), "--winlist", str(winlist), "--launch-wait", "60"]
         if guest_windows:
             argv.append("--guest-windows")
+        if keep_rooms:
+            argv.append("--keep-rooms")
+        if keep_downloads:
+            argv.append("--keep-downloads")
+        def fake_download(url, digest, destination):
+            destination.write_bytes(b"test installer")
+            return True
         installer = Mock(return_value=subprocess.CompletedProcess([], 0))
         if installer_timeout:
             installer.side_effect = subprocess.TimeoutExpired("installer", 420)
@@ -72,9 +82,9 @@ class CompatibilityRunTests(unittest.TestCase):
             for name, value in {
                 "ROOT": root,
                 "manifest": Mock(return_value=("1.0", {"Installers": [{"Architecture": "x64", "InstallerType": "nullsoft", "InstallerUrl": "https://example.test/app.exe", "InstallerSha256": "00"}]})),
-                "download": Mock(return_value=True), "run": fake_run,
+                "download": fake_download, "run": fake_run,
                 "shortcuts": fake_links, "registered_apps": Mock(return_value={}),
-                "windows": fake_windows, "missing_dlls": Mock(return_value=[]), "uniform": Mock(return_value=False),
+                "windows": fake_windows, "missing_dlls": Mock(return_value=[]), "uniform": Mock(return_value=uniform_result),
             }.items():
                 stack.enter_context(patch.object(compat, name, value))
             stack.enter_context(patch.object(compat.sys, "argv", argv))
@@ -84,6 +94,8 @@ class CompatibilityRunTests(unittest.TestCase):
             stack.enter_context(patch.object(compat.subprocess, "Popen", return_value=proc))
             stack.enter_context(redirect_stdout(io.StringIO()))
             compat.main()
+        self.artifacts = {"base": base.exists(), "room": (out / "rooms/Example.App/prefix").exists(),
+                          "installers": list((root / "thirdparty/compat-cache").iterdir())}
         return json.loads((out / "results.json").read_text())[0], server_calls, installer, proc, clock[0]
 
     def test_observes_until_deadline_and_cleans_up(self):
@@ -91,9 +103,9 @@ class CompatibilityRunTests(unittest.TestCase):
         self.assertEqual(result["status"], "läuft")
         self.assertEqual(result["seconds"], 60)
         self.assertGreaterEqual(elapsed, 60)
-        self.assertEqual([c[0] for c in calls], ["-k", "-w", "-k", "-w", "-k", "-w"])
+        self.assertEqual([c[0] for c in calls], ["-k", "-w"] * 4)
         self.assertTrue(all(c[1].endswith("base-room/prefix") and c[2] == 15 for c in calls[:2]))
-        self.assertTrue(all(c[1].endswith("rooms/Example.App/prefix") and c[2] == 15 for c in calls[2:]))
+        self.assertTrue(all(c[1].endswith("rooms/Example.App/prefix") and c[2] == 15 for c in calls[2:6]))
         proc.kill.assert_called_once()
         proc.wait.assert_called_once_with(timeout=5)
 
@@ -110,13 +122,13 @@ class CompatibilityRunTests(unittest.TestCase):
         result, calls, installer, _, _ = self.simulate(clone_failure=True)
         self.assertIn("Raum konnte nicht geklont", result["status"])
         installer.assert_not_called()
-        self.assertEqual([c[0] for c in calls], ["-k", "-w", "-k", "-w"])
+        self.assertEqual([c[0] for c in calls], ["-k", "-w"] * 3)
 
     def test_installer_timeout_cleans_detached_children(self):
         result, calls, _, _, _ = self.simulate(installer_timeout=True, installed=False)
         self.assertEqual(result["install_exit"], "Zeitlimit")
         self.assertEqual(result["status"], "nicht installiert")
-        self.assertEqual([c[0] for c in calls], ["-k", "-w", "-k", "-w", "-k", "-w"])
+        self.assertEqual([c[0] for c in calls], ["-k", "-w"] * 4)
 
     def test_window_query_exception_still_reaps_launch_process(self):
         result, calls, _, proc, _ = self.simulate(launch_failure=True)
@@ -124,6 +136,27 @@ class CompatibilityRunTests(unittest.TestCase):
         self.assertEqual([c[0] for c in calls][-2:], ["-k", "-w"])
         proc.kill.assert_called_once()
         proc.wait.assert_called_once_with(timeout=5)
+
+    def test_success_and_failure_both_remove_test_installations_and_downloads(self):
+        for failed in (False, True):
+            self.simulate(launch_failure=failed)
+            self.assertEqual(self.artifacts, {"base": False, "room": False, "installers": []})
+
+    def test_explicit_debug_options_keep_installations_and_downloads(self):
+        self.simulate(keep_rooms=True, keep_downloads=True)
+        self.assertTrue(self.artifacts["base"])
+        self.assertTrue(self.artifacts["room"])
+        self.assertEqual(len(self.artifacts["installers"]), 1)
+
+    def test_unconfirmed_shutdown_preserves_room_instead_of_deleting_live_files(self):
+        result, *_ = self.simulate(shutdown_failure=True)
+        self.assertIn("cleanup_error", result)
+        self.assertTrue(self.artifacts["room"])
+
+    def test_failed_image_analysis_cannot_count_as_rendering_success(self):
+        result, *_ = self.simulate(uniform_result=None)
+        self.assertEqual(result["status"], "Fenster offen (Darstellung ungeprüft)")
+        self.assertNotIn("uniform", result["windows"][0])
 
 
 class CauseTests(unittest.TestCase):
@@ -160,6 +193,32 @@ class CauseTests(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
+    def test_manifest_rate_limit_is_reported_as_test_infrastructure_failure(self):
+        with patch.object(compat, "run", return_value=subprocess.CompletedProcess([], 1, "", "gh: API rate limit exceeded (HTTP 403)")):
+            with self.assertRaisesRegex(RuntimeError, "rate limit"):
+                compat.gh_list("manifests/e/Example/App")
+
+    def test_missing_manifest_directory_is_distinct_from_api_failure(self):
+        with patch.object(compat, "run", return_value=subprocess.CompletedProcess([], 1, "", "gh: Not Found (HTTP 404)")):
+            self.assertEqual(compat.gh_list("manifests/e/Example/App"), [])
+
+    def test_bad_download_checksum_does_not_leave_installer_or_partial_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder) / "installer.exe"
+            with patch.object(compat.urllib.request, "urlopen", return_value=io.BytesIO(b"bad installer")):
+                self.assertFalse(compat.download("https://example.test/installer.exe", "00", destination))
+            self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_failed_or_truncated_image_conversion_is_unverified_and_cleans_bitmap(self):
+        with tempfile.TemporaryDirectory() as folder:
+            png = Path(folder) / "window.png"
+            bitmap = png.with_suffix(".bmp")
+            for status in (0, 1):
+                bitmap.write_bytes(b"BM")
+                with patch.object(compat, "run", return_value=subprocess.CompletedProcess([], status)):
+                    self.assertIsNone(compat.uniform(png))
+                self.assertFalse(bitmap.exists())
+
     def test_stop_room_waits_even_when_kill_times_out(self):
         with patch.object(compat, "run", side_effect=[subprocess.TimeoutExpired("server", 15), subprocess.CompletedProcess([], 0)]) as run:
             self.assertTrue(compat.stop_room("server", {"WINEPREFIX": "/test/prefix"}))

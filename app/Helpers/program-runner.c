@@ -58,7 +58,10 @@ static DWORD parent_id(HANDLE process)
  * after it ends, which a later OpenProcess on the reported PID cannot promise. */
 static void add_member(struct launch *launch, DWORD pid)
 {
-    struct member member = { pid, 0, OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid) };
+    /* Wine's IsProcessInJob needs PROCESS_QUERY_INFORMATION. A limited-query
+     * handle opens successfully but fails that membership check with access
+     * denied, silently dropping every child and its eventual failure. */
+    struct member member = { pid, 0, OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, pid) };
     BOOL in_job = FALSE;
     if (member.process && (!IsProcessInJob(member.process, launch->job, &in_job) || !in_job))
     {

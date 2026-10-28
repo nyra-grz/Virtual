@@ -11,6 +11,7 @@ OK_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 SCRATCH=""
+BUNDLE=""
 WINE_READY=0
 PREFIX_READY=0
 
@@ -300,69 +301,41 @@ console_test() {
 console_test 64 x86_64-w64-mingw32-gcc
 console_test 32 i686-w64-mingw32-gcc
 
-# Exercise the same Windows job helper shipped in the app, including its real
-# child exit code. A runtime-only test would miss failures in the launch bridge.
-if [ "$PREFIX_READY" = 1 ] && command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-    if x86_64-w64-mingw32-gcc -municode -O2 "$ROOT/app/Helpers/program-runner.c" \
-        -o program-runner.exe -lole32 -luuid >runner-build.log 2>&1; then
-        "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/program-runner.exe" "$SCRATCH/console-64.exe" >runner.log 2>&1
-        runner_status=$?
-        if [ "$runner_status" = 37 ] && grep -q 'VIRTUAL_EXIT_CODE=37' runner.log; then
-            report ok "Programmstart über App-Helfer" "Kindprozess und Windows-Exitcode 37"
-        else
-            report FEHLER "Programmstart über App-Helfer" "Status $runner_status"
-            show_log runner.log
-        fi
-        # Bootstrapper-Fall: Der Startprozess endet mit 0, der übergebene Prozess
-        # scheitert danach. Ein Fehler, den der Startprozess selbst abwartet, zählt nicht.
-        cat >handoff.c <<'C'
-#include <windows.h>
-#include <wchar.h>
-static int spawn(const WCHAR *mode, BOOL wait)
-{
-    WCHAR self[MAX_PATH], line[MAX_PATH + 32];
-    STARTUPINFOW startup;
-    PROCESS_INFORMATION child;
-    ZeroMemory(&startup, sizeof(startup));
-    startup.cb = sizeof(startup);
-    GetModuleFileNameW(NULL, self, MAX_PATH);
-    swprintf(line, MAX_PATH + 32, L"\"%ls\" %ls", self, mode);
-    if (!CreateProcessW(NULL, line, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) return 1;
-    if (wait) WaitForSingleObject(child.hProcess, INFINITE);
-    CloseHandle(child.hThread);
-    CloseHandle(child.hProcess);
-    return 0;
-}
-int wmain(int argc, WCHAR **argv)
-{
-    if (argc < 2) return 2;
-    if (!wcscmp(argv[1], L"handoff")) return spawn(L"late", FALSE);
-    if (!wcscmp(argv[1], L"supervised")) return spawn(L"fail", TRUE);
-    if (!wcscmp(argv[1], L"late")) Sleep(500);
-    return 41;
-}
-C
-        if x86_64-w64-mingw32-gcc -municode -Wall -Wextra -Werror handoff.c -o handoff.exe >handoff-build.log 2>&1; then
-            for handoff in handoff:41 supervised:0; do
-                mode="${handoff%%:*}" expected="${handoff#*:}"
-                "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/program-runner.exe" "$SCRATCH/handoff.exe" "$mode" >"runner-$mode.log" 2>&1
-                runner_status=$?
-                if [ "$runner_status" = "$expected" ] && grep -q "VIRTUAL_EXIT_CODE=$expected" "runner-$mode.log"; then
-                    report ok "App-Helfer: $mode" "Windows-Exitcode $expected"
-                else
-                    report FEHLER "App-Helfer: $mode" "Status $runner_status statt $expected"
-                    show_log "runner-$mode.log"
-                fi
-            done
-        else
-            report FEHLER "Übergabe-Test kompilieren"
-            show_log handoff-build.log
-        fi
-    else
-        report FEHLER "App-Helfer kompilieren"
-        show_log runner-build.log
+# Real job/child behavior, in both architectures. These tiny fixtures expose
+# runtime access-right differences that simulated launcher tests cannot see.
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    if [ "$PREFIX_READY" != 1 ] || ! command -v "$cc" >/dev/null 2>&1; then
+        report übersprungen "App-Helfer $bits Bit" "Prefix oder Compiler fehlt"
+        continue
     fi
-fi
+    if [ "$bits" = 64 ] && [ -f "$BUNDLE/Contents/Resources/program-runner.exe" ]; then
+        cp "$BUNDLE/Contents/Resources/program-runner.exe" "program-runner$bits.exe"
+    elif ! "$cc" -municode -O2 -Wall -Wextra -Werror "$ROOT/app/Helpers/program-runner.c" \
+        -o "program-runner$bits.exe" -lole32 -luuid >"runner-build$bits.log" 2>&1; then
+        report FEHLER "App-Helfer $bits Bit kompilieren"
+        show_log "runner-build$bits.log"
+        continue
+    fi
+    if ! "$cc" -municode -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/process_handoff.c" \
+        -o "handoff$bits.exe" >"handoff-build$bits.log" 2>&1; then
+        report FEHLER "App-Helfer $bits Bit kompilieren"
+        show_log "handoff-build$bits.log"
+        continue
+    fi
+    for handoff in handoff:41 nested:41 supervised:0 success:0 starter-error:7 handoff-reboot:41 wide-exit:1603 reboot:3010; do
+        mode="${handoff%%:*}" expected="${handoff#*:}"
+        WINMAC_EXPECT_NONZERO=1 "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/program-runner$bits.exe" \
+            "$SCRATCH/handoff$bits.exe" "$mode" >"runner-$bits-$mode.log" 2>&1
+        runner_status=$?
+        if [ "$runner_status" = "$((expected % 256))" ] && grep -q "VIRTUAL_EXIT_CODE=$expected" "runner-$bits-$mode.log"; then
+            report ok "App-Helfer $bits Bit: $mode" "Windows-Exitcode $expected"
+        else
+            report FEHLER "App-Helfer $bits Bit: $mode" "Status $runner_status statt $((expected % 256))"
+            show_log "runner-$bits-$mode.log"
+        fi
+    done
+done
 
 # e) Ausschließlich Hardware-Gerät; kein stiller WARP-/Software-Fallback.
 cat >d3d11.c <<'C'
