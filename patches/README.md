@@ -32,6 +32,18 @@ cannot silently ship without a required compatibility fix.
 | `0023-threadpool-timer-ex.patch` | Implements `SetThreadpoolTimerEx` / `TpSetTimerEx` from Wine upstream, preserving queued/running callback cancellation semantics and serializing immediate submission with cancellation. Removes a confirmed Zoom API-stub abort; 32-/64-bit semantic and concurrent cancellation probes, not a full Zoom compatibility claim. |
 | `0024-uxtheme-parent-background-ex.patch` | Exports and implements `DrawThemeParentBackgroundEx` for modern child controls: parent erase/print, static-brush fallback, window/client coordinates, clipping and DC restoration. A 32-/64-bit pixel probe fails on the previous missing export and passes 24 checks per architecture. Removes the API blocker recorded for WinDirStat; the complete application has not been retested. |
 | `0025-electron-image-detection.patch` | Recognizes modern Electron executables by their Node registration and Electron fuse exports, including packages whose resources live in a version subdirectory. Keeps Node-only executables, Electron's Node CLI mode, renderer children and explicit opt-out unchanged. Includes 32-/64-bit process probes and a VS Code 1.142.0 comparison: black window without the existing Chromium switches; editor and opened test text render with them. |
+| `0026-memory-protection-contracts.patch` | On Darwin, changing a shared file view to `PAGE_WRITECOPY` creates a genuine private shadow with Mach `VM_PROT_COPY`; writes no longer leak into the file or peer views. Keeps maximum rights for later guard/protection transitions. `VirtualLock` consumes a one-shot guard with `STATUS_GUARD_PAGE_VIOLATION`; successful writable-page locking updates software write-watch state without changing payload. |
+| `0027-memory-status-address-space.patch` | `GlobalMemoryStatusEx.ullAvailVirtual` counts free Windows address regions instead of subtracting resident physical memory. Reservations and releases are visible on every call even while physical-memory metrics remain cached. Region traversal has a cost proportional to address-space fragmentation (measured ~0.51 ms with 1,024 reservations on the development Mac). |
+
+`winrt/tests/memory.c` exercises 137 documented contracts per architecture: page
+reservation/commit/decommit, zeroing, protection boundaries, executable buffers,
+heap alignment/reallocation, private file writes, guard locking and live virtual
+availability. It is a focused regression gate, not proof of full Windows memory
+parity. The larger upstream heap suites retain known `todo_wine` differences;
+the combined x64 upstream suite can reach a Rosetta exception-emulation failure
+during write-watch tests, while the isolated write-watch case completes. That
+integration issue remains under investigation. These changes do not resolve the OBS
+startup crash by themselves.
 
 They are applied in this order on top of `WINE_TAG` (wine-11.0). Details, limits and
 tests: `winrt/README.md`.

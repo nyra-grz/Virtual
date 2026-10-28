@@ -569,6 +569,21 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
         show_log "theme$bits.err"
     fi
 done
+# Memory behavior must match Windows contracts, not just report plausible RAM.
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    if [ "$PREFIX_READY" != 1 ] || ! command -v "$cc" >/dev/null 2>&1; then
+        report übersprungen "Integration: Speicher $bits Bit" "Prefix oder Compiler fehlt"
+    elif "$cc" -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/memory.c" -o "memory$bits.exe" >"compile-memory$bits.log" 2>&1 &&
+         "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/memory$bits.exe" >"memory$bits.out" 2>"memory$bits.err"; then
+        report ok "Integration: Speicher $bits Bit" "$(tr -d '\r' <"memory$bits.out" | tail -1)"
+    else
+        report FEHLER "Integration: Speicher $bits Bit"
+        show_log "compile-memory$bits.log"
+        show_log "memory$bits.out"
+        show_log "memory$bits.err"
+    fi
+done
 # Windows-System-ICU (icu.dll + Weiterleitungen), 64 und 32 Bit; der Test ist mit -licu
 # gelinkt und startet ohne icu.dll gar nicht.
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
