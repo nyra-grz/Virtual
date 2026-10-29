@@ -34,6 +34,7 @@ cannot silently ship without a required compatibility fix.
 | `0025-electron-image-detection.patch` | Recognizes modern Electron executables by their Node registration and Electron fuse exports, including packages whose resources live in a version subdirectory. Keeps Node-only executables, Electron's Node CLI mode, renderer children and explicit opt-out unchanged. Includes 32-/64-bit process probes and a VS Code 1.142.0 comparison: black window without the existing Chromium switches; editor and opened test text render with them. |
 | `0026-memory-protection-contracts.patch` | On Darwin, changing a shared file view to `PAGE_WRITECOPY` creates a genuine private shadow with Mach `VM_PROT_COPY`; writes no longer leak into the file or peer views. Keeps maximum rights for later guard/protection transitions. `VirtualLock` consumes a one-shot guard with `STATUS_GUARD_PAGE_VIOLATION`; successful writable-page locking updates software write-watch state without changing payload. |
 | `0027-memory-status-address-space.patch` | `GlobalMemoryStatusEx.ullAvailVirtual` counts free Windows address regions instead of subtracting resident physical memory. Reservations and releases are visible on every call even while physical-memory metrics remain cached. Region traversal has a cost proportional to address-space fragmentation (measured ~0.51 ms with 1,024 reservations on the development Mac). |
+| `0028` (in `crossover/`) | Restores Wine 11.0's full macOS GSBASE transitions at Windows/Unix, callback and signal boundaries. Inline x64 thread/process IDs, LastError, stack bounds and fiber data address the real TEB, instead of selected Darwin TSD mirrors. `winrt/tests/teb.c` compares inline/API behavior on the main thread, eight workers, fibers and window callbacks; the 32-bit path is retained. Plain upstream Wine already contains these transitions. |
 
 `winrt/tests/memory.c` exercises 137 documented contracts per architecture: page
 reservation/commit/decommit, zeroing, protection boundaries, executable buffers,
@@ -59,14 +60,16 @@ that base as one commit each (0015 merged with CrossOver's Mac driver, 0019 repl
 by CrossOver's own bridge) plus one CrossOver-specific commit (the real Windows user name instead of
 CrossOver's fixed "crossover"). Since 26.3 CrossOver carries our libinotify fix
 for winebus itself.
-The WinRT networking/devices patches (0003–0006, 0014) are frozen at the end of the
-series: carried along on rebases, dropped if they stop applying.
+The WinRT networking/devices patches (0003–0006, 0014) are required alongside the
+later compatibility fixes. A rebase must preserve them or prove equivalent
+upstream behavior with their regression tests; a patch failure stops the build.
 
-To change a patch: edit the series branch (`thirdparty/wine-cx-series`, branch
-`series/26.3` on tag `cx-26.3.0`), then regenerate with
-`git format-patch --zero-commit --no-signature --no-numbered cx-26.3.0.. -o patches/crossover`.
-A new CrossOver release becomes a vendor commit (`vendor/crossover`, tag `cx-X.Y.Z`)
-and the series is rebased onto it.
+The source of truth is `patches/crossover/series` plus its checked patch files and
+the archive digest in `build-wine-cx.sh`. `WINMAC_PREPARE_ONLY=1 bash build-wine-cx.sh`
+reconstructs that exact source under `thirdparty/crossover/`. The older
+`thirdparty/wine-cx-series` checkout is on `series/26.1`; do not regenerate the
+26.3 patch series from it. For a new base, validate every required patch and run
+the full preservation gate before replacing the engine.
 
 ## Renaming: what actually happens (honestly)
 

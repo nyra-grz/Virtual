@@ -29,3 +29,4 @@
 0018-Virtual-0005-enumeration-upstream-fixes.patch
 0019-Virtual-0006-devices-implement.patch
 0020-Virtual-0014-wlanapi-wifi.patch
+0027-Virtual-0028-ntdll-macos-teb.patch

@@ -48,12 +48,17 @@ finish() {
             show_log "$SCRATCH/stop.log"
         fi
     fi
-    if [ -n "$SCRATCH" ]; then
+    if [ -n "$SCRATCH" ] && [ "$cleanup_status" = 0 ]; then
         if rm -rf -- "$SCRATCH"; then
             report ok "Temporäre Dateien und Wegwerf-Prefix gelöscht"
         else
             report FEHLER "Temporäre Dateien löschen" "$SCRATCH"
         fi
+    elif [ -n "$SCRATCH" ]; then
+        printf 'Diagnose und nicht bestätigt beendeter Prefix bleiben erhalten: %s\n' "$SCRATCH"
+    fi
+    if [ "${WINMAC_SMOKE_STRICT:-0}" = 1 ] && [ "$SKIP_COUNT" != 0 ]; then
+        report FEHLER "Vollständige Freigabeprüfung" "$SKIP_COUNT übersprungene Prüfungen"
     fi
     if [ "$original_status" != 0 ] && [ "$FAIL_COUNT" = 0 ]; then
         report FEHLER "Testlauf abgebrochen" "Exitcode $original_status"
@@ -192,7 +197,7 @@ fi
 # c) Auch verschluckte Fehler des Setup-Skripts werden über die Shims erfasst.
 if [ "$WINE_READY" = 1 ]; then
     : >"$WINMAC_SMOKE_FAILURES"
-    /bin/bash "$ROOT/scripts/init-prefix.sh" win10 >prefix.log 2>&1
+    /bin/bash "$WINMAC_HOME/scripts/init-prefix.sh" win10 >prefix.log 2>&1
     setup_status=$?
     if [ "$setup_status" = 0 ] && [ ! -s "$WINMAC_SMOKE_FAILURES" ] &&
        [ -d "$WINEPREFIX/drive_c/windows/system32" ]; then
@@ -569,20 +574,23 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
         show_log "theme$bits.err"
     fi
 done
-# Memory behavior must match Windows contracts, not just report plausible RAM.
+# Memory and direct thread-data accesses must both obey Windows contracts.
+for contract in memory teb; do
+label=Speicher; [ "$contract" = teb ] && label=Threaddaten
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
     bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
     if [ "$PREFIX_READY" != 1 ] || ! command -v "$cc" >/dev/null 2>&1; then
-        report übersprungen "Integration: Speicher $bits Bit" "Prefix oder Compiler fehlt"
-    elif "$cc" -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/memory.c" -o "memory$bits.exe" >"compile-memory$bits.log" 2>&1 &&
-         "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/memory$bits.exe" >"memory$bits.out" 2>"memory$bits.err"; then
-        report ok "Integration: Speicher $bits Bit" "$(tr -d '\r' <"memory$bits.out" | tail -1)"
+        report übersprungen "Integration: $label $bits Bit" "Prefix oder Compiler fehlt"
+    elif "$cc" -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/$contract.c" -o "$contract$bits.exe" -luser32 >"compile-$contract$bits.log" 2>&1 &&
+         "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/$contract$bits.exe" >"$contract$bits.out" 2>"$contract$bits.err"; then
+        report ok "Integration: $label $bits Bit" "$(tr -d '\r' <"$contract$bits.out" | tail -1)"
     else
-        report FEHLER "Integration: Speicher $bits Bit"
-        show_log "compile-memory$bits.log"
-        show_log "memory$bits.out"
-        show_log "memory$bits.err"
+        report FEHLER "Integration: $label $bits Bit"
+        show_log "compile-$contract$bits.log"
+        show_log "$contract$bits.out"
+        show_log "$contract$bits.err"
     fi
+done
 done
 # Windows-System-ICU (icu.dll + Weiterleitungen), 64 und 32 Bit; der Test ist mit -licu
 # gelinkt und startet ohne icu.dll gar nicht.

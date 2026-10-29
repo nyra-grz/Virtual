@@ -313,10 +313,26 @@ bash scripts/check-core.sh
 
 It checks the launcher, concurrent dependency installation and the real runtime
 (32/64-bit execution, process handoff, Electron/Node command lines, timers,
-control backgrounds, memory reservations/protections, private file mappings,
+control backgrounds, direct thread/process IDs, LastError, fibers and callbacks,
+memory reservations/protections, private file mappings,
 guard-page locking, address-space availability, graphics, files, media and devices).
-It downloads no test applications and removes its temporary Windows environment.
+It downloads no test applications and removes its temporary Windows environment
+after confirmed shutdown (an unconfirmed environment is retained for diagnosis).
 This is the first check after a shared fix; the app matrix is a later check.
+
+Before releasing a complete app, run the same checks against its bundled engine
+and Windows helper, without rebuilding a different bundle during the test:
+
+```bash
+python3 scripts/check-bundle.py build/Virtual.app
+```
+
+This rejects missing components, invalid signatures, external/broken bundle links,
+skipped runtime tests and content/source changes during verification. It writes an
+external `build/Virtual.verified.json` content manifest and test log. The release
+script requires this gate before creating a tag or publishing; the receipt covers
+core contracts, not untested app workflows. CI also runs the Python regressions;
+the Rosetta runtime and app workflows still require the local Mac.
 
 ```bash
 uv run scripts/compat-test.py                      # six representatives: Win32, Gecko, Electron, Qt, media, .NET
