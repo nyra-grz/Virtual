@@ -35,6 +35,17 @@ cannot silently ship without a required compatibility fix.
 | `0026-memory-protection-contracts.patch` | On Darwin, changing a shared file view to `PAGE_WRITECOPY` creates a genuine private shadow with Mach `VM_PROT_COPY`; writes no longer leak into the file or peer views. Keeps maximum rights for later guard/protection transitions. `VirtualLock` consumes a one-shot guard with `STATUS_GUARD_PAGE_VIOLATION`; successful writable-page locking updates software write-watch state without changing payload. |
 | `0027-memory-status-address-space.patch` | `GlobalMemoryStatusEx.ullAvailVirtual` counts free Windows address regions instead of subtracting resident physical memory. Reservations and releases are visible on every call even while physical-memory metrics remain cached. Region traversal has a cost proportional to address-space fragmentation (measured ~0.51 ms with 1,024 reservations on the development Mac). |
 | `0028` (in `crossover/`) | Restores Wine 11.0's full macOS GSBASE transitions at Windows/Unix, callback and signal boundaries. Inline x64 thread/process IDs, LastError, stack bounds and fiber data address the real TEB, instead of selected Darwin TSD mirrors. `winrt/tests/teb.c` compares inline/API behavior on the main thread, eight workers, fibers and window callbacks; the 32-bit path is retained. Plain upstream Wine already contains these transitions. |
+| `0029` (in `crossover/`) | Adds `DXGIDeclareAdapterRemovalSupport` with once-only, concurrent and built-in-device late-call validation. Native third-party device creation is not tracked. Exports `WcsCreateIccProfile` with regular parameter/handle/unsupported errors, preserving the existing real ICC profile for caller fallback; WCS XML conversion remains unsupported. |
+| `0030` (in `crossover/`) | GDI OpenGL forwarders hold a temporary module reference rather than pinning the first renderer forever, resolve functions afresh and preserve the forwarded last error. OpenGL clears freed per-thread pixel-format cache fields on detach so repeated load/unload is safe. Allows PrusaSlicer to select its bundled Mesa renderer automatically. |
+| `0031` (in `crossover/`) | Direct2D custom-effect factories return `IUnknown`, which is queried for `ID2D1EffectImpl` before initialization and property callbacks. Feature levels, bitmap formats and intermediate render-target precision come from the real D3D device. Tests use distinct COM identities, bound properties, balanced destruction and actual bitmap creation. |
+
+The graphics probes cover 32/64-bit exports, real ICC preservation, repeated
+OpenGL context/module lifetimes and custom-effect COM identity. The 32-bit D2D
+probe and late-device tests explicitly use WineD3D's OpenGL path; 32-bit Vulkan
+and native-renderer late-device tracking are not certified by those tests.
+Modern Paint.NET still needs standard Direct2D effects absent from this base
+(including Histogram and other effects used for category discovery); its full
+startup/editing workflow is not claimed as fixed by these patches.
 
 `winrt/tests/memory.c` exercises 137 documented contracts per architecture: page
 reservation/commit/decommit, zeroing, protection boundaries, executable buffers,

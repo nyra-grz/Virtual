@@ -316,6 +316,8 @@ It checks the launcher, concurrent dependency installation and the real runtime
 control backgrounds, direct thread/process IDs, LastError, fibers and callbacks,
 memory reservations/protections, private file mappings,
 guard-page locking, address-space availability, graphics, files, media and devices).
+It also checks replaceable OpenGL renderer lifetimes, ICC fallback, DXGI
+declaration contracts and real Direct2D custom-effect interfaces/bitmap formats.
 It downloads no test applications and removes its temporary Windows environment
 after confirmed shutdown (an unconfirmed environment is retained for diagnosis).
 This is the first check after a shared fix; the app matrix is a later check.

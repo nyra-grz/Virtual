@@ -1,0 +1,123 @@
+DXGI declaration state and regular WCS failure for existing ICC profiles. No WCS XML conversion is claimed. Late-device accounting covers Wine-owned devices; native renderers do not notify it.
+
+diff --git a/dlls/dxgi/dxgi.spec b/dlls/dxgi/dxgi.spec
+--- a/dlls/dxgi/dxgi.spec
++++ b/dlls/dxgi/dxgi.spec
+@@ -3,4 +3,5 @@
+ @ stdcall CreateDXGIFactory2(long ptr ptr)
+ @ stdcall DXGID3D10CreateDevice(ptr ptr ptr long ptr long ptr)
+ @ stdcall DXGID3D10RegisterLayers(ptr long)
++@ stdcall DXGIDeclareAdapterRemovalSupport()
+ @ stdcall DXGIGetDebugInterface1(long ptr ptr)
+diff --git a/dlls/dxgi/dxgi_main.c b/dlls/dxgi/dxgi_main.c
+--- a/dlls/dxgi/dxgi_main.c
++++ b/dlls/dxgi/dxgi_main.c
+@@ -27,8 +27,36 @@
+     HMODULE d3d10core;
+     struct dxgi_device_layer *device_layers;
+     UINT layer_count;
++    BOOL removal_support_declared;
++    BOOL device_created;
+ };
+ static struct dxgi_main dxgi_main;
++
++HRESULT WINAPI DXGIDeclareAdapterRemovalSupport(void)
++{
++    HRESULT hr;
++
++    wined3d_mutex_lock();
++    if (dxgi_main.removal_support_declared)
++        hr = DXGI_ERROR_ALREADY_EXISTS;
++    else if (dxgi_main.device_created)
++        hr = DXGI_ERROR_INVALID_CALL;
++    else
++    {
++        /* Wine reports device loss to the application, rather than terminating
++         * the process. Keep that behavior and record the once-only opt-in. */
++        dxgi_main.removal_support_declared = TRUE;
++        hr = S_OK;
++    }
++    wined3d_mutex_unlock();
++    return hr;
++}
++
++/* Called under the wined3d mutex when a DXGI device has been created. */
++void dxgi_record_device_creation(void)
++{
++    dxgi_main.device_created = TRUE;
++}
+ 
+ static void dxgi_main_cleanup(void)
+ {
+diff --git a/dlls/dxgi/dxgi_private.h b/dlls/dxgi/dxgi_private.h
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -136,6 +136,7 @@
+     IWineDXGIAdapter *adapter;
+ };
+ 
++void dxgi_record_device_creation(void);
+ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *layer,
+         IDXGIFactory *factory, IDXGIAdapter *adapter,
+         const D3D_FEATURE_LEVEL *feature_levels, unsigned int level_count);
+diff --git a/dlls/dxgi/device.c b/dlls/dxgi/device.c
+--- a/dlls/dxgi/device.c
++++ b/dlls/dxgi/device.c
+@@ -585,6 +585,9 @@
+ 
+     wined3d_mutex_unlock();
+ 
++    wined3d_mutex_lock();
++    dxgi_record_device_creation();
++    wined3d_mutex_unlock();
+     device->adapter = &dxgi_adapter->IWineDXGIAdapter_iface;
+     IWineDXGIAdapter_AddRef(device->adapter);
+ 
+diff --git a/dlls/mscms/mscms.spec b/dlls/mscms/mscms.spec
+--- a/dlls/mscms/mscms.spec
++++ b/dlls/mscms/mscms.spec
+@@ -86,7 +86,7 @@
+ @ stdcall UnregisterCMMW(wstr long)
+ @ stub WcsAssociateColorProfileWithDevice
+ @ stub WcsCheckColors
+-@ stub WcsCreateIccProfile
++@ stdcall WcsCreateIccProfile(ptr long)
+ @ stub WcsDisassociateColorProfileFromDevice
+ @ stub WcsEnumColorProfiles
+ @ stdcall WcsEnumColorProfilesSize(long ptr ptr)
+diff --git a/dlls/mscms/profile.c b/dlls/mscms/profile.c
+--- a/dlls/mscms/profile.c
++++ b/dlls/mscms/profile.c
+@@ -1438,6 +1438,32 @@
+ }
+ 
+ /******************************************************************************
++ * WcsCreateIccProfile                    [MSCMS.@]
++ */
++HPROFILE WINAPI WcsCreateIccProfile( HPROFILE handle, DWORD options )
++{
++    struct profile *profile;
++
++    TRACE( "(%p, %#lx)\n", handle, options );
++    if (options & ~0x00010000 /* WCS_ICCONLY */)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (!(profile = (struct profile *)grab_object( handle, OBJECT_TYPE_PROFILE )))
++    {
++        SetLastError( ERROR_INVALID_HANDLE );
++        return NULL;
++    }
++    /* The supported OpenColorProfile path holds an ICC profile, not a WCS XML
++     * DMP/CAMP/GMMP model. Do not fabricate a conversion or close the source.
++     * Callers such as Qt then read the original, real monitor ICC profile. */
++    release_object( &profile->hdr );
++    SetLastError( ERROR_NOT_SUPPORTED );
++    return NULL;
++}
++
++/******************************************************************************
+  * WcsGetUsePerUserProfiles               [MSCMS.@]
+  */
+ BOOL WINAPI WcsGetUsePerUserProfiles( const WCHAR* name, DWORD class, BOOL* use_per_user_profile )

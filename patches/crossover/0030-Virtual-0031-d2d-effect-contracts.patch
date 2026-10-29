@@ -1,0 +1,115 @@
+Query factory IUnknown for ID2D1EffectImpl before calling implementation methods and property bindings. Report actual device feature levels, bitmap formats and render-target precision support.
+
+diff --git a/dlls/d2d1/effect.c b/dlls/d2d1/effect.c
+--- a/dlls/d2d1/effect.c
++++ b/dlls/d2d1/effect.c
+@@ -2306,9 +2306,17 @@
+ static HRESULT STDMETHODCALLTYPE d2d_effect_context_GetMaximumSupportedFeatureLevel(ID2D1EffectContext *iface,
+         const D3D_FEATURE_LEVEL *levels, UINT32 level_count, D3D_FEATURE_LEVEL *max_level)
+ {
+-    FIXME("iface %p, levels %p, level_count %u, max_level %p stub!\n", iface, levels, level_count, max_level);
+-
+-    return E_NOTIMPL;
++    struct d2d_effect_context *context = impl_from_ID2D1EffectContext(iface);
++    D3D_FEATURE_LEVEL supported, best = 0;
++    UINT32 i;
++
++    if (!levels || !level_count || !max_level) return E_INVALIDARG;
++    supported = ID3D11Device1_GetFeatureLevel(context->device_context->d3d_device);
++    for (i = 0; i < level_count; ++i)
++        if (levels[i] <= supported && levels[i] > best) best = levels[i];
++    if (!best) return D2DERR_INSUFFICIENT_DEVICE_CAPABILITIES;
++    *max_level = best;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_effect_context_CreateTransformNodeFromEffect(ID2D1EffectContext *iface,
+@@ -3422,9 +3430,12 @@
+     struct d2d_effect_context *effect_context;
+     const struct d2d_effect_registration *reg;
+     struct d2d_effect *object;
++    IUnknown *factory_unknown = NULL;
+     UINT32 input_count;
+     WCHAR clsidW[39];
+     HRESULT hr;
++
++    *effect = NULL;
+ 
+     if (!(reg = d2d_factory_get_registered_effect(context->factory, effect_id)))
+     {
+@@ -3465,13 +3476,27 @@
+         return hr;
+     }
+ 
+-    if (FAILED(hr = reg->factory((IUnknown **)&object->impl)))
++    if (FAILED(hr = reg->factory(&factory_unknown)))
+     {
+         WARN("Failed to create implementation object, hr %#lx.\n", hr);
+         ID2D1Effect_Release(&object->ID2D1Effect_iface);
+         return hr;
+     }
+ 
++    /* PD2D1_EFFECT_FACTORY returns IUnknown, whose address/vtable need not be
++     * ID2D1EffectImpl (notably for managed COM implementations). */
++    if (!factory_unknown)
++        hr = E_FAIL;
++    else
++        hr = IUnknown_QueryInterface(factory_unknown, &IID_ID2D1EffectImpl,
++                (void **)&object->impl);
++    if (factory_unknown) IUnknown_Release(factory_unknown);
++    if (FAILED(hr))
++    {
++        ID2D1Effect_Release(&object->ID2D1Effect_iface);
++        return hr;
++    }
++
+     if (FAILED(hr = ID2D1EffectImpl_Initialize(object->impl, &effect_context->ID2D1EffectContext_iface,
+             &object->graph->ID2D1TransformGraph_iface)))
+     {
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -2318,9 +2318,27 @@
+ 
+ static BOOL STDMETHODCALLTYPE d2d_device_context_IsDxgiFormatSupported(ID2D1DeviceContext6 *iface, DXGI_FORMAT format)
+ {
+-    FIXME("iface %p, format %#x stub!\n", iface, format);
+-
+-    return FALSE;
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    UINT support = 0;
++
++    switch (format)
++    {
++        case DXGI_FORMAT_A8_UNORM:
++        case DXGI_FORMAT_R8G8B8A8_UNORM:
++        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++        case DXGI_FORMAT_B8G8R8A8_UNORM:
++        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++        case DXGI_FORMAT_B8G8R8X8_UNORM:
++        case DXGI_FORMAT_R16G16B16A16_UNORM:
++        case DXGI_FORMAT_R16G16B16A16_FLOAT:
++        case DXGI_FORMAT_R32G32B32A32_FLOAT:
++            break;
++        default:
++            return FALSE;
++    }
++    if (FAILED(ID3D11Device1_CheckFormatSupport(context->d3d_device, format, &support))) return FALSE;
++    return (support & (D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE))
++            == (D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE);
+ }
+ 
+ static BOOL STDMETHODCALLTYPE d2d_device_context_IsBufferPrecisionSupported(ID2D1DeviceContext6 *iface,
+@@ -2350,7 +2368,11 @@
+         WARN("Format support check failed, hr %#lx.\n", hr);
+     }
+ 
+-    return !!(support & D3D11_FORMAT_SUPPORT_BUFFER);
++    /* D2D intermediate buffers are textures/render targets, not D3D vertex or
++     * typed-buffer resources. In particular Metal can render an RGBA precision
++     * even when that format is unavailable for D3D11 buffers. */
++    return (support & (D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_RENDER_TARGET))
++            == (D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_RENDER_TARGET);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_GetImageLocalBounds(ID2D1DeviceContext6 *iface,

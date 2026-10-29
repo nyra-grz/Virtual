@@ -592,6 +592,46 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
     fi
 done
 done
+# Graphics contracts: real ICC data, declaration lifetime, replaceable OpenGL
+# modules and custom effects whose factory IUnknown differs from EffectImpl.
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    cxx="${cc%gcc}g++"
+    for test in graphics_contracts opengl_lifetime effect_identity; do
+        compiler="$cc"; source="$ROOT/winrt/tests/$test.c"
+        libs=(-ld3d11 -lmscms)
+        [ "$test" != opengl_lifetime ] || libs=(-lgdi32 -luser32)
+        if [ "$test" = effect_identity ]; then
+            compiler="$cxx"; source="$ROOT/winrt/tests/$test.cpp"
+            libs=(-static -ld2d1 -ld3d11 -ldxgi -lole32 -luuid)
+        fi
+        test_overrides="$WINEDLLOVERRIDES"
+        test_d3d_config="${WINE_D3D_CONFIG:-}"
+        if [ "$bits" = 32 ] && [ "$test" = effect_identity ]; then
+            test_overrides='d3d11,d3d10core,dxgi=b;winedbg.exe=d'
+            test_d3d_config='renderer=gl'
+        fi
+        if [ "$PREFIX_READY" != 1 ] || ! command -v "$compiler" >/dev/null 2>&1; then
+            report übersprungen "Integration: $test $bits Bit" "Prefix oder Compiler fehlt"
+        elif "$compiler" -O2 -Wall -Wextra -Werror "$source" -o "$test$bits.exe" "${libs[@]}" >"compile-$test$bits.log" 2>&1 &&
+             WINEDLLOVERRIDES="$test_overrides" WINE_D3D_CONFIG="$test_d3d_config" "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/$test$bits.exe" >"$test$bits.out" 2>"$test$bits.err"; then
+            report ok "Integration: $test $bits Bit" "$(tr -d '\r' <"$test$bits.out" | tail -1)"
+        else
+            report FEHLER "Integration: $test $bits Bit"
+            show_log "compile-$test$bits.log"; show_log "$test$bits.out"; show_log "$test$bits.err"
+        fi
+    done
+    # Native third-party renderers need not report creation to Wine DXGI. Check
+    # late-call accounting specifically against the built-in device path.
+    if [ -f "graphics_contracts$bits.exe" ] &&
+       WINEDLLOVERRIDES='d3d11,d3d10core,dxgi=b;winedbg.exe=d' WINE_D3D_CONFIG=renderer=gl "$WINMAC_RUNTIME/bin/virtual" \
+           "$SCRATCH/graphics_contracts$bits.exe" late >"graphics-late$bits.out" 2>"graphics-late$bits.err"; then
+        report ok "Integration: DXGI-Gerät vor Deklaration $bits Bit"
+    else
+        report FEHLER "Integration: DXGI-Gerät vor Deklaration $bits Bit"
+        show_log "graphics-late$bits.out"; show_log "graphics-late$bits.err"
+    fi
+done
 # Windows-System-ICU (icu.dll + Weiterleitungen), 64 und 32 Bit; der Test ist mit -licu
 # gelinkt und startet ohne icu.dll gar nicht.
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do

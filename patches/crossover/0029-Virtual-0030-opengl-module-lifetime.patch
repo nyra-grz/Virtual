@@ -1,0 +1,163 @@
+Balance GDI forwarding references and resolve entrypoints under a live reference. Clear released thread-local pixel-format cache fields, allowing safe unload/reload and replacement of the renderer.
+
+diff --git a/dlls/gdi32/opengl.c b/dlls/gdi32/opengl.c
+--- a/dlls/gdi32/opengl.c
++++ b/dlls/gdi32/opengl.c
+@@ -32,79 +32,87 @@
+ #include "winnt.h"
+ 
+ 
+-static HMODULE opengl32;
+-static INT (WINAPI *wglChoosePixelFormat)(HDC,const PIXELFORMATDESCRIPTOR *);
+-static INT (WINAPI *wglDescribePixelFormat)(HDC,INT,UINT,PIXELFORMATDESCRIPTOR*);
+-static INT (WINAPI *wglGetPixelFormat)(HDC);
+-static BOOL (WINAPI *wglSetPixelFormat)(HDC,INT,const PIXELFORMATDESCRIPTOR*);
+-static BOOL (WINAPI *wglSwapBuffers)(HDC);
++/* GDI must not keep an implicit process-lifetime reference to opengl32.
++ * Applications can unload the driver after a probe and load another renderer.
++ * Resolve while holding a temporary reference; cached entrypoints become stale
++ * when the application unloads/replaces that module. Preserve the call's error. */
+ 
+-/******************************************************************************
+- *		ChoosePixelFormat (GDI32.@)
+- */
+ INT WINAPI ChoosePixelFormat( HDC hdc, const PIXELFORMATDESCRIPTOR *pfd )
+ {
+-    if (!wglChoosePixelFormat)
+-    {
+-        if (!opengl32) opengl32 = LoadLibraryW( L"opengl32.dll" );
+-        if (!(wglChoosePixelFormat = (void *)GetProcAddress( opengl32, "wglChoosePixelFormat" )))
+-            return 0;
+-    }
+-    return wglChoosePixelFormat( hdc, pfd );
++    HMODULE module = LoadLibraryW( L"opengl32.dll" );
++    INT (WINAPI *func)(HDC hdc, const PIXELFORMATDESCRIPTOR *pfd);
++    INT result = 0;
++    DWORD error;
++
++    if (!module) return 0;
++    if ((func = (void *)GetProcAddress( module, "wglChoosePixelFormat" )))
++        result = func( hdc, pfd );
++    error = GetLastError();
++    FreeLibrary( module );
++    SetLastError( error );
++    return result;
+ }
+ 
+-/******************************************************************************
+- *		DescribePixelFormat (GDI32.@)
+- */
+ INT WINAPI DescribePixelFormat( HDC hdc, INT fmt, UINT size, PIXELFORMATDESCRIPTOR *pfd )
+ {
+-    if (!wglDescribePixelFormat)
+-    {
+-        if (!opengl32) opengl32 = LoadLibraryW( L"opengl32.dll" );
+-        if (!(wglDescribePixelFormat = (void *)GetProcAddress( opengl32, "wglDescribePixelFormat" )))
+-            return 0;
+-    }
+-    return wglDescribePixelFormat( hdc, fmt, size, pfd );
++    HMODULE module = LoadLibraryW( L"opengl32.dll" );
++    INT (WINAPI *func)(HDC hdc, INT fmt, UINT size, PIXELFORMATDESCRIPTOR *pfd);
++    INT result = 0;
++    DWORD error;
++
++    if (!module) return 0;
++    if ((func = (void *)GetProcAddress( module, "wglDescribePixelFormat" )))
++        result = func( hdc, fmt, size, pfd );
++    error = GetLastError();
++    FreeLibrary( module );
++    SetLastError( error );
++    return result;
+ }
+ 
+-/******************************************************************************
+- *		GetPixelFormat (GDI32.@)
+- */
+ INT WINAPI GetPixelFormat( HDC hdc )
+ {
+-    if (!wglGetPixelFormat)
+-    {
+-        if (!opengl32) opengl32 = LoadLibraryW( L"opengl32.dll" );
+-        if (!(wglGetPixelFormat = (void *)GetProcAddress( opengl32, "wglGetPixelFormat" )))
+-            return 0;
+-    }
+-    return wglGetPixelFormat( hdc );
++    HMODULE module = LoadLibraryW( L"opengl32.dll" );
++    INT (WINAPI *func)(HDC hdc);
++    INT result = 0;
++    DWORD error;
++
++    if (!module) return 0;
++    if ((func = (void *)GetProcAddress( module, "wglGetPixelFormat" )))
++        result = func( hdc );
++    error = GetLastError();
++    FreeLibrary( module );
++    SetLastError( error );
++    return result;
+ }
+ 
+-/******************************************************************************
+- *		SetPixelFormat (GDI32.@)
+- */
+ BOOL WINAPI SetPixelFormat( HDC hdc, INT fmt, const PIXELFORMATDESCRIPTOR *pfd )
+ {
+-    if (!wglSetPixelFormat)
+-    {
+-        if (!opengl32) opengl32 = LoadLibraryW( L"opengl32.dll" );
+-        if (!(wglSetPixelFormat = (void *)GetProcAddress( opengl32, "wglSetPixelFormat" )))
+-            return FALSE;
+-    }
+-    return wglSetPixelFormat( hdc, fmt, pfd );
++    HMODULE module = LoadLibraryW( L"opengl32.dll" );
++    BOOL (WINAPI *func)(HDC hdc, INT fmt, const PIXELFORMATDESCRIPTOR *pfd);
++    BOOL result = FALSE;
++    DWORD error;
++
++    if (!module) return FALSE;
++    if ((func = (void *)GetProcAddress( module, "wglSetPixelFormat" )))
++        result = func( hdc, fmt, pfd );
++    error = GetLastError();
++    FreeLibrary( module );
++    SetLastError( error );
++    return result;
+ }
+ 
+-/******************************************************************************
+- *		SwapBuffers (GDI32.@)
+- */
+ BOOL WINAPI SwapBuffers( HDC hdc )
+ {
+-    if (!wglSwapBuffers)
+-    {
+-        if (!opengl32) opengl32 = LoadLibraryW( L"opengl32.dll" );
+-        if (!(wglSwapBuffers = (void *)GetProcAddress( opengl32, "wglSwapBuffers" )))
+-            return FALSE;
+-    }
+-    return wglSwapBuffers( hdc );
++    HMODULE module = LoadLibraryW( L"opengl32.dll" );
++    BOOL (WINAPI *func)(HDC hdc);
++    BOOL result = FALSE;
++    DWORD error;
++
++    if (!module) return FALSE;
++    if ((func = (void *)GetProcAddress( module, "wglSwapBuffers" )))
++        result = func( hdc );
++    error = GetLastError();
++    FreeLibrary( module );
++    SetLastError( error );
++    return result;
+ }
+diff --git a/dlls/opengl32/wgl.c b/dlls/opengl32/wgl.c
+--- a/dlls/opengl32/wgl.c
++++ b/dlls/opengl32/wgl.c
+@@ -1747,6 +1747,10 @@
+         /* fallthrough */
+     case DLL_THREAD_DETACH:
+         free( NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_FORMATS_PTR] );
++        NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_FORMATS_PTR] = NULL;
++        NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_FORMATS_NUM] = 0;
++        NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_FORMATS_ONSCREEN] = 0;
++        NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_FORMATS_HDC] = 0;
+         return TRUE;
+     }
+     return TRUE;
