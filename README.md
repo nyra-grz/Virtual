@@ -50,6 +50,12 @@ Portable applications retain their working directory and must keep their complet
 folder. Installers are tracked with their child processes, and newly installed
 apps are discovered from shortcuts and App Paths/Uninstall registrations.
 Missing Windows components and nonzero exits are reported in the app with a log.
+Launcher-managed applications receive genuine Windows stdout/stderr pipes when
+host pipes do not support Windows pipe-state calls. This fixes libuv/Electron
+`open EBADF` startup failures while keeping live logs, binary output, stdin and
+child-process tracking. Files, consoles and existing Windows pipes retain their
+handles. Direct runtime launches without `program-runner.exe` do not use this
+transport bridge.
 Microsoft .NET Framework 4.8 remains available in the room's Windows tools for
 applications that need it instead of Wine Mono. Wine still cannot run every app.
 On Apple Silicon, the x64 Wine engine also requires Rosetta 2.
@@ -388,6 +394,11 @@ uv run --with pyyaml python -m unittest discover -s scripts/tests -v
 - **No** kernel tricks, **no** signature circumvention, **no** hiding of activity.
   Anti-cheat with a ring-0 driver does not run.
 - 3D support is experimental; not every game runs.
+- Paint.NET 5.1.12 is still blocked: its effect-category initialization requests
+  missing Direct2D built-ins (Histogram, OpacityMetadata, AlphaMask,
+  ConvolveMatrix, Contrast, BitmapSource, Emboss and Opacity). The base also lacks
+  rendering of effect images and several shader/transform APIs; registering
+  placeholder metadata would not provide working image editing.
 
 ## Definition of done – status
 

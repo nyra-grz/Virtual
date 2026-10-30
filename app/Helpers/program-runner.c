@@ -183,6 +183,117 @@ static WCHAR *command_line(int argc, WCHAR **argv)
     return line;
 }
 
+/* Imported Unix pipes can be read/written by Wine, but do not implement the
+ * Windows pipe-state API used by libuv (SetNamedPipeHandleState fails with
+ * ERROR_INVALID_HANDLE). Give children real Windows pipes and relay every byte
+ * to the original log sink. Regular files, consoles and existing Windows pipes
+ * keep their original handles. There is no application-specific detection. */
+struct output_relay
+{
+    HANDLE reader, writer, destination, thread;
+    volatile LONG stopping;
+    DWORD error;
+};
+
+static DWORD WINAPI relay_output(void *arg)
+{
+    struct output_relay *relay = arg;
+    BYTE buffer[16384];
+    DWORD count, written;
+
+    while (!InterlockedCompareExchange(&relay->stopping, 0, 0))
+    {
+        if (!ReadFile(relay->reader, buffer, sizeof(buffer), &count, NULL))
+        {
+            DWORD error = GetLastError();
+            if (error != ERROR_BROKEN_PIPE && error != ERROR_OPERATION_ABORTED) relay->error = error;
+            break;
+        }
+        if (!count) break;
+        for (DWORD offset = 0; offset < count; offset += written)
+        {
+            if (!WriteFile(relay->destination, buffer + offset, count - offset, &written, NULL) || !written)
+            {
+                relay->error = GetLastError();
+                if (!relay->error) relay->error = ERROR_WRITE_FAULT;
+                goto done;
+            }
+        }
+    }
+done:
+    /* Closing the read end also gives the child a broken-pipe error if the
+     * host log sink fails, instead of leaving it blocked on a full pipe. */
+    CloseHandle(relay->reader);
+    relay->reader = NULL;
+    return 0;
+}
+
+static BOOL prepare_output_relay(struct output_relay **out, HANDLE *handle)
+{
+    SECURITY_ATTRIBUTES attributes = { sizeof(attributes), NULL, TRUE };
+    struct output_relay *relay;
+    DWORD mode, error;
+
+    *out = NULL;
+    if (GetFileType(*handle) != FILE_TYPE_PIPE
+            || GetNamedPipeHandleStateW(*handle, &mode, NULL, NULL, NULL, NULL, 0)) return TRUE;
+    if (!(relay = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*relay))))
+    {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    relay->destination = *handle;
+    if (!CreatePipe(&relay->reader, &relay->writer, &attributes, 65536)
+            || !SetHandleInformation(relay->reader, HANDLE_FLAG_INHERIT, 0)
+            || !(relay->thread = CreateThread(NULL, 0, relay_output, relay, 0, NULL)))
+    {
+        error = GetLastError();
+        if (relay->reader) CloseHandle(relay->reader);
+        if (relay->writer) CloseHandle(relay->writer);
+        HeapFree(GetProcessHeap(), 0, relay);
+        SetLastError(error);
+        return FALSE;
+    }
+    *handle = relay->writer;
+    *out = relay;
+    return TRUE;
+}
+
+static void close_relay_writer(struct output_relay *relay)
+{
+    if (relay && relay->writer)
+    {
+        CloseHandle(relay->writer);
+        relay->writer = NULL;
+    }
+}
+
+static DWORD finish_output_relay(struct output_relay *relay)
+{
+    DWORD error;
+    if (!relay) return 0;
+    close_relay_writer(relay);
+    /* The whole application job has ended. Normally EOF drains the pipe at
+     * once. A process outside the job may still hold an inherited writer; do
+     * not let that process keep this launch alive forever. Cancel only after
+     * allowing queued output to drain. Never free a relay still used by a
+     * thread; process teardown will reclaim it if a sink cannot be cancelled. */
+    if (WaitForSingleObject(relay->thread, 5000) != WAIT_OBJECT_0)
+    {
+        InterlockedExchange(&relay->stopping, 1);
+        for (unsigned int i = 0; i < 40; ++i)
+        {
+            CancelSynchronousIo(relay->thread);
+            if (WaitForSingleObject(relay->thread, 50) == WAIT_OBJECT_0) break;
+        }
+        if (WaitForSingleObject(relay->thread, 0) != WAIT_OBJECT_0) return ERROR_TIMEOUT;
+    }
+    error = relay->error;
+    CloseHandle(relay->thread);
+    HeapFree(GetProcessHeap(), 0, relay);
+    return error;
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
@@ -190,6 +301,7 @@ int wmain(int argc, WCHAR **argv)
     STARTUPINFOW startup = {0};
     PROCESS_INFORMATION child = {0};
     struct launch launch = {0};
+    struct output_relay *output = NULL, *errors = NULL;
     HANDLE job, port;
     WCHAR *line;
     DWORD status = 1;
@@ -224,6 +336,17 @@ int wmain(int argc, WCHAR **argv)
     }
     launch.job = job;
     startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    if (!prepare_output_relay(&output, &startup.hStdOutput)
+            || !prepare_output_relay(&errors, &startup.hStdError))
+    {
+        status = GetLastError();
+        fprintf(stderr, "Windows-Ausgabekanal konnte nicht angelegt werden (Fehler %lu).\n", status);
+        goto cleanup;
+    }
     if (!CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &startup, &child))
         fprintf(stderr, "Programmstart fehlgeschlagen (Windows-Fehler %lu).\n", GetLastError());
     else if (!AssignProcessToJobObject(job, child.hProcess))
@@ -233,6 +356,8 @@ int wmain(int argc, WCHAR **argv)
     }
     else
     {
+        close_relay_writer(output);
+        close_relay_writer(errors);
         launch.starter = child.dwProcessId;
         ResumeThread(child.hThread);
         wait_for_job(&launch, port, child.hProcess);
@@ -244,6 +369,7 @@ int wmain(int argc, WCHAR **argv)
             status = launch.failed_status;
         }
     }
+cleanup:
     while (launch.count)
     {
         HANDLE process = launch.members[--launch.count].process;
@@ -254,6 +380,14 @@ int wmain(int argc, WCHAR **argv)
     if (child.hProcess) CloseHandle(child.hProcess);
     CloseHandle(job);
     if (port) CloseHandle(port);
+    DWORD output_error = finish_output_relay(output);
+    DWORD stderr_error = finish_output_relay(errors);
+    if (output_error || stderr_error)
+    {
+        fprintf(stderr, "Windows-Ausgabe konnte nicht vollstaendig weitergeleitet werden (Fehler %lu/%lu).\n",
+                output_error, stderr_error);
+        if (succeeded(status)) status = ERROR_WRITE_FAULT;
+    }
     HeapFree(GetProcessHeap(), 0, line);
     /* Preserve Windows' 32-bit result; the host process exit status only keeps
      * the low byte (for example, MSI success-with-reboot 3010 becomes 194). */

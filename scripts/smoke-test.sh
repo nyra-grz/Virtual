@@ -340,6 +340,22 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
             show_log "runner-$bits-$mode.log"
         fi
     done
+    if "$cc" -municode -mwindows -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/stdio_transport.c" \
+        -o "stdio$bits.exe" >"stdio-build$bits.log" 2>&1; then
+        # Keep exact-byte assertions independent of engine diagnostic banners.
+        # The general suite separately exercises the default sync backend.
+        if WINEMSYNC=0 MVK_CONFIG_LOG_LEVEL=0 python3 "$ROOT/scripts/test-stdio-transport.py" \
+            --wine "$WINMAC_RUNTIME/bin/virtual" --runner "$SCRATCH/program-runner$bits.exe" \
+            --fixture "$SCRATCH/stdio$bits.exe" --scratch "$SCRATCH" >"stdio$bits.log" 2>&1; then
+            report ok "App-Helfer $bits Bit: Windows-Ausgabepipes" "Pipe-API, Datei, 2 MiB binaer, spaete Kinder und stdin"
+        else
+            report FEHLER "App-Helfer $bits Bit: Windows-Ausgabepipes"
+            show_log "stdio$bits.log"
+        fi
+    else
+        report FEHLER "App-Helfer $bits Bit: Ausgabetest kompilieren"
+        show_log "stdio-build$bits.log"
+    fi
 done
 
 # Browser options must follow Electron's image identity, not its executable name
