@@ -342,9 +342,9 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
     done
     if "$cc" -municode -mwindows -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/stdio_transport.c" \
         -o "stdio$bits.exe" >"stdio-build$bits.log" 2>&1; then
-        # Keep exact-byte assertions independent of engine diagnostic banners.
-        # The general suite separately exercises the default sync backend.
-        if WINEMSYNC=0 MVK_CONFIG_LOG_LEVEL=0 python3 "$ROOT/scripts/test-stdio-transport.py" \
+        # Keep exact-byte assertions independent of graphics diagnostics; retain
+        # the prefix's sync backend because its existing server uses it too.
+        if WINMAC_EXPECT_NONZERO=1 MVK_CONFIG_LOG_LEVEL=0 python3 "$ROOT/scripts/test-stdio-transport.py" \
             --wine "$WINMAC_RUNTIME/bin/virtual" --runner "$SCRATCH/program-runner$bits.exe" \
             --fixture "$SCRATCH/stdio$bits.exe" --scratch "$SCRATCH" >"stdio$bits.log" 2>&1; then
             report ok "App-Helfer $bits Bit: Windows-Ausgabepipes" "Pipe-API, Datei, 2 MiB binaer, spaete Kinder und stdin"
