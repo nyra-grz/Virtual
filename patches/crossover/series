@@ -33,3 +33,4 @@
 0028-Virtual-0029-graphics-api-contracts.patch
 0029-Virtual-0030-opengl-module-lifetime.patch
 0030-Virtual-0031-d2d-effect-contracts.patch
+0031-Virtual-0032-shader-reflection-contracts.patch

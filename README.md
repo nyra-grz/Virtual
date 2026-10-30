@@ -124,6 +124,12 @@ reported instead of repeatedly relaunching the app. Winetricks handles the pinne
 legacy recipes; current .NET runtime installers come from Microsoft's verified
 release metadata. Native .NET 4.8 is selected for detected classic WPF/WinRT apps.
 
+Shared shader reflection now reports actual minimum feature levels from DXBC
+shader models (including level-9 translations) and preserves encoded requirement
+flags for double arithmetic and minimum precision. Independent fixtures check
+these metadata APIs in 32 and 64 bits against reference results. This does not
+claim that the active GPU can execute every reflected shader.
+
 GStreamer supports media decoding; the runtime tests include an actual H.264 frame
 decoded to RGB32. A keyboard regression checks Mac layout/user-locale handling,
 and asynchronous directory notifications are tested through the kqueue bridge.

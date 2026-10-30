@@ -648,6 +648,22 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
         show_log "graphics-late$bits.out"; show_log "graphics-late$bits.err"
     fi
 done
+# Shared shader metadata, independent of any application or renderer.
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    if [ "$PREFIX_READY" != 1 ] || ! command -v "$cc" >/dev/null 2>&1; then
+        report übersprungen "Integration: Shader-Analyse $bits Bit" "Prefix oder Compiler fehlt"
+    elif "$cc" -municode -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/shader_reflection.c" \
+            -o "shader-reflection$bits.exe" -ldxguid >"compile-shader-reflection$bits.log" 2>&1 &&
+         WINEDLLOVERRIDES='d3dcompiler_47=b;winedbg.exe=d' "$WINMAC_RUNTIME/bin/virtual" \
+            "$SCRATCH/shader-reflection$bits.exe" >"shader-reflection$bits.out" 2>"shader-reflection$bits.err"; then
+        report ok "Integration: Shader-Analyse $bits Bit" "$(tr -d '\r' <"shader-reflection$bits.out" | tail -1)"
+    else
+        report FEHLER "Integration: Shader-Analyse $bits Bit"
+        show_log "compile-shader-reflection$bits.log"
+        show_log "shader-reflection$bits.out"; show_log "shader-reflection$bits.err"
+    fi
+done
 # Windows-System-ICU (icu.dll + Weiterleitungen), 64 und 32 Bit; der Test ist mit -licu
 # gelinkt und startet ohne icu.dll gar nicht.
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do

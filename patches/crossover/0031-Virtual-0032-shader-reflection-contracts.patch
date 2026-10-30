@@ -1,0 +1,129 @@
+Implement common Direct3D shader reflection contracts for all callers.
+
+Derive minimum feature level from shader model and the translated D3D9 code
+in level-9 DXBC containers. Preserve encoded SFI0 requirement bits instead of
+reporting zero. Validate the data consumed and reject a null feature-level
+output with E_INVALIDARG. This is shader metadata, not an assertion that a
+particular GPU can execute it. No process-name checks or application profiles.
+
+Regression: winrt/tests/shader_reflection.c; independent HLSL fixtures and
+Microsoft reference API results for 9_1, 9_3, 10_0, 10_1, 11_0, double,
+extended double and minimum-precision requirements.
+
+--- a/dlls/d3dcompiler_43/reflection.c
++++ b/dlls/d3dcompiler_43/reflection.c
+@@ -135,6 +135,8 @@
+     char *creator;
+     UINT flags;
+     UINT version;
++    D3D_FEATURE_LEVEL legacy_feature_level;
++    UINT64 requires_flags;
+     UINT bound_resource_count;
+     UINT constant_buffer_count;
+ 
+@@ -700,9 +702,22 @@
+ static HRESULT STDMETHODCALLTYPE d3dcompiler_shader_reflection_GetMinFeatureLevel(
+         ID3D11ShaderReflection *iface, D3D_FEATURE_LEVEL *level)
+ {
+-    FIXME("iface %p, level %p stub!\n", iface, level);
+-
+-    return E_NOTIMPL;
++    struct d3dcompiler_shader_reflection *reflection = impl_from_ID3D11ShaderReflection(iface);
++    unsigned int major = (reflection->version >> 4) & 0xf;
++    unsigned int minor = reflection->version & 0xf;
++
++    TRACE("iface %p, level %p.\n", iface, level);
++
++    if (!level) return E_INVALIDARG;
++    if (reflection->legacy_feature_level)
++        *level = reflection->legacy_feature_level;
++    else if (major == 4 && minor <= 1)
++        *level = minor ? D3D_FEATURE_LEVEL_10_1 : D3D_FEATURE_LEVEL_10_0;
++    else if (major == 5 && minor <= 1)
++        *level = D3D_FEATURE_LEVEL_11_0;
++    else
++        return E_FAIL;
++    return S_OK;
+ }
+ 
+ static UINT STDMETHODCALLTYPE d3dcompiler_shader_reflection_GetThreadGroupSize(
+@@ -728,9 +743,10 @@
+ static UINT64 STDMETHODCALLTYPE d3dcompiler_shader_reflection_GetRequiresFlags(
+         ID3D11ShaderReflection *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-
+-    return 0;
++    struct d3dcompiler_shader_reflection *reflection = impl_from_ID3D11ShaderReflection(iface);
++
++    TRACE("iface %p.\n", iface);
++    return reflection->requires_flags;
+ }
+ #endif
+ 
+@@ -1785,6 +1801,7 @@
+     const uint32_t *u_ptr;
+     unsigned int len;
+ 
++    if (data_size < 2 * sizeof(uint32_t)) return E_FAIL;
+     r->version = read_u32(&ptr);
+     TRACE("Shader version: %u\n", r->version);
+ 
+@@ -1867,6 +1884,57 @@
+ 
+         switch (section->tag)
+         {
++            case ('A' | 'o' << 8 | 'n' << 16 | '9' << 24):
++            {
++                const char *ptr = section->data.code;
++                uint32_t byte_code_size, byte_code_offset, version;
++
++                /* Level-9 profiles carry both SM4 and translated D3D9 code.
++                 * The translated version distinguishes 9_1 (2.0) from 9_3
++                 * (2.x); the outer Aon9 header uses 2.0 for both. */
++                if (section->data.size < 4 * sizeof(uint32_t))
++                {
++                    hr = E_FAIL;
++                    goto err_out;
++                }
++                ptr += 2 * sizeof(uint32_t);
++                byte_code_size = read_u32(&ptr);
++                byte_code_offset = read_u32(&ptr);
++                if (byte_code_offset > section->data.size || byte_code_size < sizeof(uint32_t)
++                        || byte_code_size > section->data.size - byte_code_offset)
++                {
++                    hr = E_FAIL;
++                    goto err_out;
++                }
++                ptr = (const char *)section->data.code + byte_code_offset;
++                version = read_u32(&ptr);
++                if ((version != 0xfffe0200 && version != 0xffff0200)
++                        && (version != 0xfffe0201 && version != 0xffff0201))
++                {
++                    hr = E_FAIL;
++                    goto err_out;
++                }
++                reflection->legacy_feature_level = version & 0xff
++                        ? D3D_FEATURE_LEVEL_9_3 : D3D_FEATURE_LEVEL_9_1;
++                break;
++            }
++
++            case ('S' | 'F' << 8 | 'I' << 16 | '0' << 24):
++            {
++                const char *ptr = section->data.code;
++                uint32_t low, high;
++
++                if (section->data.size < 2 * sizeof(uint32_t))
++                {
++                    hr = E_FAIL;
++                    goto err_out;
++                }
++                low = read_u32(&ptr);
++                high = read_u32(&ptr);
++                reflection->requires_flags = low | (UINT64)high << 32;
++                break;
++            }
++
+             case TAG_RDEF:
+                 hr = d3dcompiler_parse_rdef(reflection, section->data.code, section->data.size);
+                 if (FAILED(hr))
