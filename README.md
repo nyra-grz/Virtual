@@ -149,6 +149,12 @@ To build the complete app locally without publishing:
 WINMAC_BUNDLE_ENGINE=1 ./build-app.sh
 ```
 
+Windows app windows use the normal macOS window plane, including Windows
+"topmost" windows and borderless windows. Window ownership and Win32 ordering
+remain separate from global Mac window levels. Kiosk overlays are opt-in;
+actual exclusive display capture retains its required plane. Already running
+Windows processes must restart to load a changed Mac driver.
+
 ## Rooms and programs
 
 The native sidebar groups programs by **room** (an independent Wine prefix with its

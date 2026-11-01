@@ -11,6 +11,7 @@ fi
 (cd app && swift test)
 uv run --with pyyaml python -m unittest discover -s scripts/tests -v
 python3 -m unittest discover -s scripts -p test_dotnet_cache.py -v
+python3 scripts/test-window-levels.py
 
 # Prefer the engine bundled in the local app. WINMAC_HOME can select a candidate.
 if [ -z "${WINMAC_HOME:-}" ] && [ -x "$ROOT/build/Virtual.app/Contents/Resources/Engine/runtime/bin/virtual" ]; then

@@ -118,6 +118,27 @@ final class ImportAndLaunchTests: XCTestCase {
         XCTAssertEqual(setupRuns, 2)
     }
 
+    func testNormalWindowModeOverridesInheritedKioskEnvironment() throws {
+        let preferences = UserDefaults.standard
+        let previous = preferences.object(forKey: "overlayEnabled")
+        let inherited = ProcessInfo.processInfo.environment["VIRTUAL_KIOSK_OVERLAY"]
+        defer {
+            if let previous { preferences.set(previous, forKey: "overlayEnabled") }
+            else { preferences.removeObject(forKey: "overlayEnabled") }
+            if let inherited { setenv("VIRTUAL_KIOSK_OVERLAY", inherited, 1) }
+            else { unsetenv("VIRTUAL_KIOSK_OVERLAY") }
+        }
+        setenv("VIRTUAL_KIOSK_OVERLAY", "1", 1)
+        preferences.removeObject(forKey: "overlayEnabled")
+        let room = room()
+        XCTAssertFalse(Settings.shared.overlayEnabled)
+        XCTAssertNil(RoomStore.shared.environment(for: room)["VIRTUAL_KIOSK_OVERLAY"])
+        Settings.shared.overlayEnabled = true
+        XCTAssertEqual(RoomStore.shared.environment(for: room)["VIRTUAL_KIOSK_OVERLAY"], "1")
+        Settings.shared.overlayEnabled = false
+        XCTAssertNil(RoomStore.shared.environment(for: room)["VIRTUAL_KIOSK_OVERLAY"])
+    }
+
     func testInstallerUsesMsiExecAfterPreparation() throws {
         let room = room(), installer = try program(in: room, filename: "An installer.msi")
         let done = observe(Launcher.didFinishInRoom)

@@ -106,7 +106,7 @@ final class Settings {
     }
 
     var overlayEnabled: Bool {
-        get { defaults.object(forKey: "overlayEnabled") as? Bool ?? true }
+        get { defaults.object(forKey: "overlayEnabled") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "overlayEnabled") }
     }
     var overlayShortcut: OverlayController.Shortcut {

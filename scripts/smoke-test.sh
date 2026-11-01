@@ -608,6 +608,20 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
     fi
 done
 done
+# Native-plane changes must preserve Win32 ownership and topmost state.
+for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+    bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
+    if [ "$PREFIX_READY" != 1 ] || ! command -v "$cc" >/dev/null 2>&1; then
+        report übersprungen "Integration: Fensterordnung $bits Bit" "Prefix oder Compiler fehlt"
+    elif "$cc" -O2 -Wall -Wextra -Werror "$ROOT/winrt/tests/window_order.c" -o "window-order$bits.exe" \
+            -luser32 >"compile-window-order$bits.log" 2>&1 &&
+         "$WINMAC_RUNTIME/bin/virtual" "$SCRATCH/window-order$bits.exe" >"window-order$bits.out" 2>"window-order$bits.err"; then
+        report ok "Integration: Fensterordnung $bits Bit" "$(tr -d '\r' <"window-order$bits.out" | tail -1)"
+    else
+        report FEHLER "Integration: Fensterordnung $bits Bit"
+        show_log "compile-window-order$bits.log"; show_log "window-order$bits.out"; show_log "window-order$bits.err"
+    fi
+done
 # Graphics contracts: real ICC data, declaration lifetime, replaceable OpenGL
 # modules and custom effects whose factory IUnknown differs from EffectImpl.
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do

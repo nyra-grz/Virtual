@@ -1,0 +1,159 @@
+Use the normal macOS window plane for ordinary Windows windows.
+
+WS_EX_TOPMOST remains a Windows ordering property, not a mandate to outrank
+other Mac applications or the Dock. Borderless/full-screen geometry alone no
+longer raises the plane. Explicit kiosk overlays and actual display capture
+retain their required planes. A shared native policy is compiled into both
+window-level calculation and floating-floor adjustment; tests compile that
+exact header against AppKit constants without controlling the user's desktop.
+
+Overlay is opt-in; false environment values do not accidentally enable it.
+No application names, executable checks or application-specific configuration.
+
+--- /dev/null
++++ b/dlls/winemac.drv/virtual_window_levels.h
+@@ -0,0 +1,35 @@
++/*
++ * Shared macOS window-plane policy for Virtual's Wine driver.
++ * Copyright 2026 Virtual contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#ifndef VIRTUAL_WINDOW_LEVELS_H
++#define VIRTUAL_WINDOW_LEVELS_H
++
++#include <string.h>
++#include <strings.h>
++
++static inline BOOL virtual_overlay_value(const char *value)
++{
++    return value && (!strcmp(value, "1") || !strcasecmp(value, "true")
++            || !strcasecmp(value, "yes") || !strcasecmp(value, "on"));
++}
++
++static inline NSInteger virtual_window_level(BOOL active, BOOL floating,
++        BOOL captured, BOOL overlay, BOOL demoted)
++{
++    if (demoted) return NSNormalWindowLevel;
++    if (active && captured) return CGShieldingWindowLevel() + 1 + !!floating;
++    if (overlay)
++        return (active ? NSStatusWindowLevel + 1 : NSFloatingWindowLevel) + !!floating;
++    return NSNormalWindowLevel;
++}
++
++static inline NSInteger virtual_floating_level(NSInteger level, BOOL floating,
++        BOOL demoted, NSInteger nonfloating_level)
++{
++    if (!floating || demoted || level <= NSNormalWindowLevel) return level;
++    return level > nonfloating_level ? level : nonfloating_level + 1;
++}
++
++#endif
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -30,6 +30,7 @@
+ 
+ #include "macdrv_cocoa.h"
+ #import "cocoa_app.h"
++#include "virtual_window_levels.h"
+ #import "cocoa_event.h"
+ #import "cocoa_opengl.h"
+ #import "d3dmetal_objc.h" /* CW HACK 22435 */
+@@ -161,7 +162,10 @@
+ BOOL virtual_kiosk_overlay(void)
+ {
+     static int enabled = -1;
+-    if (enabled < 0) enabled = getenv("VIRTUAL_KIOSK_OVERLAY") != NULL;
++    if (enabled < 0)
++    {
++        enabled = virtual_overlay_value(getenv("VIRTUAL_KIOSK_OVERLAY"));
++    }
+     return enabled;
+ }
+ 
+@@ -1271,42 +1275,15 @@
+ 
+     - (NSInteger) minimumLevelForActive:(BOOL)active
+     {
+-        NSInteger level;
+-
+-        if (self.floating && (active || topmost_float_inactive == TOPMOST_FLOAT_INACTIVE_ALL ||
+-                              (topmost_float_inactive == TOPMOST_FLOAT_INACTIVE_NONFULLSCREEN && !fullscreen)))
+-            level = NSFloatingWindowLevel;
+-        else
+-            level = NSNormalWindowLevel;
+-
+-        if (active)
+-        {
+-            BOOL captured;
+-
+-            captured = (fullscreen || [self screen]) && [[WineApplicationController sharedController] areDisplaysCaptured];
+-
+-            if (captured || fullscreen)
+-            {
+-                if (captured)
+-                    level = CGShieldingWindowLevel() + 1; /* Need +1 or we don't get mouse moves */
+-                else
+-                    level = NSStatusWindowLevel + 1;
+-
+-                if (self.floating)
+-                    level++;
+-            }
+-        }
+-
+-        /* Stays above other apps' windows while another app is active, until shrunk. */
+-        if ([self virtualKioskDemoted])
+-            level = NSNormalWindowLevel;
+-        else if ((fullscreen && virtual_kiosk_overlay()) || [self virtualIsKiosk])
+-        {
+-            if (!active && level < NSFloatingWindowLevel)
+-                level = NSFloatingWindowLevel + (self.floating ? 1 : 0);
+-        }
+-
+-        return level;
++        BOOL overlay = (fullscreen && virtual_kiosk_overlay()) || [self virtualIsKiosk];
++        BOOL captured = active && (fullscreen || [self screen]) &&
++                [[WineApplicationController sharedController] areDisplaysCaptured];
++
++        /* Win32 topmost/owned-window ordering stays inside the normal Mac
++         * plane. Only an opted-in kiosk or an actual captured display raises
++         * the native plane; deactivation alone never pins ordinary windows. */
++        return virtual_window_level(active, self.floating, captured, overlay,
++                [self virtualKioskDemoted]);
+     }
+ 
+     /* On the desktop a program switched to for itself, i.e. part of a kiosk. */
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -22,6 +22,7 @@
+ #import "cocoa_cursorclipping.h"
+ #import "cocoa_event.h"
+ #import "cocoa_window.h"
++#include "virtual_window_levels.h"
+ #import "cocoa_icon_utils.h"
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+@@ -694,8 +695,6 @@
+         NSUInteger nextFloatingIndex = 0;
+         __block NSInteger maxLevel = NSIntegerMin;
+         __block NSInteger maxNonfloatingLevel = NSNormalWindowLevel;
+-        /* Windows with WS_EX_TOPMOST should have a window level higher than the macOS dock */
+-        __block NSInteger minFloatingLevel = kCGDockWindowLevel + 1;
+         __block WineWindow* prev = nil;
+         WineWindow* window;
+ 
+@@ -732,13 +731,8 @@
+             NSInteger origLevel = [window level];
+             NSInteger newLevel = [window minimumLevelForActive:active];
+ 
+-            if (window.floating && ![window virtualKioskDemoted])
+-            {
+-                if (minFloatingLevel <= maxNonfloatingLevel)
+-                    minFloatingLevel = maxNonfloatingLevel + 1;
+-                if (newLevel < minFloatingLevel)
+-                    newLevel = minFloatingLevel;
+-            }
++            newLevel = virtual_floating_level(newLevel, window.floating,
++                    [window virtualKioskDemoted], maxNonfloatingLevel);
+ 
+             if (newLevel < maxLevel)
+                 newLevel = maxLevel;
