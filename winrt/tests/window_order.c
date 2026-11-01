@@ -17,10 +17,12 @@ int main(void)
     cls.hInstance = GetModuleHandleW(NULL);
     cls.lpszClassName = L"VirtualWindowOrderTest";
     check(RegisterClassW(&cls) != 0, "register test class");
-    owner = CreateWindowExW(0, cls.lpszClassName, L"Owner", WS_OVERLAPPEDWINDOW,
+    owner = CreateWindowExW(WS_EX_TOPMOST, cls.lpszClassName, L"Owner", WS_OVERLAPPEDWINDOW,
             20, 20, 320, 200, NULL, NULL, cls.hInstance, NULL);
     check(owner != NULL, "create hidden owner");
     if (!owner) return 1;
+    check((GetWindowLongPtrW(owner, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0,
+            "topmost creation flag retained");
     dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, cls.lpszClassName, L"Owned dialog",
             WS_POPUP | WS_CAPTION, 40, 40, 160, 100, owner, NULL, cls.hInstance, NULL);
     check(dialog != NULL, "create hidden owned dialog");
