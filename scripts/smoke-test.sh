@@ -613,17 +613,17 @@ done
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
     bits=64; [ "$cc" = i686-w64-mingw32-gcc ] && bits=32
     cxx="${cc%gcc}g++"
-    for test in graphics_contracts opengl_lifetime effect_identity; do
+    for test in graphics_contracts opengl_lifetime effect_identity effect_render; do
         compiler="$cc"; source="$ROOT/winrt/tests/$test.c"
         libs=(-ld3d11 -lmscms)
         [ "$test" != opengl_lifetime ] || libs=(-lgdi32 -luser32)
-        if [ "$test" = effect_identity ]; then
+        if [ "$test" = effect_identity ] || [ "$test" = effect_render ]; then
             compiler="$cxx"; source="$ROOT/winrt/tests/$test.cpp"
             libs=(-static -ld2d1 -ld3d11 -ldxgi -lole32 -luuid)
         fi
         test_overrides="$WINEDLLOVERRIDES"
         test_d3d_config="${WINE_D3D_CONFIG:-}"
-        if [ "$bits" = 32 ] && [ "$test" = effect_identity ]; then
+        if [ "$bits" = 32 ] && { [ "$test" = effect_identity ] || [ "$test" = effect_render ]; }; then
             test_overrides='d3d11,d3d10core,dxgi=b;winedbg.exe=d'
             test_d3d_config='renderer=gl'
         fi

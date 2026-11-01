@@ -1,0 +1,290 @@
+Implement the shared Direct2D image path for bitmap-resolving passthrough graphs.
+
+Walk nested alias graphs with strong temporary references, cycle/reentry checks
+and resource-domain validation. Prepare effects after properties/context changes,
+retain and release cached context references, allow NULL input detachment, and
+reuse the existing GPU bitmap path so DPI, clipping and target offsets survive.
+Compute local/world bounds; propagate unsupported topologies and callback errors
+through EndDraw instead of reporting success after rendering nothing.
+
+This does not implement shader/color-filter graph execution or add fake effects.
+Regression: independent effect_render.cpp, real GPU staging readback in x86/x64,
+40-level chains, resource domains, transforms, clips, failure tags and cleanup.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -831,10 +831,17 @@
+     ID2D1Image **inputs;
+     size_t inputs_size;
+     size_t input_count;
++    D2D1_CHANGE_TYPE changes;
++    struct d2d_device_context *last_context;
++    float last_dpi_x, last_dpi_y;
++    D2D1_DRAWING_STATE_DESCRIPTION1 last_drawing_state;
++    BOOL preparing;
+ };
+ 
+ HRESULT d2d_effect_create(struct d2d_device_context *context, const CLSID *effect_id,
+         ID2D1Effect **effect);
++HRESULT d2d_effect_resolve_bitmap(struct d2d_device_context *context, ID2D1Image *image,
++        BOOL prepare, ID2D1Bitmap **bitmap);
+ void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
+ HRESULT d2d_effect_properties_add(struct d2d_effect_properties *props, const WCHAR *name,
+         UINT32 index, D2D1_PROPERTY_TYPE type, const WCHAR *value);
+--- a/dlls/d2d1/effect.c
++++ b/dlls/d2d1/effect.c
+@@ -2195,7 +2195,11 @@
+     if (prop->index < 0x80000000 && !prop->set_function) return E_INVALIDARG;
+ 
+     if (prop->set_function)
+-        return prop->set_function((IUnknown *)effect->impl, value, size);
++    {
++        HRESULT hr = prop->set_function((IUnknown *)effect->impl, value, size);
++        if (SUCCEEDED(hr)) effect->changes |= D2D1_CHANGE_TYPE_PROPERTIES;
++        return hr;
++    }
+ 
+     if (prop->size != size) return E_INVALIDARG;
+ 
+@@ -2205,6 +2209,7 @@
+         case D2D1_PROPERTY_TYPE_UINT32:
+         case D2D1_PROPERTY_TYPE_ENUM:
+             memcpy(properties->data.ptr + prop->data.offset, value, size);
++            effect->changes |= D2D1_CHANGE_TYPE_PROPERTIES;
+             break;
+         default:
+             FIXME("Unhandled type %u.\n", prop->type);
+@@ -2633,6 +2638,8 @@
+     d2d_effect_properties_cleanup(&effect->properties);
+     if (effect->impl)
+         ID2D1EffectImpl_Release(effect->impl);
++    if (effect->last_context)
++        ID2D1DeviceContext6_Release(&effect->last_context->ID2D1DeviceContext6_iface);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_effect_QueryInterface(ID2D1Effect *iface, REFIID iid, void **out)
+@@ -2815,7 +2822,7 @@
+     if (index >= effect->input_count)
+         return;
+ 
+-    ID2D1Image_AddRef(input);
++    if (input) ID2D1Image_AddRef(input);
+     if (effect->inputs[index])
+         ID2D1Image_Release(effect->inputs[index]);
+     effect->inputs[index] = input;
+@@ -2850,6 +2857,7 @@
+         memset(&effect->inputs[effect->input_count], 0, sizeof(*effect->inputs) * (count - effect->input_count));
+     }
+     effect->input_count = count;
++    effect->changes = D2D1_CHANGE_TYPE_GRAPH;
+ 
+     if (initialized)
+     {
+@@ -2986,6 +2994,105 @@
+     d2d_effect_image_GetFactory,
+ };
+ 
++/* Resolve alias graphs without losing image DPI, clips or the caller's world
++ * transform. Keep every traversed image alive: PrepareForRender may replace an
++ * input, and a released object's address must not be mistaken for a cycle. */
++HRESULT d2d_effect_resolve_bitmap(struct d2d_device_context *context, ID2D1Image *image,
++        BOOL prepare, ID2D1Bitmap **bitmap)
++{
++    ID2D1Image **visited = NULL, *current = image, *next;
++    size_t count = 0, capacity = 0, i;
++    struct d2d_effect *effect;
++    D2D1_CHANGE_TYPE changes;
++    HRESULT hr = E_NOTIMPL;
++
++    *bitmap = NULL;
++    if (!image) return D2DERR_INVALID_GRAPH_CONFIGURATION;
++    /* Keep the ordinary bitmap path allocation-free. */
++    if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)bitmap)))
++        return S_OK;
++    if (context->cs) EnterCriticalSection(context->cs);
++    while (current)
++    {
++        for (i = 0; i < count; ++i)
++            if (visited[i] == current) { hr = D2DERR_CYCLIC_GRAPH; goto done; }
++        if (!d2d_array_reserve((void **)&visited, &capacity, count + 1, sizeof(*visited)))
++        {
++            hr = E_OUTOFMEMORY;
++            goto done;
++        }
++        ID2D1Image_AddRef(current);
++        visited[count++] = current;
++        if (SUCCEEDED(ID2D1Image_QueryInterface(current, &IID_ID2D1Bitmap, (void **)bitmap)))
++        {
++            hr = S_OK;
++            goto done;
++        }
++        if (current->lpVtbl != &d2d_effect_image_vtbl)
++        {
++            hr = E_NOTIMPL;
++            goto done;
++        }
++        effect = impl_from_ID2D1Image(current);
++        if (effect->preparing)
++        {
++            hr = D2DERR_CYCLIC_GRAPH;
++            goto done;
++        }
++        if (effect->effect_context->device_context->device != context->device)
++        {
++            hr = D2DERR_WRONG_RESOURCE_DOMAIN;
++            goto done;
++        }
++        if (prepare)
++        {
++            changes = effect->changes;
++            if (effect->last_context != context || effect->last_dpi_x != context->desc.dpiX
++                    || effect->last_dpi_y != context->desc.dpiY
++                    || memcmp(&effect->last_drawing_state, &context->drawing_state,
++                            sizeof(effect->last_drawing_state)))
++                changes |= D2D1_CHANGE_TYPE_CONTEXT;
++            if (changes)
++            {
++                effect->changes = D2D1_CHANGE_TYPE_NONE;
++                effect->preparing = TRUE;
++                hr = ID2D1EffectImpl_PrepareForRender(effect->impl, changes);
++                effect->preparing = FALSE;
++                if (FAILED(hr))
++                {
++                    effect->changes |= changes;
++                    goto done;
++                }
++                ID2D1DeviceContext6_AddRef(&context->ID2D1DeviceContext6_iface);
++                if (effect->last_context)
++                    ID2D1DeviceContext6_Release(&effect->last_context->ID2D1DeviceContext6_iface);
++                effect->last_context = context;
++                effect->last_dpi_x = context->desc.dpiX;
++                effect->last_dpi_y = context->desc.dpiY;
++                effect->last_drawing_state = context->drawing_state;
++            }
++        }
++        if (!effect->graph || !effect->graph->passthrough)
++        {
++            hr = E_NOTIMPL;
++            goto done;
++        }
++        if (effect->graph->passthrough_input >= effect->input_count
++                || !(next = effect->inputs[effect->graph->passthrough_input]))
++        {
++            hr = D2DERR_INVALID_GRAPH_CONFIGURATION;
++            goto done;
++        }
++        current = next;
++    }
++    hr = D2DERR_INVALID_GRAPH_CONFIGURATION;
++done:
++    for (i = 0; i < count; ++i) ID2D1Image_Release(visited[i]);
++    free(visited);
++    if (context->cs) LeaveCriticalSection(context->cs);
++    return hr;
++}
++
+ static inline struct d2d_effect_properties *impl_from_ID2D1Properties(ID2D1Properties *iface)
+ {
+     return CONTAINING_RECORD(iface, struct d2d_effect_properties, ID2D1Properties_iface);
+@@ -3457,6 +3564,7 @@
+     object->ID2D1Image_iface.lpVtbl = &d2d_effect_image_vtbl;
+     object->refcount = 1;
+     object->effect_context = effect_context;
++    object->changes = D2D1_CHANGE_TYPE_GRAPH;
+ 
+     /* Create properties */
+     d2d_effect_duplicate_properties(object, &object->properties, reg->properties);
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -2382,10 +2382,12 @@
+     D2D_SIZE_U pixel_size;
+     ID2D1Bitmap *bitmap;
+     D2D_SIZE_F size;
++    HRESULT hr;
+ 
+     TRACE("iface %p, image %p, local_bounds %p.\n", iface, image, local_bounds);
+ 
+-    if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)&bitmap)))
++    if (!image || !local_bounds) return E_INVALIDARG;
++    if (SUCCEEDED(hr = d2d_effect_resolve_bitmap(context, image, TRUE, &bitmap)))
+     {
+         local_bounds->left = 0.0f;
+         local_bounds->top  = 0.0f;
+@@ -2415,16 +2417,33 @@
+     {
+         FIXME("Unable to get local bounds of image %p.\n", image);
+ 
+-        return E_NOTIMPL;
++        return hr;
+     }
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_GetImageWorldBounds(ID2D1DeviceContext6 *iface,
+         ID2D1Image *image, D2D1_RECT_F *world_bounds)
+ {
+-    FIXME("iface %p, image %p, world_bounds %p stub!\n", iface, image, world_bounds);
+-
+-    return E_NOTIMPL;
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    const D2D1_MATRIX_3X2_F *matrix = &context->drawing_state.transform;
++    D2D1_RECT_F bounds;
++    D2D1_POINT_2F point;
++    HRESULT hr;
++
++    TRACE("iface %p, image %p, world_bounds %p.\n", iface, image, world_bounds);
++
++    if (!world_bounds) return E_INVALIDARG;
++    if (FAILED(hr = d2d_device_context_GetImageLocalBounds(iface, image, &bounds))) return hr;
++    d2d_point_transform(&point, matrix, bounds.left, bounds.top);
++    world_bounds->left = world_bounds->right = point.x;
++    world_bounds->top = world_bounds->bottom = point.y;
++    d2d_point_transform(&point, matrix, bounds.right, bounds.top);
++    d2d_rect_expand(world_bounds, &point);
++    d2d_point_transform(&point, matrix, bounds.left, bounds.bottom);
++    d2d_rect_expand(world_bounds, &point);
++    d2d_point_transform(&point, matrix, bounds.right, bounds.bottom);
++    d2d_rect_expand(world_bounds, &point);
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_GetGlyphRunWorldBounds(ID2D1DeviceContext6 *iface,
+@@ -2627,6 +2646,7 @@
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+     ID2D1Bitmap *bitmap;
++    HRESULT hr;
+ 
+     TRACE("iface %p, image %p, target_offset %s, image_rect %s, interpolation_mode %#x, composite_mode %#x.\n",
+             iface, image, debug_d2d_point_2f(target_offset), debug_d2d_rect_f(image_rect),
+@@ -2641,6 +2661,12 @@
+         return;
+     }
+ 
++    if (!image)
++    {
++        d2d_device_context_set_error(context, E_INVALIDARG);
++        return;
++    }
++
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+         d2d_command_list_draw_image(context->target.command_list, image, target_offset, image_rect,
+@@ -2651,7 +2677,7 @@
+     if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER)
+         FIXME("Unhandled composite mode %#x.\n", composite_mode);
+ 
+-    if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)&bitmap)))
++    if (SUCCEEDED(hr = d2d_effect_resolve_bitmap(context, image, TRUE, &bitmap)))
+     {
+         d2d_device_context_draw_bitmap(context, bitmap, NULL, 1.0f, interpolation_mode, image_rect, target_offset, NULL);
+ 
+@@ -2659,7 +2685,8 @@
+         return;
+     }
+ 
+-    FIXME("Unhandled image %p.\n", image);
++    WARN("Unable to draw image %p, hr %#lx.\n", image, hr);
++    d2d_device_context_set_error(context, hr);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawGdiMetafile(ID2D1DeviceContext6 *iface,

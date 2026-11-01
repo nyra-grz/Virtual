@@ -124,6 +124,13 @@ reported instead of repeatedly relaunching the app. Winetricks handles the pinne
 legacy recipes; current .NET runtime installers come from Microsoft's verified
 release metadata. Native .NET 4.8 is selected for detected classic WPF/WinRT apps.
 
+Direct2D can resolve nested passthrough effect images to real bitmap rendering,
+with DPI/unit-aware local bounds, transformed world bounds, clipping and target
+offsets. Cycles, missing inputs, failed preparation and unsupported graph
+processing are reported through HRESULT/EndDraw. Shader/color-filter graphs are
+still incomplete. The independent test reads rendered pixels back from the GPU;
+no application names or application-specific launch configuration are involved.
+
 Shared shader reflection now reports actual minimum feature levels from DXBC
 shader models (including level-9 translations) and preserves encoded requirement
 flags for double arithmetic and minimum precision. Independent fixtures check
