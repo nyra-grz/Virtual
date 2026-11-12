@@ -1,0 +1,130 @@
+From: Daniel Özdek <daniel.timur.23@gmail.com>
+Date: Thu, 12 Nov 2026 15:35:00 +0100
+Subject: [PATCH] winebus.sys: Don't poll SDL every millisecond without devices
+
+winebus initialises SDL without the video subsystem, so SDL_WaitEventTimeout
+has nothing to sleep on and pumps the joystick drivers with SDL_Delay(1) in
+between. Every Wine session therefore woke up ~1000 times per second in the
+winedevice process hosting winebus, even with no controller connected
+(1.2 % CPU and energy impact ~20 in Activity Monitor while idle).
+
+Keep the old behaviour while SDL devices exist, so controller latency is
+unchanged. Without devices, pump once and sleep 100 ms (hotplug is still
+noticed within 100 ms); a pipe wakes the thread at once when the bus stops.
+Measured idle: 143 -> 4 idle wakeups/s, 1.2 % -> 0.0 % CPU, energy impact
+19.8 -> 0.2; the session still ends 3 s after its last program.
+
+diff --git a/dlls/winebus.sys/bus_sdl.c b/dlls/winebus.sys/bus_sdl.c
+index f274d547..05a6e08d 100644
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -30,6 +30,7 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <unistd.h>
++#include <poll.h>
+ #include <sys/types.h>
+ #include <dlfcn.h>
+ #ifdef HAVE_SDL_H
+@@ -67,6 +68,8 @@ static void *sdl_handle = NULL;
+ static UINT quit_event = -1;
+ static struct list event_queue = LIST_INIT(event_queue);
+ static struct list device_list = LIST_INIT(device_list);
++/* Virtual: wakes sdl_bus_wait from its idle sleep when the bus stops. */
++static int wake_fds[2] = {-1, -1};
+ 
+ #define MAKE_FUNCPTR(f) static typeof(f) * p##f = NULL
+ MAKE_FUNCPTR(SDL_GetError);
+@@ -80,6 +83,7 @@ MAKE_FUNCPTR(SDL_JoystickName);
+ MAKE_FUNCPTR(SDL_JoystickNumAxes);
+ MAKE_FUNCPTR(SDL_JoystickOpen);
+ MAKE_FUNCPTR(SDL_WaitEventTimeout);
++MAKE_FUNCPTR(SDL_PollEvent);
+ MAKE_FUNCPTR(SDL_JoystickNumButtons);
+ MAKE_FUNCPTR(SDL_JoystickNumBalls);
+ MAKE_FUNCPTR(SDL_JoystickNumHats);
+@@ -1104,6 +1108,7 @@ NTSTATUS sdl_bus_init(void *args)
+     LOAD_FUNCPTR(SDL_JoystickNumAxes);
+     LOAD_FUNCPTR(SDL_JoystickOpen);
+     LOAD_FUNCPTR(SDL_WaitEventTimeout);
++    LOAD_FUNCPTR(SDL_PollEvent);
+     LOAD_FUNCPTR(SDL_JoystickNumButtons);
+     LOAD_FUNCPTR(SDL_JoystickNumBalls);
+     LOAD_FUNCPTR(SDL_JoystickNumHats);
+@@ -1188,6 +1193,13 @@ NTSTATUS sdl_bus_init(void *args)
+         }
+     }
+ 
++    if (pipe(wake_fds) == 0)
++    {
++        fcntl(wake_fds[0], F_SETFD, FD_CLOEXEC);
++        fcntl(wake_fds[1], F_SETFD, FD_CLOEXEC);
++    }
++    else wake_fds[0] = wake_fds[1] = -1;
++
+     return STATUS_SUCCESS;
+ 
+ failed:
+@@ -1196,10 +1208,35 @@ failed:
+     return STATUS_UNSUCCESSFUL;
+ }
+ 
++/* Virtual: SDL_Init runs without the video subsystem here, so SDL_WaitEventTimeout cannot
++ * sleep and pumps the joystick drivers every millisecond. That kept every Wine session awake
++ * ~1000 times per second although no controller was connected. Keep that rate while devices
++ * exist (input latency), otherwise look for newly connected devices every 100 ms. */
++static int sdl_wait_event(SDL_Event *event)
++{
++    struct pollfd wake = {.fd = wake_fds[0], .events = POLLIN};
++    BOOL idle;
++    char c;
++
++    pthread_mutex_lock(&sdl_cs);
++    idle = list_empty(&device_list);
++    pthread_mutex_unlock(&sdl_cs);
++
++    if (!idle && pSDL_WaitEventTimeout(event, 10)) return 1;
++    if (idle)
++    {
++        if (pSDL_PollEvent(event)) return 1;
++        if (poll(&wake, wake.fd >= 0 ? 1 : 0, 100) > 0 && read(wake.fd, &c, 1) < 0)
++            WARN("failed to read wake pipe, errno %d\n", errno);
++    }
++    event->type = SDL_FIRSTEVENT;
++    return 0;
++}
++
+ NTSTATUS sdl_bus_wait(void *args)
+ {
+     struct bus_event *result = args;
+-    SDL_Event event;
++    SDL_Event event = {0};
+ 
+     /* cleanup previously returned event */
+     bus_event_cleanup(result);
+@@ -1207,11 +1244,14 @@ NTSTATUS sdl_bus_wait(void *args)
+     do
+     {
+         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
+-        if (pSDL_WaitEventTimeout(&event, 10) != 0) process_device_event(&event);
++        if (sdl_wait_event(&event)) process_device_event(&event);
+         else check_all_devices_effects_state();
+     } while (event.type != quit_event);
+ 
+     TRACE("SDL main loop exiting\n");
++    if (wake_fds[0] >= 0) close(wake_fds[0]);
++    if (wake_fds[1] >= 0) close(wake_fds[1]);
++    wake_fds[0] = wake_fds[1] = -1;
+     bus_event_queue_destroy(&event_queue);
+     dlclose(sdl_handle);
+     sdl_handle = NULL;
+@@ -1224,6 +1264,9 @@ NTSTATUS sdl_bus_stop(void *args)
+ 
+     if (!sdl_handle) return STATUS_SUCCESS;
+ 
++    /* Wake before pushing: the bus thread closes the pipe once it sees the quit event. */
++    if (wake_fds[1] >= 0 && write(wake_fds[1], "q", 1) < 0)
++        WARN("failed to wake SDL bus, errno %d\n", errno);
+     event.type = quit_event;
+     if (pSDL_PushEvent(&event) != 1)
+     {

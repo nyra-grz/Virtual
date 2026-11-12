@@ -315,6 +315,9 @@ export ROSETTA_ADVERTISE_AVX="\${ROSETTA_ADVERTISE_AVX:-1}"
 # Gleiche Geometrie in mehreren Durchgängen exakt gleich rechnen (sonst flackern
 # aufgemalte Flächen wie Straßenmarkierungen gegen ihren Untergrund).
 export D3DM_POSITION_INVARIANCE="\${D3DM_POSITION_INVARIANCE:-1}"
+# DX12 über das Metal-3-Backend: Das Metal-4-Backend (Standard ab macOS 27, GPTK 4 beta) war
+# gemessen ~20 % langsamer (BeamNG Ultra: 22 ms statt 18 ms GPU pro Bild). Mit D3DM_MTL4=1 umkehrbar.
+export D3DM_MTL4="\${D3DM_MTL4:-0}"
 ENV
 fi
 
