@@ -121,7 +121,8 @@ final class ProgramImportWindowController: NSWindowController, NSTableViewDataSo
                 setBusy(false)
                 switch result {
                 case .success(let scan):
-                    candidates = scan.candidates; warnings = scan.warnings; checked = Set(candidates.indices)
+                    // Nur unauffällige Funde vorauswählen: große Arbeits- oder Projektordner muss man bewusst anhaken.
+                    candidates = scan.candidates; warnings = scan.warnings; checked = Set(candidates.indices.filter { candidates[$0].isSafeDefault })
                     table.reloadData(); updateSummary()
                 case .failure(let error): status.stringValue = error.localizedDescription
                 }
@@ -131,10 +132,14 @@ final class ProgramImportWindowController: NSWindowController, NSTableViewDataSo
     func numberOfRows(in tableView: NSTableView) -> Int { candidates.count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let candidate = candidates[row]
-        let check = NSButton(checkboxWithTitle: "\(candidate.name) · \(fileCount(candidate.executables.count))", target: self, action: #selector(toggleCandidate(_:)))
-        check.tag = row; check.state = checked.contains(row) ? .on : .off; check.isEnabled = !busy
-        let path = NSTextField(labelWithString: candidate.source.path)
-        path.textColor = .secondaryLabelColor; path.font = .systemFont(ofSize: 11); path.lineBreakMode = .byTruncatingMiddle; path.toolTip = candidate.source.path
+        let check = NSButton(checkboxWithTitle: "\(candidate.name) · \(fileCount(candidate.executables.count)) · \(sizeText(candidate))", target: self, action: #selector(toggleCandidate(_:)))
+        check.tag = row; check.state = checked.contains(row) ? .on : .off; check.isEnabled = !busy && candidate.blocker == nil
+        var detail = candidate.source.path
+        if let blocker = candidate.blocker { detail = "Nicht importierbar: \(blocker) · " + detail }
+        else if !candidate.isSafeDefault { detail = "Großer Ordner, nicht vorausgewählt – bitte prüfen · " + detail }
+        let path = NSTextField(labelWithString: detail)
+        path.textColor = candidate.isSafeDefault ? .secondaryLabelColor : .systemOrange
+        path.font = .systemFont(ofSize: 11); path.lineBreakMode = .byTruncatingMiddle; path.toolTip = detail
         let stack = NSStackView(views: [check, path]); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 4
         return stack
     }
@@ -143,6 +148,12 @@ final class ProgramImportWindowController: NSWindowController, NSTableViewDataSo
         updateSummary()
     }
     private func fileCount(_ count: Int) -> String { "\(count) " + (count == 1 ? "Programmdatei" : "Programmdateien") }
+    private func sizeText(_ candidate: ProgramImport.Candidate) -> String {
+        let bytes = ByteCountFormatter.string(fromByteCount: Int64(candidate.size), countStyle: .file)
+        let files = candidate.fileCount.formatted()
+        return candidate.measuredFully ? "\(bytes), \(files) Dateien" : "über \(bytes), über \(files) Dateien"
+    }
+    private var selectedSize: UInt64 { checked.reduce(0) { $0 + candidates[$1].size } }
     @objc private func showWarnings() {
         let alert = NSAlert()
         alert.messageText = "Übersprungene Pfade"
@@ -153,7 +164,9 @@ final class ProgramImportWindowController: NSWindowController, NSTableViewDataSo
     }
     @objc private func updateSummary() {
         let count = checked.reduce(0) { $0 + candidates[$1].executables.count }
-        status.stringValue = candidates.isEmpty ? "Keine .exe- oder .msi-Dateien gefunden." : "\(checked.count) Einträge ausgewählt · \(fileCount(count))."
+        status.stringValue = candidates.isEmpty ? "Keine .exe- oder .msi-Dateien gefunden." : "\(checked.count) Einträge ausgewählt · \(fileCount(count)) · \(ByteCountFormatter.string(fromByteCount: Int64(selectedSize), countStyle: .file))."
+        let skipped = candidates.indices.filter { !candidates[$0].isSafeDefault && !checked.contains($0) }.count
+        if skipped > 0 { status.stringValue += "\n\(skipped) große oder blockierte Funde sind nicht ausgewählt." }
         if !warnings.isEmpty { status.stringValue += "\n\(warnings.count) Pfade übersprungen." }
         detailsButton.isHidden = warnings.isEmpty
         status.toolTip = warnings.joined(separator: "\n")
@@ -167,10 +180,21 @@ final class ProgramImportWindowController: NSWindowController, NSTableViewDataSo
             status.stringValue = "Der Raum wurde entfernt oder wird gerade eingerichtet. Bitte später erneut öffnen."; return
         }
         let chosen = checked.sorted().map { candidates[$0] }, recycle = move.state == .on
+        let tiles = chosen.reduce(0) { $0 + ProgramImport.libraryExecutables($1.executables).count }
+        if tiles > ProgramImport.manyProgramsThreshold {
+            let alert = NSAlert()
+            alert.messageText = "\(tiles) Programme in die Bibliothek eintragen?"
+            alert.informativeText = "Die Auswahl enthält sehr viele Programmdateien. Jede wird eine eigene Kachel in „\(room.name)“. Meist ist das ein Arbeits- oder Projektordner, kein einzelnes Programm."
+            alert.addButton(withTitle: "Trotzdem importieren"); alert.addButton(withTitle: "Abbrechen")
+            let response = alert.runModal()
+            window?.makeKeyAndOrderFront(nil)
+            guard response == .alertFirstButtonReturn else { return }
+        }
         if recycle {
+            let names = chosen.prefix(5).map { "• \($0.name)" }.joined(separator: "\n") + (chosen.count > 5 ? "\n• … und \(chosen.count - 5) weitere" : "")
             let alert = NSAlert()
             alert.messageText = "Originale nach dem Import in den Papierkorb legen?"
-            alert.informativeText = "\(fileCount(chosen.reduce(0) { $0 + $1.executables.count })) aus \(chosen.count) Dateien/Ordnern werden in „\(room.name)“ übernommen. Ausgewählte Ordner werden mit ihrem gesamten Inhalt kopiert und anschließend in den Papierkorb gelegt. Das geschieht erst nach geprüfter Kopie und gespeicherter Bibliothek."
+            alert.informativeText = "\(fileCount(chosen.reduce(0) { $0 + $1.executables.count })) aus \(chosen.count) Dateien/Ordnern (\(ByteCountFormatter.string(fromByteCount: Int64(selectedSize), countStyle: .file))) werden in „\(room.name)“ übernommen:\n\(names)\n\nAusgewählte Ordner werden mit ihrem gesamten Inhalt kopiert und anschließend in den Papierkorb gelegt. Das geschieht erst nach geprüfter Kopie und gespeicherter Bibliothek."
             alert.addButton(withTitle: "Importieren und verschieben"); alert.addButton(withTitle: "Abbrechen")
             let response = alert.runModal()
             window?.makeKeyAndOrderFront(nil)
@@ -193,7 +217,7 @@ final class ProgramImportWindowController: NSWindowController, NSTableViewDataSo
     private func finish(_ copies: [ProgramImport.Copy], in room: Room, recycle: Bool, cancelled: Bool) {
         do {
             guard !cancelled, RoomStore.shared.rooms.contains(where: { $0.id == room.id }), PrefixSetup.current(in: room) == nil else { throw ProgramImport.Failure.cancelled }
-            let programs = try Library.shared.addImported(urls: copies.flatMap(\.executables), to: room)
+            let programs = try Library.shared.addImported(urls: copies.flatMap { ProgramImport.libraryExecutables($0.executables) }, to: room)
             onImport?(programs)
             if recycle {
                 status.stringValue = "Import gespeichert. Originale werden in den Papierkorb gelegt…"

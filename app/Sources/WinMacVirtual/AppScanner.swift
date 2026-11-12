@@ -9,7 +9,7 @@ enum AppScanner {
                                        "help", "hilfe", "manual", "handbuch", "documentation", "dokumentation",
                                        "website", "web site", "homepage", "license", "lizenz", "release notes", "changelog"]
 
-    private static func isAuxiliaryName(_ name: String) -> Bool {
+    static func isAuxiliaryName(_ name: String) -> Bool {
         let lower = name.lowercased()
         if lower.hasPrefix("deinstall") { return true }
         let words = Set(lower.split { !$0.isLetter && !$0.isNumber }.map(String.init))

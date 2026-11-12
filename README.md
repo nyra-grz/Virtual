@@ -226,9 +226,19 @@ folder are copied individually; matching subfolders are copied in full to
 need to be run; this does not migrate another Wine prefix's registry or installed
 system components. Existing Virtual folders, hidden paths and app bundles are
 excluded from discovery. Copies containing symbolic links or special files are
-rejected so they cannot keep depending on files outside the room.
+rejected so they cannot keep depending on files outside the room; such entries are
+shown but cannot be checked.
 
-The optional move mode asks for confirmation with the file/folder count. Only
+Each entry shows its size and file count. Only entries that look like a single
+program are pre-checked: more than 20 GB, 20,000 files or 25 executables (typically
+a work or build folder that happens to contain `.exe` files) must be checked
+deliberately. Before anything is copied, Virtual checks free space; on the same
+APFS volume copies are clones and need no extra space. Folder imports add their
+main programs as tiles, not uninstallers, crash reporters or runtime installers
+(they stay in the copy), and more than 30 new tiles require confirmation.
+
+The optional move mode asks for confirmation with the file/folder count, total size
+and the names of the affected files and folders. Only
 after a byte-checked copy and an atomic library save are the selected original
 files or **whole folders** sent to the macOS Trash. If copying, verification or
 saving fails, originals remain untouched. Cancelled or failed batches roll back

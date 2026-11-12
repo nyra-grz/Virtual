@@ -107,6 +107,44 @@ final class ProgramImportTests: XCTestCase {
         XCTAssertEqual(try fm.contentsOfDirectory(atPath: other.path), [])
         XCTAssertTrue(fm.fileExists(atPath: original.path))
     }
+    func testScanMeasuresContentAndBlocksFoldersWithLinks() throws {
+        try file("Downloads/Portable/App.exe", text: String(repeating: "a", count: 1000))
+        try file("Downloads/Portable/data/.hidden.bin", text: String(repeating: "b", count: 24))
+        let linked = try file("Downloads/Linked/App.exe")
+        try fm.createSymbolicLink(at: root.appendingPathComponent("Downloads/Linked/shared.dll"), withDestinationURL: linked)
+        let candidates = try scan()
+        let portable = try XCTUnwrap(candidates.first { $0.name == "Portable" })
+        // Hidden files count too: copy() takes them along.
+        XCTAssertEqual(portable.size, 1024)
+        XCTAssertEqual(portable.fileCount, 2)
+        XCTAssertNil(portable.blocker)
+        XCTAssertTrue(portable.isSafeDefault)
+        let blocked = try XCTUnwrap(candidates.first { $0.name == "Linked" })
+        XCTAssertNotNil(blocked.blocker)
+        XCTAssertFalse(blocked.isSafeDefault)
+    }
+    func testWorkTreesWithManyExecutablesAreNotSelectedByDefault() throws {
+        for i in 0...ProgramImport.defaultExecutableLimit { try file("Downloads/Builds/run\(i)/tool\(i).exe") }
+        try file("Downloads/Setup.exe")
+        let candidates = try scan()
+        XCTAssertFalse(try XCTUnwrap(candidates.first { $0.name == "Builds" }).isSafeDefault)
+        XCTAssertTrue(try XCTUnwrap(candidates.first { $0.name == "Setup.exe" }).isSafeDefault)
+    }
+    func testLibraryGetsMainProgramsButNotHelpers() {
+        let dir = root.appendingPathComponent("Game")
+        let exes = ["Game.exe", "unins000.exe", "CrashSender.exe", "vc_redist.x64.exe", "Uninstall.exe"].map { dir.appendingPathComponent($0) }
+        XCTAssertEqual(ProgramImport.libraryExecutables(exes).map(\.lastPathComponent), ["Game.exe"])
+        // A lone file is always the user's explicit choice.
+        XCTAssertEqual(ProgramImport.libraryExecutables([dir.appendingPathComponent("vc_redist.x64.exe")]).count, 1)
+        XCTAssertEqual(ProgramImport.libraryExecutables(Array(exes.dropFirst(2))).count, 1)
+    }
+    func testClonesOnTheSameVolumeNeedNoSpace() throws {
+        let source = try file("Downloads/Setup.exe")
+        let destination = root.appendingPathComponent("Virtual/drive_c")
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        let clones = (try destination.resourceValues(forKeys: [.volumeSupportsFileCloningKey])).volumeSupportsFileCloning == true
+        XCTAssertEqual(ProgramImport.requiredSpace(for: [(source, 5_000_000)], destination: destination), clones ? 0 : 5_000_000)
+    }
     func testMissingExecutableSincePreviewIsRejected() throws {
         try file("Downloads/Portable/App.exe")
         let candidate = try XCTUnwrap(scan().first)

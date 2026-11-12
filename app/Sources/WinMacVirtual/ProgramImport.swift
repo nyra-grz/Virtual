@@ -5,8 +5,25 @@ enum ProgramImport {
     struct Candidate {
         let source: URL
         let executables: [URL]
+        /// Gemessen beim Durchsuchen; bei sehr großen Ordnern nur eine Untergrenze (`measuredFully == false`).
+        var size: UInt64 = 0
+        var fileCount = 0
+        var measuredFully = true
+        /// Grund, warum der Eintrag nicht importiert werden kann (z. B. Links im Ordner).
+        var blocker: String?
         var name: String { source.lastPathComponent }
+        /// Vorausgewählt wird nur, was wie ein einzelnes Programm aussieht. Ganze Arbeits- oder
+        /// Projektordner mit vielen .exe (z. B. Build-Verzeichnisse) muss man bewusst anhaken.
+        var isSafeDefault: Bool {
+            blocker == nil && measuredFully && size <= ProgramImport.defaultSizeLimit
+                && fileCount <= ProgramImport.defaultFileLimit && executables.count <= ProgramImport.defaultExecutableLimit
+        }
     }
+    static let defaultSizeLimit: UInt64 = 20_000_000_000
+    static let defaultFileLimit = 20_000
+    static let defaultExecutableLimit = 25
+    /// Ab so vielen Kacheln fragt das Fenster vor dem Import nach.
+    static let manyProgramsThreshold = 30
     struct Scan {
         var candidates: [Candidate] = []
         var warnings: [String] = []
@@ -75,10 +92,76 @@ enum ProgramImport {
                     groups[group, default: []].append(url)
                 } catch { result.warnings.append("\(url.path): \(error.localizedDescription)") }
             }
-            result.candidates += groups.map { Candidate(source: $0.key, executables: $0.value.sorted { $0.path < $1.path }) }
+            for (group, executables) in groups {
+                var candidate = Candidate(source: group, executables: executables.sorted { $0.path < $1.path })
+                try measure(&candidate, cancelled: cancelled)
+                result.candidates.append(candidate)
+            }
         }
         result.candidates.sort { $0.source.path.localizedStandardCompare($1.source.path) == .orderedAscending }
         return result
+    }
+
+    /// Größe, Dateizahl und Hindernisse eines Fundes, so wie `copy` ihn später übernehmen würde
+    /// (inklusive versteckter Dateien und Paketinhalte). Bricht bei sehr großen Ordnern früh ab:
+    /// dann ist er ohnehin nicht vorausgewählt, und die Liste zeigt eine Untergrenze.
+    static func measure(_ candidate: inout Candidate, cancelled: () -> Bool = { false }) throws {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
+        var size: UInt64 = 0, files = 0, full = true
+        var blocker: String?
+        func account(_ url: URL) throws -> Bool {
+            let v = try url.resourceValues(forKeys: Set(keys))
+            if v.isSymbolicLink == true {
+                blocker = blocker ?? "enthält Links (\(url.lastPathComponent))"
+            } else if v.isRegularFile == true {
+                size += UInt64(v.fileSize ?? 0); files += 1
+            } else if v.isDirectory != true {
+                blocker = blocker ?? "enthält besondere Dateien (\(url.lastPathComponent))"
+            }
+            return size <= defaultSizeLimit && files <= defaultFileLimit
+        }
+        if (try candidate.source.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true {
+            var unreadable: String?
+            guard let walker = FileManager.default.enumerator(at: candidate.source, includingPropertiesForKeys: keys, options: [], errorHandler: { url, _ in
+                unreadable = unreadable ?? "nicht lesbar (\(url.lastPathComponent))"
+                return true
+            }) else { throw Failure.invalid("„\(candidate.source.path)“ konnte nicht gemessen werden.") }
+            var seen = 0
+            for case let url as URL in walker {
+                seen += 1
+                if seen % 512 == 0, cancelled() { throw Failure.cancelled }
+                if try !account(url) { full = false; break }
+            }
+            blocker = blocker ?? unreadable
+        } else {
+            _ = try account(candidate.source)
+        }
+        candidate.size = size; candidate.fileCount = files; candidate.measuredFully = full; candidate.blocker = blocker
+    }
+
+    /// Programme, die als Kacheln in die Bibliothek kommen. Eine einzelne Datei immer; in Ordnern
+    /// keine Deinstaller, Crash-Melder und Laufzeit-Installer (die bleiben in der Kopie erhalten).
+    static func libraryExecutables(_ executables: [URL]) -> [URL] {
+        guard executables.count > 1 else { return executables }
+        let helpers = ["crash", "redist", "dxsetup", "dotnetfx", "oalinst", "physx", "uninst", "unins0"]
+        let main = executables.filter { url in
+            let name = url.deletingPathExtension().lastPathComponent
+            let lower = name.lowercased()
+            return !AppScanner.isAuxiliaryName(name) && !helpers.contains { lower.contains($0) }
+        }
+        return main.isEmpty ? [executables[0]] : main
+    }
+
+    /// Platz, den die Kopien wirklich brauchen: Auf demselben APFS-Laufwerk klont `copyItem`
+    /// (kein zusätzlicher Platz), sonst die volle Größe.
+    static func requiredSpace(for sources: [(url: URL, size: UInt64)], destination: URL) -> UInt64 {
+        let target = try? destination.resourceValues(forKeys: [.volumeIdentifierKey, .volumeSupportsFileCloningKey])
+        return sources.reduce(0) { total, item in
+            let volume = (try? item.url.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier
+            let clones = target?.volumeSupportsFileCloning == true && volume != nil && target?.volumeIdentifier != nil
+                && (volume as AnyObject).isEqual(target?.volumeIdentifier)
+            return clones ? total : total + item.size
+        }
     }
 
     private struct Entry: Equatable {
@@ -120,13 +203,21 @@ enum ProgramImport {
             throw Failure.invalid("Importquelle und Ziel dürfen sich nicht überschneiden oder über Links umgeleitet sein.")
         }
         try fm.createDirectory(at: base, withIntermediateDirectories: true)
+        // Erst alles erfassen und den Platz prüfen, bevor die erste Datei kopiert wird.
+        let inventories = try candidates.map { try inventory($0.source, cancelled: cancelled) }
+        let needed = requiredSpace(for: zip(candidates, inventories).map { ($0.source, $1.reduce(0) { $0 + $1.size }) }, destination: base)
+        if needed > 0, let free = (try? base.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
+           Int64(needed) + 2_000_000_000 > free {
+            let format = { (bytes: Int64) in ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
+            throw Failure.invalid("Nicht genug freier Platz: Der Import braucht \(format(Int64(needed))), frei sind \(format(free)). Es wurde nichts kopiert.")
+        }
         var created: [URL] = []
         var copies: [Copy] = []
         do {
             for (index, candidate) in candidates.enumerated() {
                 if cancelled() { throw Failure.cancelled }
                 progress(index, candidates.count)
-                let before = try inventory(candidate.source, cancelled: cancelled)
+                let before = inventories[index]
                 guard !candidate.executables.isEmpty else { throw Failure.invalid("Keine Programme in „\(candidate.name)“.") }
                 let container = base.appendingPathComponent(UUID().uuidString)
                 try fm.createDirectory(at: container, withIntermediateDirectories: false)
