@@ -10,6 +10,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private let detail = NSStackView()
     private let contentScroll = NSScrollView()
     private let banner = NSTextField(wrappingLabelWithString: "")
+    private var importController: ProgramImportWindowController?
     private var selected: AnyObject?
     private var announcedRoomID: UUID?
     private var observers: [NSObjectProtocol] = []
@@ -50,7 +51,15 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
 
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 
+    func canTerminate() -> Bool {
+        guard importController?.isImporting == true else { return true }
+        importController?.window?.makeKeyAndOrderFront(nil)
+        NSSound.beep()
+        return false
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard canTerminate() else { return false }
         DispatchQueue.main.async { NSApp.terminate(nil) }
         return false
     }
@@ -613,6 +622,16 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         visibleLog = log
     }
 
+    @objc func importPrograms() {
+        if let controller = importController { controller.window?.makeKeyAndOrderFront(nil); return }
+        let controller = ProgramImportWindowController(room: room)
+        controller.onImport = { [weak self] programs in if let first = programs.first { self?.selectProgram(first) } }
+        controller.onClose = { [weak self] in self?.importController = nil }
+        importController = controller
+        controller.window?.center()
+        controller.showWindow(nil)
+    }
+
     @objc func addProgram() {
         let targetRoom = room
         let panel = NSOpenPanel()
@@ -757,6 +776,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             item("Entfernen", #selector(removeSelected))
         } else {
             item("Programm hinzufügen…", #selector(addProgram))
+            item("Windows-Programme importieren…", #selector(importPrograms))
             if !room.isReady { item("Raum einrichten", #selector(setupRoom)) }
             if room.id != RoomStore.shared.defaultRoom.id { item("Umbenennen…", #selector(renameSelected)); item("Raum löschen…", #selector(deleteRoom)) }
             menu.addItem(.separator())
@@ -772,7 +792,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             item.label = "Hinzufügen"
             item.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Hinzufügen")
             let menu = NSMenu()
-            for (title, action) in [("Neuer Raum…", #selector(newRoom)), ("Programm hinzufügen…", #selector(addProgram))] {
+            for (title, action) in [("Neuer Raum…", #selector(newRoom)), ("Programm hinzufügen…", #selector(addProgram)), ("Windows-Programme importieren…", #selector(importPrograms))] {
                 let entry = menu.addItem(withTitle: title, action: action, keyEquivalent: ""); entry.target = self
             }
             item.menu = menu

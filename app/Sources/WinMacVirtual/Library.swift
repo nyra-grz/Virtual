@@ -100,6 +100,30 @@ final class Library {
         return program
     }
 
+    /// Persist copied programs before the import UI may recycle originals.
+    func addImported(urls: [URL], to room: Room) throws -> [Program] {
+        var additions: [Program] = []
+        for url in urls {
+            guard Self.supportedExtensions.contains(url.pathExtension.lowercased()),
+                  (try url.resourceValues(forKeys: [.isRegularFileKey])).isRegularFile == true else {
+                throw ProgramImport.Failure.invalid("„\(url.path)“ ist kein unterstütztes Programm.")
+            }
+            let path = url.standardizedFileURL.path
+            if programs.contains(where: { $0.path == path && $0.roomID == room.id }) || additions.contains(where: { $0.path == path }) { continue }
+            additions.append(Program(name: url.deletingPathExtension().lastPathComponent, path: path,
+                                     bookmark: nil, roomID: room.id))
+        }
+        let updated = (programs + additions).sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(updated)
+        try FileManager.default.createDirectory(at: Settings.shared.root, withIntermediateDirectories: true)
+        try data.write(to: storeURL, options: .atomic)
+        programs = updated
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
+        return additions
+    }
+
     /// Gleicht die gefundenen Verknüpfungen eines Raums ab; gibt die neuen Programme zurück.
     @discardableResult
     func syncDetected(_ found: [(name: String, path: String)], in room: Room) -> [Program] {

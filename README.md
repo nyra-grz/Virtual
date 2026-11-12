@@ -218,6 +218,23 @@ An ordinary file goes to its owning room or a room that declares its extension;
 otherwise a configured room can be chosen. Virtual registers as an alternate file
 viewer, so it does not replace existing default file handlers.
 
+**Ablage → Windows-Programme importieren…** (⇧⌘I, also in the + menu) searches
+Downloads, Desktop, Documents, or chosen folders for `.exe` and `.msi` files. Review
+the checked entries and choose a destination room. Files directly in the search
+folder are copied individually; matching subfolders are copied in full to
+`C:\Virtual Imports`, preserving DLLs, data and relative paths. Installers still
+need to be run; this does not migrate another Wine prefix's registry or installed
+system components. Existing Virtual folders, hidden paths and app bundles are
+excluded from discovery. Copies containing symbolic links or special files are
+rejected so they cannot keep depending on files outside the room.
+
+The optional move mode asks for confirmation with the file/folder count. Only
+after a byte-checked copy and an atomic library save are the selected original
+files or **whole folders** sent to the macOS Trash. If copying, verification or
+saving fails, originals remain untouched. Cancelled or failed batches roll back
+their new copies; existing imports are never overwritten. A recycling failure is
+reported separately and leaves the saved import available.
+
 Certificates (`cer`, `crt`, `der`, `pem`, `p7b`, `p7c`, `pfx`, `p12`) can be opened
 with Virtual from Finder or imported with the room tool. The bundled Windows
 `certimport.exe` writes to that room's current-user stores: self-issued certificates

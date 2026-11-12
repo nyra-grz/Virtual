@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Sie hängen weder an Virtuals Prozess noch an einer Pipe von Virtual. Beenden kann man
     /// sie selbst oder über „Alles beenden“ auf der Raum-Seite.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        .terminateNow
+        mainController?.canTerminate() == false ? .terminateCancel : .terminateNow
     }
 
     private var pendingURLs: [URL] = []
@@ -72,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fileMenu = NSMenu(title: "Ablage")
         fileItem.submenu = fileMenu
         fileMenu.addItem(withTitle: "Programm hinzufügen…", action: #selector(addFromMenu), keyEquivalent: "o")
+        fileMenu.addItem(withTitle: "Windows-Programme importieren…", action: #selector(importFromMenu), keyEquivalent: "I")
         fileMenu.addItem(withTitle: "Schließen", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
 
         let editItem = NSMenuItem()
@@ -89,5 +90,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleOverlay() { OverlayController.shared.toggle() }
     @objc private func openSettings() { SettingsWindowController.shared.showWindow(nil) }
     @objc private func checkForUpdates() { Updater.shared.check(interactive: true) }
+    @objc private func importFromMenu() { mainController.importPrograms() }
     @objc private func addFromMenu() { mainController.window?.makeKeyAndOrderFront(nil); mainController.addProgram() }
 }
