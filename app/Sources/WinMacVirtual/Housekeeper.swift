@@ -21,6 +21,8 @@ final class Housekeeper {
         let prefix: String?
         let isServer: Bool
         let isRunner: Bool
+        /// Ausführbare Datei (Wine-Loader bzw. wineserver der Engine, aus der der Prozess läuft).
+        var executable: String = ""
 
         /// Kurzer Name für Protokolle, z. B. „MicrosoftEdgeUpdate.exe“.
         var shortName: String {
@@ -242,7 +244,8 @@ final class Housekeeper {
             let name = info.args.first ?? executable
             result.append(WineProcess(pid: pid, name: name, prefix: info.prefix.map(canonical),
                                       isServer: (executable as NSString).lastPathComponent == "wineserver",
-                                      isRunner: name.lowercased().hasSuffix("program-runner.exe")))
+                                      isRunner: name.lowercased().hasSuffix("program-runner.exe"),
+                                      executable: executable))
         }
         return result
     }

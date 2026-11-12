@@ -36,6 +36,7 @@ final class Updater {
         case download
         case badArchive
         case badEngine
+        case inUse
         case tool(String, Int32)
 
         var errorDescription: String? {
@@ -46,6 +47,7 @@ final class Updater {
             case .download: return "Das Update konnte nicht geladen werden."
             case .badArchive: return "Das Archiv enthält keine passende Virtual-App in der angekündigten Version."
             case .badEngine: return "Die geladene Engine ist unvollständig oder beschädigt. Bitte später erneut versuchen."
+            case .inUse: return "Es laufen noch Windows-Programme aus dieser App, auch aus einer früheren Sitzung. Bitte beende sie (etwa über „Alles beenden“ auf der Raum-Seite) und suche dann erneut nach Updates."
             case .tool(let name, let status): return "\(name) ist gescheitert (Status \(status))."
             }
         }
@@ -142,9 +144,9 @@ final class Updater {
         if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        // Während des Austauschs darf kein Programm aus dem alten Bundle starten.
-        guard !Launcher.shared.hasRunning else {
-            show("Erst Programme beenden", "Bitte beende die laufenden Windows-Programme und suche dann erneut nach Updates.")
+        // Der Austausch nimmt Programmen aus dem alten Bundle Dateien weg, die sie noch nachladen.
+        guard !Launcher.shared.hasRunning, !Self.bundleEngineInUse() else {
+            show("Erst Programme beenden", UpdateError.inUse.localizedDescription)
             return
         }
         isWorking = true
@@ -275,6 +277,8 @@ final class Updater {
         else { throw UpdateError.badArchive }
 
         progress("Installiere …", nil)
+        // Während des Downloads kann etwas gestartet worden sein (etwa aus Windows heraus).
+        guard !Self.bundleEngineInUse() else { throw UpdateError.inUse }
         // Die App kommt ohne Engine signiert; mit Engine neu versiegeln (ad hoc, wie build-app.sh).
         try? Self.run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", app.path])
         try? Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
@@ -303,6 +307,13 @@ final class Updater {
             try? fm.removeItem(at: engine)
             throw UpdateError.badEngine
         }
+    }
+
+    /// Laufen Wine-Prozesse aus der Engine dieses Bundles, auch aus früheren Sitzungen von Virtual?
+    /// Räume mit D3DMetal laufen aus der Spiele-Engine außerhalb des Bundles und zählen nicht.
+    static func bundleEngineInUse() -> Bool {
+        let bundle = Bundle.main.bundleURL.resolvingSymlinksInPath().path + "/"
+        return Housekeeper.wineProcesses().contains { $0.executable.hasPrefix(bundle) }
     }
 
     static func engineVersion(at engine: URL?) -> String? {
