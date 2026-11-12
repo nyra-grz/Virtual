@@ -1,0 +1,155 @@
+From: Daniel Özdek <daniel.timur.23@gmail.com>
+Date: Wed, 11 Nov 2026 13:45:00 +0100
+Subject: [PATCH] ntdll: Give folder-detected Chromium switches only to programs that use Chromium
+
+A program next to libcef.dll/chrome_elf.dll (or icudtl.dat + resources.pak) got
+--in-process-gpu --no-sandbox even when it never runs Chromium itself. BeamNG's
+CrashRpt CrashSender.exe sits next to the game's CEF copy, rejects the extra
+arguments and exits; the game then waits for it forever during crInstall.
+The folder markers now only count when the image links libcef/chrome_elf
+(directly or delay-loaded), is a .NET image (CefSharp, e.g. Safe Exam Browser)
+or exports napi_module_register (Node/Electron). Known browser executable names
+and the Electron fuse detection are unchanged.
+
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -2025,39 +2025,48 @@
+     return virtual_check_buffer_for_read( ptr, len ) ? ptr : NULL;
+ }
+ 
+-static BOOL chromium_image_exports( const void *module, const char *name )
++/* data directory of the mapped image and its SizeOfImage, NULL if absent */
++static const IMAGE_DATA_DIRECTORY *chromium_image_dir( const void *module, unsigned int index, DWORD *size )
+ {
+     const IMAGE_DOS_HEADER *dos = module;
+     const IMAGE_NT_HEADERS64 *nt;
+     const IMAGE_DATA_DIRECTORY *dir;
+-    const IMAGE_EXPORT_DIRECTORY *exports;
+-    const DWORD *names;
+-    const char *export_name;
+-    DWORD size;
+-    SIZE_T len = strlen( name ) + 1;
+-    unsigned int lo = 0, hi, mid;
+-    int cmp;
+ 
+     if (!module || !virtual_check_buffer_for_read( dos, sizeof(*dos) ) ||
+         dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+-        (ULONG_PTR)module > ~(ULONG_PTR)0 - dos->e_lfanew) return FALSE;
++        (ULONG_PTR)module > ~(ULONG_PTR)0 - dos->e_lfanew) return NULL;
+     nt = (const IMAGE_NT_HEADERS64 *)((const BYTE *)module + dos->e_lfanew);
+-    if (!virtual_check_buffer_for_read( nt, sizeof(*nt) ) || nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
++    if (!virtual_check_buffer_for_read( nt, sizeof(*nt) ) || nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+     if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+     {
+-        if (!nt->OptionalHeader.NumberOfRvaAndSizes) return FALSE;
+-        dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+-        size = nt->OptionalHeader.SizeOfImage;
++        if (nt->OptionalHeader.NumberOfRvaAndSizes <= index) return NULL;
++        dir = &nt->OptionalHeader.DataDirectory[index];
++        *size = nt->OptionalHeader.SizeOfImage;
+     }
+     else if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+     {
+         const IMAGE_NT_HEADERS32 *nt32 = (const IMAGE_NT_HEADERS32 *)nt;
+-        if (!nt32->OptionalHeader.NumberOfRvaAndSizes) return FALSE;
+-        dir = &nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+-        size = nt32->OptionalHeader.SizeOfImage;
++        if (nt32->OptionalHeader.NumberOfRvaAndSizes <= index) return NULL;
++        dir = &nt32->OptionalHeader.DataDirectory[index];
++        *size = nt32->OptionalHeader.SizeOfImage;
+     }
+-    else return FALSE;
+-    if (!dir->VirtualAddress || !(exports = chromium_image_data( module, size, dir->VirtualAddress, sizeof(*exports) )))
++    else return NULL;
++    return dir->VirtualAddress ? dir : NULL;
++}
++
++static BOOL chromium_image_exports( const void *module, const char *name )
++{
++    const IMAGE_DATA_DIRECTORY *dir;
++    const IMAGE_EXPORT_DIRECTORY *exports;
++    const DWORD *names;
++    const char *export_name;
++    DWORD size;
++    SIZE_T len = strlen( name ) + 1;
++    unsigned int lo = 0, hi, mid;
++    int cmp;
++
++    if (!(dir = chromium_image_dir( module, IMAGE_DIRECTORY_ENTRY_EXPORT, &size )) ||
++        !(exports = chromium_image_data( module, size, dir->VirtualAddress, sizeof(*exports) )))
+         return FALSE;
+     if (exports->NumberOfNames > size / sizeof(*names) ||
+         !(names = chromium_image_data( module, size, exports->AddressOfNames,
+@@ -2080,6 +2089,57 @@
+            chromium_image_exports( module, "?IsRunAsNodeEnabled@fuses@electron@@YA_NXZ" );
+ }
+ 
++static BOOL chromium_dll_name( const void *module, DWORD size, DWORD rva )
++{
++    static const char *dlls[] = { "libcef.dll", "chrome_elf.dll" };
++    const char *name;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(dlls); i++)
++    {
++        SIZE_T len = strlen( dlls[i] ) + 1;  /* compare the terminator too */
++        if ((name = chromium_image_data( module, size, rva, len )) && !strncasecmp( name, dlls[i], len ))
++            return TRUE;
++    }
++    return FALSE;
++}
++
++/* Whether the program itself runs Chromium: it links libcef/chrome_elf (directly
++ * or delay-loaded), is a .NET program (CefSharp loads libcef from managed code)
++ * or a Node/Electron binary. Helpers that merely sit in the same folder, such as
++ * a game's crash reporter next to its CEF copy, parse their arguments strictly
++ * and must not get browser switches. */
++static BOOL uses_chromium( const void *module )
++{
++    const IMAGE_DATA_DIRECTORY *dir;
++    DWORD size;
++    unsigned int i;
++
++    if ((dir = chromium_image_dir( module, IMAGE_DIRECTORY_ENTRY_IMPORT, &size )))
++    {
++        const IMAGE_IMPORT_DESCRIPTOR *imp;
++        for (i = 0; i < 4096; i++)
++        {
++            if (!(imp = chromium_image_data( module, size, dir->VirtualAddress + i * sizeof(*imp), sizeof(*imp) )) ||
++                !imp->Name) break;
++            if (chromium_dll_name( module, size, imp->Name )) return TRUE;
++        }
++    }
++    if ((dir = chromium_image_dir( module, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &size )))
++    {
++        const IMAGE_DELAYLOAD_DESCRIPTOR *delay;
++        for (i = 0; i < 4096; i++)
++        {
++            if (!(delay = chromium_image_data( module, size, dir->VirtualAddress + i * sizeof(*delay), sizeof(*delay) )) ||
++                !delay->DllNameRVA) break;
++            if ((delay->Attributes.AllAttributes & 1) && chromium_dll_name( module, size, delay->DllNameRVA ))
++                return TRUE;
++        }
++    }
++    if (chromium_image_dir( module, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR, &size )) return TRUE;
++    return chromium_image_exports( module, "napi_module_register" );
++}
++
+ static BOOL is_chromium_program( const UNICODE_STRING *image, void *module )
+ {
+     static const char *exe_names[] = { "msedge.exe", "chrome.exe", "msedgewebview2.exe", "brave.exe",
+@@ -2105,6 +2165,13 @@
+     dir_len = slash + 1 - unix_name;
+     memcpy( path, unix_name, dir_len );
+     for (i = 0; i < ARRAY_SIZE(exe_names) && !ret; i++) ret = !strcasecmp( slash + 1, exe_names[i] );
++    /* the folder markers below only count for programs that use Chromium themselves */
++    if (!ret && !uses_chromium( module ))
++    {
++        free( path );
++        free( unix_name );
++        return FALSE;
++    }
+     for (i = 0; i < ARRAY_SIZE(markers) && !ret; i++)
+     {
+         strcpy( path + dir_len, markers[i] );

@@ -1,0 +1,30 @@
+Subject: [PATCH] winemac: Clear foreground when macOS focus leaves Wine
+
+The desktop window is not an active application. The regular foreground
+setter clears the foreground input when passed the desktop; the internal
+setter instead activates Explorer's desktop window. Use the clearing path
+for both macOS window and app deactivation.
+
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1904,7 +1904,7 @@
+     {
+         send_message(hwnd, WM_CANCELMODE, 0, 0);
+         if (hwnd == NtUserGetForegroundWindow())
+-            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
++            NtUserSetForegroundWindow(NtUserGetDesktopWindow());
+     }
+ }
+ 
+@@ -1932,8 +1932,8 @@
+ 
+     if (get_active_window() == NtUserGetForegroundWindow())
+     {
+-        TRACE("setting fg to desktop\n");
+-        NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
++        TRACE("clearing foreground window\n");
++        NtUserSetForegroundWindow(NtUserGetDesktopWindow());
+     }
+ }
+ 

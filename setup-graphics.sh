@@ -37,12 +37,16 @@ VKD3D_REPO="HansKristian-Work/vkd3d-proton"
 DXVK_DLLS=(d3d9 d3d10core d3d11 dxgi)
 DXMT_DLLS=(d3d10core d3d11 dxgi)
 VKD3D_DLLS=(d3d12 d3d12core)
+# D3DMetal: DLSS-Aufrufe gehen über nvngx/nvapi64 an MetalFX; Apple legt beide in system32.
+D3DM_SYSTEM_DLLS=(nvngx nvapi64)
 
 usage() {
-    echo "Aufruf: $0 [--dxmt | --dxvk] [--dx12] | --off"
+    echo "Aufruf: $0 [--dxmt | --dxvk | --d3dmetal] [--dx12] | --off"
     echo "  (ohne Argument)  DXVK für DirectX 10/11 einrichten (über Vulkan/MoltenVK)"
     echo "  --dxmt           stattdessen DXMT (direkt über Metal, schneller, noch Lücken)"
     echo "  --dxvk           DXVK ausdrücklich (Standard)"
+    echo "  --d3dmetal       Apples D3DMetal für DirectX 11/12 (Game Porting Toolkit, vom Nutzer"
+    echo "                   importiert nach ~/Library/Application Support/Virtual/D3DMetal/<Version>)"
     echo "  --dx12           zusätzlich VKD3D-Proton für DirectX 12 (experimentell)"
     echo "  --off            alles zurück auf WineD3D"
 }
@@ -75,7 +79,7 @@ restore_dll() { # $1 Systemordner, $2 Sicherungsordner, $3 DLL
 
 disable_graphics() {
     echo "==> Zurück auf WineD3D…"
-    for dll in "${DXVK_DLLS[@]}" "${VKD3D_DLLS[@]}" winemetal; do
+    for dll in "${DXVK_DLLS[@]}" "${VKD3D_DLLS[@]}" "${D3DM_SYSTEM_DLLS[@]}" winemetal; do
         restore_dll "$SYS64" "$BACKUP/system32" "$dll"
         restore_dll "$SYS32" "$BACKUP/syswow64" "$dll"
         WINMAC_EXPECT_NONZERO=1 "$BIN/virtual" reg delete 'HKCU\Software\Wine\DllOverrides' /v "$dll" /f >/dev/null 2>&1 || true
@@ -88,7 +92,7 @@ disable_graphics() {
 WANT_DX12=0
 # Ohne Angabe die zuletzt für diesen Raum gewählte Variante (bleibt bei Engine-Updates)
 BACKEND="$(cat "$WINEPREFIX/.virtual/graphics-backend" 2>/dev/null || echo dxvk)"
-case "$BACKEND" in dxmt|dxvk) ;; *) BACKEND=dxvk ;; esac
+case "$BACKEND" in dxmt|dxvk|d3dmetal) ;; *) BACKEND=dxvk ;; esac
 for arg in "$@"; do
     case "$arg" in
         -h|--help) usage; exit 0 ;;
@@ -96,6 +100,7 @@ for arg in "$@"; do
         --dx12)    WANT_DX12=1 ;;
         --dxvk)    BACKEND=dxvk ;;
         --dxmt)    BACKEND=dxmt ;;
+        --d3dmetal) BACKEND=d3dmetal ;;
         *)         usage; exit 1 ;;
     esac
 done
@@ -209,6 +214,36 @@ install_dxmt() { # $1 entpackter Ordner
     WINMAC_EXPECT_NONZERO=1 "$BIN/virtual" reg delete 'HKCU\Software\Wine\DllOverrides' /v d3d9 /f >/dev/null 2>&1 || true
 }
 
+# --- D3DMetal (Apples Game Porting Toolkit; Lizenz erlaubt keine Weitergabe, darum
+# importiert jeder Nutzer sein eigenes) ------------------------------------------
+# Braucht eine eigene Engine, deren ntdll CrossOvers TEB-Spiegelung behält (ohne Patch
+# 0028): D3DMetal ruft Mach-O- und PE-Code direkt gegenseitig auf. Unter DXVK bleiben die
+# DLLs in system32 als Rückfall; die Overrides unten geben D3DMetal den Vorrang.
+D3DMETAL_ROOT="${VIRTUAL_D3DMETAL_ROOT:-$HOME/Library/Application Support/Virtual/D3DMetal}"
+# Ohne Angabe die neueste importierte Version (3.0 und 4.0 beta laufen mit dieser Engine).
+D3DMETAL_VERSION="${VIRTUAL_D3DMETAL_VERSION:-$(for v in $(ls "$D3DMETAL_ROOT" 2>/dev/null); do
+    [ -f "$D3DMETAL_ROOT/$v/wine/x86_64-windows/d3d11.dll" ] && echo "$v"; done | sort -V | tail -1)}"
+GAMES_ENGINE="${VIRTUAL_GAMES_ENGINE:-$HOME/Library/Application Support/Virtual/Engines/d3dmetal}"
+if [ "$BACKEND" = d3dmetal ]; then
+    D3DM="$D3DMETAL_ROOT/$D3DMETAL_VERSION"
+    if [ ! -f "$D3DM/wine/x86_64-windows/d3d11.dll" ] || [ ! -e "$D3DM/external/D3DMetal.framework" ]; then
+        echo "==> D3DMetal $D3DMETAL_VERSION fehlt ($D3DM) – nehme DXVK."; BACKEND=dxvk
+    elif [ ! -x "$GAMES_ENGINE/runtime/bin/virtual" ]; then
+        echo "==> D3DMetal-Engine fehlt ($GAMES_ENGINE) – nehme DXVK."; BACKEND=dxvk
+    else
+        # Apples Unix-Teile (d3d11.so …) sind Links auf libd3dshared.dylib und suchen
+        # D3DMetal.framework neben sich (@loader_path). Nie kopieren: zwei Kopien derselben
+        # Bibliothek haben getrennten Zustand und stürzen ab.
+        ln -sfn ../../external/libd3dshared.dylib "$D3DM/wine/x86_64-unix/libd3dshared.dylib"
+        ln -sfn ../../external/D3DMetal.framework "$D3DM/wine/x86_64-unix/D3DMetal.framework"
+        # MetalFX für DLSS (Apples Anleitung): nvngx-on-metalfx unter dem Namen nvngx.
+        if [ -f "$D3DM/wine/x86_64-windows/nvngx-on-metalfx.dll" ]; then
+            [ -f "$D3DM/wine/x86_64-windows/nvngx.dll" ] || cp "$D3DM/wine/x86_64-windows/nvngx-on-metalfx.dll" "$D3DM/wine/x86_64-windows/nvngx.dll"
+            ln -sfn ../../external/libd3dshared.dylib "$D3DM/wine/x86_64-unix/nvngx.so"
+        fi
+    fi
+fi
+
 if [ "$BACKEND" = dxmt ] && [ ! -f "$WINE_BIN/../lib/wine/x86_64-unix/winemetal.so" ]; then
     echo "==> DXMT-Brücke fehlt in der Runtime – nehme DXVK."
     BACKEND=dxvk
@@ -245,6 +280,16 @@ if [ "$WANT_DX12" = 1 ]; then
     install_dlls "$THIRD/vkd3d" x86 "${VKD3D_DLLS[@]}"
 fi
 
+# --- D3DMetal: nvngx/nvapi64 in system32 (nur solange D3DMetal aktiv ist) ---
+for dll in "${D3DM_SYSTEM_DLLS[@]}"; do
+    if [ "$BACKEND" = d3dmetal ] && [ -f "$D3DM/wine/x86_64-windows/$dll.dll" ]; then
+        backup_dll "$SYS64" "$BACKUP/system32" "$dll"
+        rm -f "$SYS64/$dll.dll"; cp "$D3DM/wine/x86_64-windows/$dll.dll" "$SYS64/"
+    else
+        restore_dll "$SYS64" "$BACKUP/system32" "$dll"
+    fi
+done
+
 # --- Umgebung für die virtual*-Befehle ---------------------------------------
 mkdir -p "$WINEPREFIX/.virtual"
 printf '%s\n' "$BACKEND" > "$WINEPREFIX/.virtual/graphics-backend"
@@ -256,9 +301,26 @@ export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
 export DXMT_LOG_LEVEL="${DXMT_LOG_LEVEL:-none}"
 # FPS-Anzeige bei Bedarf:  DXVK_HUD=fps runtime/bin/virtual spiel.exe
 ENV
+if [ "$BACKEND" = d3dmetal ]; then
+    cat >> "$WINEPREFIX/.virtual/graphics-env.sh" <<ENV
+# D3DMetal $D3DMETAL_VERSION: DirectX 11/12 über Apples Metal-Übersetzung, eigene Engine.
+# FPS-Anzeige bei Bedarf:  MTL_HUD_ENABLED=1
+export VIRTUAL_ROOM_RUNTIME="$GAMES_ENGINE/runtime"
+export WINEDLLPATH_PREPEND="$D3DM/wine"
+export WINEDLLOVERRIDES="d3d11,dxgi,d3d12,d3d12core,d3d10=b\${WINEDLLOVERRIDES:+;\$WINEDLLOVERRIDES}"
+export CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal
+# DLSS → MetalFX (Apple: ab macOS 26) und AVX-Angaben für Spiele (Apple: ab macOS 15).
+export D3DM_ENABLE_METALFX="\${D3DM_ENABLE_METALFX:-1}"
+export ROSETTA_ADVERTISE_AVX="\${ROSETTA_ADVERTISE_AVX:-1}"
+# Gleiche Geometrie in mehreren Durchgängen exakt gleich rechnen (sonst flackern
+# aufgemalte Flächen wie Straßenmarkierungen gegen ihren Untergrund).
+export D3DM_POSITION_INVARIANCE="\${D3DM_POSITION_INVARIANCE:-1}"
+ENV
+fi
 
 echo "============================================================"
-echo " Grafik-Runtime eingerichtet ($([ "$BACKEND" = dxmt ] && echo "DXMT über Metal" || echo "DXVK über MoltenVK"))."
+case "$BACKEND" in dxmt) NAME="DXMT über Metal" ;; d3dmetal) NAME="D3DMetal $D3DMETAL_VERSION über Metal" ;; *) NAME="DXVK über MoltenVK" ;; esac
+echo " Grafik-Runtime eingerichtet ($NAME)."
 echo "   DLLs:      $SYS64 (+ syswow64)"
 echo "   Sicherung: $BACKUP"
 echo "   Env:       $WINEPREFIX/.virtual/graphics-env.sh"

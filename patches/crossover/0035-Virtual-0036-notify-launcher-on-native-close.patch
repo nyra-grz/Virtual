@@ -1,0 +1,39 @@
+Subject: [PATCH] winemac: Notify managed launches of a titlebar close request
+
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -26,6 +26,9 @@
+ #endif
+ 
+ #include "config.h"
++
++#include <fcntl.h>
++#include <unistd.h>
+ 
+ #include <IOKit/pwr_mgt/IOPMLib.h>
+ #define GetCurrentThread Mac_GetCurrentThread
+@@ -1776,6 +1779,8 @@
+ void macdrv_window_close_requested(HWND hwnd)
+ {
+     HMENU sysmenu;
++    const char *request;
++    int fd;
+ 
+     if (NtUserGetClassLongW(hwnd, GCL_STYLE) & CS_NOCLOSE)
+     {
+@@ -1795,6 +1800,14 @@
+         }
+     }
+ 
++    /* The launcher checks the entire job after an explicit titlebar close.
++     * It waits for remaining windows or a save dialog to close normally. */
++    request = getenv("WINMAC_NATIVE_CLOSE_PATH");
++    if (request && request[0] == '/' && !NtUserGetWindowRelative(hwnd, GW_OWNER))
++    {
++        fd = open(request, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
++        if (fd != -1) close(fd);
++    }
+     perform_window_command(hwnd, 0, 0, SC_CLOSE, HTCLOSE);
+ }
+ 

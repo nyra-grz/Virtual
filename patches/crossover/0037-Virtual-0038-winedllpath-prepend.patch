@@ -1,0 +1,37 @@
+From: Daniel Özdek <daniel.timur.23@gmail.com>
+Date: Thu, 12 Nov 2026 08:45:00 +0100
+Subject: [PATCH] ntdll: Support WINEDLLPATH_PREPEND for builtin directories searched before Wine's own
+
+CrossOver and Sikarugir load an imported D3DMetal (Game Porting Toolkit redist)
+by putting its wine/ directory ahead of the builtin DLL directory. Virtual
+can then enable D3DMetal per room from a folder outside the engine, without
+replacing Wine's own d3d11/dxgi/d3d12 or touching program folders.
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -386,13 +386,23 @@
+ 
+ static void set_dll_path(void)
+ {
+-    char *p, *path = getenv( "WINEDLLPATH" );
++    char *p, *path = getenv( "WINEDLLPATH" ), *prepend = getenv( "WINEDLLPATH_PREPEND" );
+     int i, count = 0;
+ 
+     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
++    if (prepend && *prepend) for (p = prepend, count++; *p; p++) if (*p == ':') count++;
+ 
+     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
+     count = 0;
++
++    /* Virtual: builtin directories searched before Wine's own, e.g. an imported
++     * D3DMetal (<dir>/x86_64-windows, <dir>/x86_64-unix), as in CrossOver. */
++    if (prepend && *prepend)
++    {
++        prepend = strdup( prepend );
++        for (p = strtok( prepend, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
++        free( prepend );
++    }
+ 
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 

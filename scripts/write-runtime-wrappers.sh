@@ -24,10 +24,21 @@ export WINEDEBUG="${WINEDEBUG:-fixme-all}"
 export WINEMSYNC="${WINEMSYNC:-1}"
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES-}"
 export DXVK_ASYNC="${DXVK_ASYNC:-1}" DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
+# MoltenVK logs info/warnings per frame by default (BeamNG under DXVK: ~50 MB/s of
+# "VkDescriptorPool exhausted" into the program log, the game stutters). Errors only.
+export MVK_CONFIG_LOG_LEVEL="${MVK_CONFIG_LOG_LEVEL:-1}"
 if [ -f "$WINEPREFIX/.virtual/graphics-env.sh" ]; then
     source "$WINEPREFIX/.virtual/graphics-env.sh"
 elif [ -f "$RUNTIME/graphics-env.sh" ]; then
     source "$RUNTIME/graphics-env.sh"
+fi
+# A room's graphics setup may pick another engine (setup-graphics.sh --d3dmetal needs
+# one whose ntdll keeps CrossOver's TEB mirroring). Hand over to that engine's launcher.
+if [ -n "${VIRTUAL_ROOM_RUNTIME:-}" ] && [ -z "${VIRTUAL_ROOM_RUNTIME_ACTIVE:-}" ] \
+   && [ -x "$VIRTUAL_ROOM_RUNTIME/bin/$(basename "$0")" ] \
+   && [ "$(cd "$VIRTUAL_ROOM_RUNTIME" 2>/dev/null && pwd)" != "$RUNTIME" ]; then
+    export VIRTUAL_ROOM_RUNTIME_ACTIVE=1
+    exec "$VIRTUAL_ROOM_RUNTIME/bin/$(basename "$0")" "$@"
 fi
 # Gebündeltes GStreamer (scripts/bundle-gstreamer.sh) für Video/Audio in Windows-Programmen
 GST_DIR="$WINE_BIN/../lib/gst"

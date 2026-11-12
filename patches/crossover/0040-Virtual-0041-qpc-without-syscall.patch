@@ -1,0 +1,111 @@
+From: Daniel Özdek <daniel.timur.23@gmail.com>
+Date: Thu, 12 Nov 2026 09:55:00 +0100
+Subject: [PATCH] server, ntdll: QueryPerformanceCounter without a syscall under Rosetta
+
+Under Rosetta rdtsc counts nanoseconds from the hardware counter behind
+mach_absolute_time(), with the same epoch in every process. The server
+publishes mach_continuous_time() - rdtsc (read without a counter tick in
+between, so exact) in KUSER_SHARED_DATA.QpcBias on every time update;
+RtlQueryPerformanceCounter returns (rdtsc + bias) / 100, the exact value of
+NtQueryPerformanceCounter and of the server timeout clock. QpcBypassEnabled
+stays clear (not the Windows shift formula). Without a published bias
+(older server, Intel Macs) the syscall path is used as before.
+Measured: 46 ns -> 10 ns (games engine), 379 ns -> 10 ns (engine with 0028);
+1M interleaved Rtl/Nt reads without ordering violations.
+
+diff --git a/server/fd.c b/server/fd.c
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -76,6 +76,10 @@
+ #endif
+ #include <sys/stat.h>
+ #include <sys/time.h>
++#if defined(__APPLE__) && defined(__x86_64__)
++#include <mach/mach_time.h>
++#include <sys/sysctl.h>
++#endif
+ #ifdef MAJOR_IN_MKDEV
+ #include <sys/mkdev.h>
+ #elif defined(MAJOR_IN_SYSMACROS)
+@@ -413,7 +417,48 @@
+     atomic_store_ulong(&user_shared_data->TickCount.LowPart, tick_count);
+     atomic_store_long(&user_shared_data->TickCount.High1Time, tick_count >> 32);
+     atomic_store_ulong(&user_shared_data->TickCountLowDeprecated, tick_count);
++}
++
++#if defined(__APPLE__) && defined(__x86_64__)
++/* Virtual: QueryPerformanceCounter without a syscall. Under Rosetta, rdtsc counts
++ * nanoseconds from the same hardware counter as mach_absolute_time(), so
++ * mach_continuous_time() - rdtsc is constant except across system sleep. Publish it in
++ * QpcBias; ntdll computes (rdtsc + QpcBias) / 100, which equals monotonic_counter()
++ * (the clock of NtQueryPerformanceCounter and of server timeouts) exactly.
++ * QpcBypassEnabled stays clear: this is not Windows' (tsc + bias) >> shift scheme. */
++static void set_user_shared_data_qpc_bias(void)
++{
++    static int usable = -1;
++    unsigned int lo, hi;
++    UINT64 before, after, now;
++    int i;
++
++    if (usable < 0)
++    {
++        mach_timebase_info_data_t timebase;
++        int translated = 0;
++        size_t size = sizeof(translated);
++
++        usable = !sysctlbyname( "sysctl.proc_translated", &translated, &size, NULL, 0 ) && translated == 1
++                 && !mach_timebase_info( &timebase ) && timebase.numer == 1 && timebase.denom == 1;
++    }
++    if (!usable) return;
++
++    for (i = 0; i < 8; i++)  /* the counter must not tick between the two reads */
++    {
++        __asm__ __volatile__( "rdtsc" : "=a" (lo), "=d" (hi) );
++        before = ((UINT64)hi << 32) | lo;
++        now = mach_continuous_time();
++        __asm__ __volatile__( "rdtsc" : "=a" (lo), "=d" (hi) );
++        after = ((UINT64)hi << 32) | lo;
++        if (before == after && now > before)
++        {
++            if (user_shared_data->QpcBias != now - before) user_shared_data->QpcBias = now - before;
++            return;
++        }
++    }
+ }
++#endif
+ 
+ void set_current_time(void)
+ {
+@@ -423,6 +468,9 @@
+     current_time = (timeout_t)now.tv_sec * TICKS_PER_SEC + now.tv_usec * 10 + ticks_1601_to_1970;
+     monotonic_time = monotonic_counter();
+     if (user_shared_data) set_user_shared_data_time();
++#if defined(__APPLE__) && defined(__x86_64__)
++    if (user_shared_data) set_user_shared_data_qpc_bias();
++#endif
+ }
+ 
+ /* add a timeout user */
+diff --git a/dlls/ntdll/time.c b/dlls/ntdll/time.c
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -382,6 +382,19 @@
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
+ {
++#if defined(__x86_64__) && !defined(__arm64ec__)
++    /* Virtual: a wineserver running under Rosetta publishes mach_continuous_time() - rdtsc
++     * in QpcBias (server/fd.c), so (rdtsc + bias) / 100 is exactly the value of
++     * NtQueryPerformanceCounter, without the syscall that games pay for every frame. */
++    ULONGLONG bias = user_shared_data->QpcBias;
++    if (bias)
++    {
++        ULONG lo, hi;
++        __asm__ __volatile__( "rdtsc" : "=a" (lo), "=d" (hi) );
++        counter->QuadPart = ((((ULONGLONG)hi << 32) | lo) + bias) / 100;
++        return TRUE;
++    }
++#endif
+     NtQueryPerformanceCounter( counter, NULL );
+     return TRUE;
+ }

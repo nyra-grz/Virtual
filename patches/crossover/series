@@ -36,3 +36,10 @@
 0031-Virtual-0032-shader-reflection-contracts.patch
 0032-Virtual-0033-d2d-image-graphs.patch
 0033-Virtual-0034-native-window-levels.patch
+0034-Virtual-0035-clear-foreground-on-mac-focus-loss.patch
+0035-Virtual-0036-notify-launcher-on-native-close.patch
+0036-Virtual-0037-chromium-switches-only-for-chromium-users.patch
+0037-Virtual-0038-winedllpath-prepend.patch
+0038-Virtual-0039-ntdll-foreign-personality-routine.patch
+0039-Virtual-0040-winemac-cursor-position-quartz.patch
+0040-Virtual-0041-qpc-without-syscall.patch

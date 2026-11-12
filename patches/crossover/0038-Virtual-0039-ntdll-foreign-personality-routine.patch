@@ -1,0 +1,36 @@
+From: Daniel Özdek <daniel.timur.23@gmail.com>
+Date: Thu, 12 Nov 2026 09:05:00 +0100
+Subject: [PATCH] ntdll: Initialize the module in virtual_unwind and allow a NULL handler data pointer
+
+For a fault in host (Mach-O) code, LdrFindEntryForAddress fails and leaves the
+module pointer unset, so the "personality routine in system library" guard never
+fired and a libunwind personality routine was called as SEH handler (jump to a
+garbage address). Hit by Apple's D3DMetal, which runs Mach-O code on PE threads.
+Same diagnosis: https://github.com/frankea/Whisky/issues/163
+
+diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
+index a5bbbaea..cb199188 100644
+--- a/dlls/ntdll/signal_x86_64.c
++++ b/dlls/ntdll/signal_x86_64.c
+@@ -100,7 +100,7 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
+  */
+ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEXT *context )
+ {
+-    LDR_DATA_TABLE_ENTRY *module;
++    LDR_DATA_TABLE_ENTRY *module = NULL;
+     NTSTATUS status;
+ 
+     dispatch->ImageBase = 0;
+diff --git a/dlls/ntdll/unwind.c b/dlls/ntdll/unwind.c
+index 6e2b8641..237a2266 100644
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -2072,7 +2072,7 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+     {
+         context->Rip = *(ULONG64 *)context->Rsp;
+         context->Rsp += sizeof(ULONG64);
+-        *data = NULL;
++        if (data) *data = NULL;
+         *handler_ret = NULL;
+         return STATUS_SUCCESS;
+     }

@@ -1,0 +1,33 @@
+From: Daniel Özdek <daniel.timur.23@gmail.com>
+Date: Thu, 12 Nov 2026 09:50:00 +0100
+Subject: [PATCH] winemac: Read the cursor position through Quartz instead of the main thread
+
+NtUserGetCursorPos asks the driver whenever the mouse has been still for
+100 ms. The driver dispatched to the Cocoa main thread for every call
+(~12 us, longer while the main thread presents frames). CGEventCreate(NULL)
+returns the same Quartz coordinates on any thread (~0.1 us).
+Measured with a GetCursorPos loop: 10.8-12.1 us -> 0.46-0.96 us per call.
+
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -2829,6 +2829,19 @@
+  */
+ int macdrv_get_cursor_position(CGPoint *pos)
+ {
++    /* Quartz reports the global cursor location (already in the flipped, top-left
++       origin that flippedMouseLocation produces) and is thread-safe. GetCursorPos
++       lands here whenever the mouse has been still for 100 ms, and games poll it
++       every frame: a round trip to the main thread costs ~12 us and also waits
++       behind whatever the main thread is doing (presenting, window events). */
++    CGEventRef event = CGEventCreate(NULL);
++    if (event)
++    {
++        *pos = cgpoint_win_from_mac(CGEventGetLocation(event));
++        CFRelease(event);
++        return TRUE;
++    }
++
+     OnMainThread(^{
+         NSPoint location = [NSEvent mouseLocation];
+         location = [[WineApplicationController sharedController] flippedMouseLocation:location];
