@@ -8,6 +8,106 @@
 #include <wchar.h>
 
 #define JOB_KEY 1
+#define CONTROL_INTERVAL 250
+
+struct close_control
+{
+    WCHAR stop[MAX_PATH], window[MAX_PATH];
+    ULONGLONG next_check, force_at, watch_until, empty_since;
+};
+
+struct job_windows
+{
+    HANDLE job;
+    BOOL request_close, visible, incomplete;
+};
+
+static BOOL CALLBACK inspect_window(HWND hwnd, LPARAM data)
+{
+    struct job_windows *windows = (void *)data;
+    DWORD pid;
+    HANDLE process;
+    BOOL member = FALSE;
+    RECT rect;
+
+    if (!IsWindowVisible(hwnd) || !GetWindowRect(hwnd, &rect) || IsRectEmpty(&rect)) return TRUE;
+    if (!GetWindowThreadProcessId(hwnd, &pid)
+            || !(process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid))) return TRUE;
+    IsProcessInJob(process, windows->job, &member);
+    CloseHandle(process);
+    if (member)
+    {
+        windows->visible = TRUE;
+        if (windows->request_close && !GetWindow(hwnd, GW_OWNER)) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    }
+    return TRUE;
+}
+
+static BOOL CALLBACK inspect_desktop(WCHAR *name, LPARAM data)
+{
+    struct job_windows *windows = (void *)data;
+    HDESK desktop = OpenDesktopW(name, 0, FALSE, DESKTOP_READOBJECTS);
+    if (!desktop) windows->incomplete = TRUE;
+    else
+    {
+        if (!EnumDesktopWindows(desktop, inspect_window, data)) windows->incomplete = TRUE;
+        CloseDesktop(desktop);
+    }
+    return TRUE;
+}
+
+static BOOL has_job_windows(HANDLE job, BOOL request_close)
+{
+    struct job_windows windows = { .job = job, .request_close = request_close };
+    return !EnumDesktopsW(GetProcessWindowStation(), inspect_desktop, (LPARAM)&windows)
+           || windows.incomplete || windows.visible;
+}
+
+static void read_request_path(const WCHAR *name, WCHAR path[MAX_PATH])
+{
+    DWORD length = GetEnvironmentVariableW(name, path, MAX_PATH);
+    if (!length || length >= MAX_PATH) path[0] = 0;
+}
+
+/* Return FALSE if the explicit shutdown could not be issued. The job's
+ * kill-on-close limit is still a fallback when the helper exits. */
+static BOOL handle_close_requests(HANDLE job, struct close_control *control)
+{
+    ULONGLONG now;
+    if (!control->stop[0] && !control->window[0]) return TRUE;
+    now = GetTickCount64();
+    if (now < control->next_check) return TRUE;
+    control->next_check = now + CONTROL_INTERVAL;
+
+    if (!control->force_at && control->stop[0] && GetFileAttributesW(control->stop) != INVALID_FILE_ATTRIBUTES)
+    {
+        has_job_windows(job, TRUE);
+        control->force_at = now + 2000;
+    }
+    if (control->force_at)
+    {
+        if (now < control->force_at) return TRUE;
+        control->stop[0] = control->window[0] = 0;
+        return TerminateJobObject(job, 0);
+    }
+
+    if (control->window[0] && DeleteFileW(control->window))
+    {
+        control->watch_until = now + 30000;
+        control->empty_since = 0;
+    }
+    if (now < control->watch_until)
+    {
+        if (has_job_windows(job, FALSE)) control->empty_since = 0;
+        else if (!control->empty_since) control->empty_since = now;
+        else if (now - control->empty_since >= 1000)
+        {
+            control->stop[0] = control->window[0] = 0;
+            return TerminateJobObject(job, 0);
+        }
+    }
+    return TRUE;
+}
 
 /* Result rule: the start process decides, unless it reported success while
  * processes it handed over were still running (a bootstrapper or shortcut stub
@@ -120,15 +220,19 @@ static BOOL job_is_empty(HANDLE job)
 
 /* Job messages arrive in event order, so the member list always shows which
  * processes were alive when a message was posted. */
-static void wait_for_job(struct launch *launch, HANDLE port, HANDLE starter)
+static BOOL wait_for_job(struct launch *launch, HANDLE port, HANDLE starter)
 {
+    struct close_control control = {0};
     BOOL idle = FALSE;
+    read_request_path(L"WINMAC_STOP_REQUEST", control.stop);
+    read_request_path(L"WINMAC_WINDOW_REQUEST", control.window);
     for (;;)
     {
         DWORD message;
         ULONG_PTR key;
         OVERLAPPED *data;
-        if (port && GetQueuedCompletionStatus(port, &message, &key, &data, idle ? 0 : 50))
+        if (!idle && !handle_close_requests(launch->job, &control)) return FALSE;
+        if (port && GetQueuedCompletionStatus(port, &message, &key, &data, idle ? 0 : CONTROL_INTERVAL))
         {
             if (key != JOB_KEY) continue;
             if (message == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO) idle = TRUE;
@@ -139,11 +243,12 @@ static void wait_for_job(struct launch *launch, HANDLE port, HANDLE starter)
             continue;
         }
         if (idle) break;   /* remaining messages read after the job became empty */
-        if (!port) Sleep(50);
+        if (!port) Sleep(CONTROL_INTERVAL);
         /* Without job messages: a shell shortcut can spawn another process and exit
          * immediately, so wait until the whole job is empty. */
         if (WaitForSingleObject(starter, 0) == WAIT_OBJECT_0 && job_is_empty(launch->job)) idle = TRUE;
     }
+    return TRUE;
 }
 
 static WCHAR *command_line(int argc, WCHAR **argv)
@@ -360,7 +465,12 @@ int wmain(int argc, WCHAR **argv)
         close_relay_writer(errors);
         launch.starter = child.dwProcessId;
         ResumeThread(child.hThread);
-        wait_for_job(&launch, port, child.hProcess);
+        if (!wait_for_job(&launch, port, child.hProcess))
+        {
+            status = GetLastError();
+            fprintf(stderr, "Windows-Prozessgruppe konnte nicht beendet werden (Fehler %lu).\n", status);
+            goto cleanup;
+        }
         GetExitCodeProcess(child.hProcess, &status);
         if (succeeded(status) && launch.failed_pid)
         {

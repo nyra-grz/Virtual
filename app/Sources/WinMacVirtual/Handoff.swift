@@ -222,7 +222,9 @@ final class Handoff {
     static let didSelectProgram = Notification.Name("WinMacVirtual.handoff.didSelectProgram")
 
     private func runTool(_ args: [String], in room: Room, title: String) {
-        do { try Launcher.shared.runTool(args, in: room, title: title) } catch { show("Öffnen nicht möglich", error.localizedDescription) }
+        do {
+            try Launcher.shared.runTool(args, in: room, title: title, trackChildren: true, manageClose: true)
+        } catch { show("Öffnen nicht möglich", error.localizedDescription) }
     }
 
     // MARK: - Zertifikate

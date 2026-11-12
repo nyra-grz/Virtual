@@ -190,10 +190,11 @@ final class RoomWatcher {
         var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
                                            retain: nil, release: nil, copyDescription: nil)
         let roomID = room.id
-        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+        let callback: FSEventStreamCallback = { stream, info, _, _, _, _ in
             guard let info else { return }
             let watcher = Unmanaged<RoomWatcher>.fromOpaque(info).takeUnretainedValue()
-            watcher.changed()
+            guard let roomID = watcher.streams.first(where: { $0.value == stream })?.key else { return }
+            watcher.changed(roomID)
         }
         guard let stream = FSEventStreamCreate(nil, callback, &context, watched as CFArray,
                                                FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1.0,
@@ -204,15 +205,15 @@ final class RoomWatcher {
     }
 
     /// Mehrere Änderungen kurz hintereinander (ein Installer schreibt viele Dateien) bündeln.
-    private func changed() {
-        let ids = Set(RoomStore.shared.rooms.map(\.id))
-        guard pending.isEmpty else { pending.formUnion(ids); return }
-        pending = ids
+    private func changed(_ roomID: UUID) {
+        let needsRefresh = pending.isEmpty
+        pending.insert(roomID)
+        guard needsRefresh else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             guard let self else { return }
-            let rooms = self.pending
+            let rooms = RoomStore.shared.rooms.filter { self.pending.contains($0.id) }
             self.pending.removeAll()
-            for id in rooms { AppScanner.refresh(RoomStore.shared.room(id: id)) }
+            for room in rooms { AppScanner.refresh(room) }
         }
     }
 }

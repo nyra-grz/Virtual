@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 /// Native Source List und ein scrollbarer Inhalt: auch im kleinsten Fenster bleiben
 /// alle Aktionen erreichbar, ohne feste Spaltenbreiten vor dem ersten Layout.
 final class MainWindowController: NSWindowController, NSOutlineViewDataSource, NSOutlineViewDelegate,
-                                  NSToolbarDelegate, NSMenuDelegate {
+                                  NSToolbarDelegate, NSMenuDelegate, NSWindowDelegate {
     private let split = NSSplitViewController()
     private let outline = NSOutlineView()
     private let detail = NSStackView()
@@ -35,6 +35,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         window.toolbarStyle = .unified
         window.isReleasedWhenClosed = false
         self.init(window: window)
+        window.delegate = self
         build()
         observe()
         selectRoom(RoomStore.shared.defaultRoom)
@@ -48,6 +49,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        DispatchQueue.main.async { NSApp.terminate(nil) }
+        return false
+    }
 
     private func build() {
         guard let window else { return }
@@ -408,7 +414,17 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         let graphics = NSMenuItem(title: "Grafik", action: nil, keyEquivalent: "")
         let graphicsMenu = NSMenu()
         let current = (try? String(contentsOf: room.prefixURL.appendingPathComponent(".virtual/graphics-backend"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "dxvk"
-        for (name, backend) in [("Kompatibilität (DXVK)", "dxvk"), ("Metal (DXMT, experimentell)", "dxmt")] {
+        var backends = [("Kompatibilität (DXVK)", "dxvk"), ("Metal (DXMT, experimentell)", "dxmt")]
+        // Apples D3DMetal (Game Porting Toolkit) darf Virtual nicht mitliefern; erscheint,
+        // sobald der Nutzer es nach ~/Library/Application Support/Virtual/D3DMetal importiert hat.
+        let d3dmetal = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Virtual/D3DMetal", isDirectory: true)
+        if current == "d3dmetal" || ((try? FileManager.default.contentsOfDirectory(atPath: d3dmetal.path)) ?? []).contains(where: {
+            FileManager.default.fileExists(atPath: d3dmetal.appendingPathComponent("\($0)/wine/x86_64-windows/d3d11.dll").path)
+        }) {
+            backends.append(("Apple D3DMetal (DirectX 11/12, Spiele)", "d3dmetal"))
+        }
+        for (name, backend) in backends {
             let item = ActionMenuItem(name) { [weak self] in
                 guard let self else { return }
                 guard !Launcher.shared.hasRunning(in: room), PrefixSetup.current(in: room) == nil else {

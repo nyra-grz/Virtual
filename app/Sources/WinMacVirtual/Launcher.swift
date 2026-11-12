@@ -15,6 +15,7 @@ final class Launcher {
     struct Running {
         let process: Process
         let logURL: URL
+        let stopRequest: URL?
     }
 
     /// Laufende Prozesse nach Programm-ID.
@@ -22,6 +23,7 @@ final class Launcher {
     private var preparing: [UUID: Program] = [:]
     private var pendingTools: [UUID: UUID] = [:]
     private var stopping: Set<UUID> = []
+    private var stopRequested: Set<UUID> = []
     private var repaired: Set<UUID> = []
 
     func isRunning(_ program: Program) -> Bool { running[program.id] != nil || preparing[program.id] != nil }
@@ -85,23 +87,26 @@ final class Launcher {
         }
 
         let programID = program.id
-        let (process, logURL) = try start(arguments, in: room, title: program.name, id: programID,
-                                        directory: program.url.deletingLastPathComponent(), trackChildren: true) { [weak self] status in
+        let launch = try start(arguments, in: room, title: program.name, id: programID,
+                               directory: program.url.deletingLastPathComponent(), trackChildren: true,
+                               manageClose: true) { [weak self] status in
             guard let self else { return }
             self.running[programID] = nil
+            self.stopRequested.remove(programID)
             let stopped = self.stopping.remove(programID) != nil
             let isMSI = program.url.pathExtension.lowercased() == "msi"
             if !LaunchDiagnostics.installerSucceeded(status: status, isMSI: isMSI), !stopped, !(isMSI && (status == 1602 || status == 66)) {
                 self.repairOrReport(status, program: program)
             }
         }
-        recentLogs[programID] = logURL
-        running[programID] = Running(process: process, logURL: logURL)
+        recentLogs[programID] = launch.logURL
+        running[programID] = launch
         NotificationCenter.default.post(name: Launcher.didChange, object: nil)
     }
 
     /// Startet ein Windows-Werkzeug (Explorer, Eingabeaufforderung, Installer …) in einem Raum.
-    func runTool(_ arguments: [String], in room: Room, title: String, directory: URL? = nil, trackChildren: Bool = false) throws {
+    func runTool(_ arguments: [String], in room: Room, title: String, directory: URL? = nil,
+                 trackChildren: Bool = false, manageClose: Bool = false) throws {
         guard !Updater.shared.isInstalling else { throw LaunchError.updateInProgress }
         guard Settings.shared.runtimeIsInstalled else { throw LaunchError.runtimeMissing }
         let id = UUID()
@@ -112,16 +117,17 @@ final class Launcher {
             guard pendingTools.removeValue(forKey: id) != nil else { return }
             do {
                 if let error { throw error }
-                let (process, logURL) = try start(arguments, in: room, title: title, id: id,
-                                                  directory: directory, trackChildren: trackChildren) { [weak self] status in
+                let launch = try start(arguments, in: room, title: title, id: id,
+                                       directory: directory, trackChildren: trackChildren,
+                                       manageClose: manageClose) { [weak self] status in
                     guard let self else { return }
                     self.tools[id] = nil
                     self.toolTitles[id] = nil
                     let stopped = self.stopping.remove(id) != nil
                     if status != 0, !stopped { self.reportExit(status, id: id, title: title) }
                 }
-                recentLogs[id] = logURL
-                tools[id] = process
+                recentLogs[id] = launch.logURL
+                tools[id] = launch.process
             } catch {
                 toolTitles[id] = nil
                 reportFailure(error, id: id, title: title)
@@ -210,9 +216,23 @@ final class Launcher {
     }
 
     private func start(_ arguments: [String], in room: Room, title: String, id: UUID, directory: URL? = nil,
-                       trackChildren: Bool = false, ended: @escaping (Int32) -> Void) throws -> (Process, URL) {
+                       trackChildren: Bool = false, manageClose: Bool = false,
+                       ended: @escaping (Int32) -> Void) throws -> Running {
         let settings = Settings.shared
         try FileManager.default.createDirectory(at: settings.logsPath, withIntermediateDirectories: true)
+        let helper = trackChildren ? Bundle.main.url(forResource: "program-runner", withExtension: "exe") : nil
+        var environment = RoomStore.shared.environment(for: room)
+        let requests = room.driveC.appendingPathComponent(".virtual", isDirectory: true)
+            .appendingPathComponent("close", isDirectory: true)
+        let token = UUID().uuidString
+        let stopRequest = manageClose && helper != nil ? requests.appendingPathComponent(token + ".stop") : nil
+        let windowRequest = stopRequest.map { $0.deletingPathExtension().appendingPathExtension("window") }
+        if let stopRequest, let windowRequest {
+            try FileManager.default.createDirectory(at: requests, withIntermediateDirectories: true)
+            environment["WINMAC_STOP_REQUEST"] = "C:\\.virtual\\close\\" + stopRequest.lastPathComponent
+            environment["WINMAC_WINDOW_REQUEST"] = "C:\\.virtual\\close\\" + windowRequest.lastPathComponent
+            environment["WINMAC_NATIVE_CLOSE_PATH"] = windowRequest.path
+        }
 
         let stamp = Self.timestamp()
         let safeName = title.replacingOccurrences(of: "/", with: "_")
@@ -225,25 +245,29 @@ final class Launcher {
 
         let process = Process()
         process.executableURL = settings.virtualBinary
-        if trackChildren, let helper = Bundle.main.url(forResource: "program-runner", withExtension: "exe") {
+        if let helper {
             process.arguments = [helper.path] + arguments
         } else {
             process.arguments = arguments
         }
-        process.environment = RoomStore.shared.environment(for: room)
+        process.environment = environment
         // Portable apps and installers often load files relative to their own folder.
         process.currentDirectoryURL = directory ?? room.driveC
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        // Programme schreiben direkt in ihr Logfile, nicht in eine Pipe von Virtual: So laufen
+        // sie (und ihr Log) weiter, wenn Virtual beendet wird. Die Live-Anzeige liest mit.
+        process.standardOutput = handle
+        process.standardError = handle
 
-        let output = ProgramOutput(log: handle, reader: pipe.fileHandleForReading, programID: id)
+        let output = try ProgramOutput(log: handle, logURL: logURL, programID: id)
         let roomID = room.id
 
         process.terminationHandler = { proc in
             output.finish(status: proc.terminationStatus) {
                 DispatchQueue.main.async {
+                    for request in [stopRequest, windowRequest].compactMap({ $0 }) {
+                        try? FileManager.default.removeItem(at: request)
+                    }
                     self.processRooms[id] = nil
                     let status = LaunchDiagnostics.exitCode(status: proc.terminationStatus, output: Self.logTail(logURL))
                     ended(status)
@@ -259,10 +283,9 @@ final class Launcher {
         } catch {
             // Ohne Start ruft Process den terminationHandler nie auf: selbst aufräumen.
             output.abort()
-            try? pipe.fileHandleForWriting.close()
             throw error
         }
-        return (process, logURL)
+        return Running(process: process, logURL: logURL, stopRequest: stopRequest)
     }
 
     /// Beendet ein laufendes Programm (sanft, dann hart).
@@ -271,10 +294,18 @@ final class Launcher {
             NotificationCenter.default.post(name: Self.didChange, object: nil)
             return
         }
-        guard let r = running[program.id] else { return }
+        guard let r = running[program.id], stopRequested.insert(program.id).inserted else { return }
         stopping.insert(program.id)
-        r.process.terminate()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+        var grace: TimeInterval = 0
+        if let request = r.stopRequest, (try? Data().write(to: request, options: .atomic)) != nil {
+            grace = 6
+        }
+        let terminate = {
+            if r.process.isRunning { r.process.terminate() }
+        }
+        if grace > 0 { DispatchQueue.main.asyncAfter(deadline: .now() + grace, execute: terminate) }
+        else { terminate() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + grace + 3) {
             if r.process.isRunning {
                 kill(r.process.processIdentifier, SIGKILL)
             }
@@ -375,31 +406,34 @@ final class Launcher {
     }
 }
 
-/// Schreibt die Ausgabe eines gestarteten Programms ins Log. Lesen, Schreiben und Abschluss
-/// laufen auf einer seriellen Queue: Was das Programm vor seinem Ende geschrieben hat, wird
-/// vor dem Footer vollständig aus der Pipe geholt, und nach dem Footer kommt nichts mehr.
+/// Führt das Log eines gestarteten Programms. Das Programm schreibt selbst in die Datei
+/// (stdout/stderr zeigen direkt darauf); hier wird nur für die Live-Anzeige mitgelesen und
+/// am Ende der Footer angehängt. Mitlesen und Abschluss laufen auf einer seriellen Queue.
 private final class ProgramOutput: @unchecked Sendable {
     private let queue = DispatchQueue(label: "WinMacVirtual.launcher.output")
     private let log: FileHandle
     private let reader: FileHandle
     private let programID: UUID
-    private let source: DispatchSourceRead
+    private let source: DispatchSourceFileSystemObject
 
-    init(log: FileHandle, reader: FileHandle, programID: UUID) {
+    init(log: FileHandle, logURL: URL, programID: UUID) throws {
         self.log = log
-        self.reader = reader
+        reader = try FileHandle(forReadingFrom: logURL)
         self.programID = programID
-        let fd = reader.fileDescriptor
-        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
-        source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        // Der Kopf steht schon im Log; mitgelesen wird nur, was das Programm schreibt.
+        _ = try? reader.seekToEnd()
+        let reader = self.reader
+        source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: reader.fileDescriptor,
+                                                           eventMask: [.extend, .write], queue: queue)
         // Der Handler hält self, bis die Quelle abgebrochen ist (finish/abort tun das immer).
         source.setEventHandler { self.drain() }
         source.setCancelHandler { try? reader.close() }
         source.resume()
     }
 
-    /// Nach dem Prozessende: Rest aus der Pipe holen, ohne auf EOF zu warten – von Wine
-    /// gestartete Hintergrundprozesse (wineserver, services.exe) halten die Pipe oft weiter offen.
+    /// Nach dem Prozessende: Neues noch mitlesen, dann den Footer schreiben. Von Wine
+    /// gestartete Hintergrundprozesse (wineserver, services.exe) können danach weiter ins
+    /// Log schreiben; das stört nicht, die Live-Anzeige endet hier.
     func finish(status: Int32, then done: @escaping () -> Void) {
         queue.async {
             if !self.source.isCancelled {
@@ -421,24 +455,22 @@ private final class ProgramOutput: @unchecked Sendable {
         }
     }
 
-    /// Liest, was gerade in der Pipe liegt (nicht blockierend). Nur auf `queue` aufrufen.
+    /// Liest, was seit dem letzten Mal ans Log angehängt wurde. Nur auf `queue` aufrufen.
     private func drain() {
         var buffer = [UInt8](repeating: 0, count: 65536)
         while true {
             let n = read(reader.fileDescriptor, &buffer, buffer.count)
             if n > 0 {
-                append(Data(buffer[0..<n]))
+                announce(Data(buffer[0..<n]))
             } else if n < 0 && errno == EINTR {
                 continue
             } else {
-                if n == 0 { source.cancel() }   // EOF: alle Schreiber haben die Pipe geschlossen
-                return
+                return   // Dateiende: auf das nächste Anhängen warten
             }
         }
     }
 
-    private func append(_ data: Data) {
-        try? log.write(contentsOf: data)
+    private func announce(_ data: Data) {
         guard let text = String(data: data, encoding: .utf8) else { return }
         let programID = self.programID
         DispatchQueue.main.async {

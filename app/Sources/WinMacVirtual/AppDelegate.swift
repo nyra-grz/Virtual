@@ -32,39 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private var isShuttingDown = false
-
-    /// Mit Virtual endet auch Wine: alle Räume werden komplett beendet, damit keine
-    /// Wine-Prozesse im Hintergrund weiterlaufen. Laufende Programme vorher nachfragen.
+    /// Virtual beenden lässt gestartete Windows-Programme weiterlaufen (wie ein Launcher):
+    /// Sie hängen weder an Virtuals Prozess noch an einer Pipe von Virtual. Beenden kann man
+    /// sie selbst oder über „Alles beenden“ auf der Raum-Seite.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard !isShuttingDown else { return .terminateCancel }
-        let titles = Launcher.shared.runningTitles
-        if !titles.isEmpty {
-            let alert = NSAlert()
-            alert.messageText = "Virtual beenden?"
-            alert.informativeText = titles.count == 1
-                ? "„\(titles[0])“ läuft noch und wird geschlossen."
-                : "Diese Windows-Programme laufen noch und werden geschlossen: \(titles.joined(separator: ", "))."
-            alert.addButton(withTitle: "Beenden")
-            alert.addButton(withTitle: "Abbrechen")
-            guard alert.runModal() == .alertFirstButtonReturn else {
-                mainController.window?.makeKeyAndOrderFront(nil)
-                return .terminateCancel
-            }
-        }
-        isShuttingDown = true
-        Launcher.shared.stopAll(in: RoomStore.shared.rooms) { [self] unconfirmed in
-            guard !unconfirmed.isEmpty else { NSApp.reply(toApplicationShouldTerminate: true); return }
-            let alert = NSAlert()
-            alert.messageText = "Nicht alles ist beendet"
-            alert.informativeText = Launcher.stopFailureMessage(unconfirmed)
-            alert.addButton(withTitle: "Trotzdem beenden")
-            alert.addButton(withTitle: "Abbrechen")
-            let quit = alert.runModal() == .alertFirstButtonReturn
-            if !quit { isShuttingDown = false }
-            NSApp.reply(toApplicationShouldTerminate: quit)
-        }
-        return .terminateLater
+        .terminateNow
     }
 
     private var pendingURLs: [URL] = []
