@@ -12,6 +12,7 @@ final class SettingsWindowController: NSWindowController {
     private var setupLog: NSTextView!
     private var autoUpdateBox: NSButton!
     private var overlayBox: NSButton!
+    private var hudBox: NSButton!
     private var shortcutRecorder: ShortcutRecorder!
 
     private let versions = ["win11", "win10", "win81", "win8", "win7", "winxp"]
@@ -93,6 +94,14 @@ final class SettingsWindowController: NSWindowController {
         shortcutRecorder = ShortcutRecorder()
         shortcutRecorder.translatesAutoresizingMaskIntoConstraints = false
 
+        hudBox = NSButton(checkboxWithTitle: "Leistungsanzeige (FPS) in Spielen einblenden", target: nil, action: nil)
+        hudBox.state = Settings.shared.metalHUD ? .on : .off
+        hudBox.translatesAutoresizingMaskIntoConstraints = false
+        let hudHelp = NSTextField(wrappingLabelWithString: "Apples Metal-Anzeige oben rechts im Fenster: Bilder pro Sekunde, GPU-Zeit pro Bild und Übersetzungsweg. Gilt ab dem nächsten Start eines Programms – bei Spielen aus Steam, sobald Steam neu gestartet wurde.")
+        hudHelp.font = .systemFont(ofSize: 11)
+        hudHelp.textColor = .secondaryLabelColor
+        hudHelp.translatesAutoresizingMaskIntoConstraints = false
+
         let save = NSButton(title: "Sichern", target: self, action: #selector(saveAndClose))
         save.keyEquivalent = "\r"
         save.bezelStyle = .rounded
@@ -100,7 +109,7 @@ final class SettingsWindowController: NSWindowController {
 
         [runtimeLabel, runtimeField, runtimePick, runtimeStatus,
          prefixLabel, prefixField, prefixPick, versionLabel, versionPopup,
-         setupButton, logScroll, overlayBox, overlayHelp, shortcutLabel, shortcutRecorder, autoUpdateBox, save].forEach { v.addSubview($0) }
+         setupButton, logScroll, overlayBox, overlayHelp, shortcutLabel, shortcutRecorder, hudBox, hudHelp, autoUpdateBox, save].forEach { v.addSubview($0) }
 
         let m: CGFloat = 20
         NSLayoutConstraint.activate([
@@ -148,7 +157,12 @@ final class SettingsWindowController: NSWindowController {
             shortcutRecorder.centerYAnchor.constraint(equalTo: shortcutLabel.centerYAnchor),
             shortcutRecorder.leadingAnchor.constraint(equalTo: shortcutLabel.trailingAnchor, constant: 12),
             shortcutRecorder.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
-            shortcutRecorder.bottomAnchor.constraint(equalTo: save.topAnchor, constant: -16),
+            hudBox.topAnchor.constraint(equalTo: shortcutRecorder.bottomAnchor, constant: 14),
+            hudBox.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
+            hudHelp.topAnchor.constraint(equalTo: hudBox.bottomAnchor, constant: 5),
+            hudHelp.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
+            hudHelp.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -m),
+            hudHelp.bottomAnchor.constraint(equalTo: save.topAnchor, constant: -16),
             logScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 90),
 
             autoUpdateBox.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
@@ -201,6 +215,7 @@ final class SettingsWindowController: NSWindowController {
             if overlayBox.state == .on { try OverlayController.shared.configure(shortcutRecorder.shortcut) }
         } catch { NSAlert(error: error).runModal(); return false }
         Settings.shared.overlayEnabled = overlayBox.state == .on
+        Settings.shared.metalHUD = hudBox.state == .on
         Settings.shared.overlayShortcut = shortcutRecorder.shortcut
         OverlayController.shared.update()
         Settings.shared.runtimePath = URL(fileURLWithPath: (runtimeField.stringValue as NSString).expandingTildeInPath)

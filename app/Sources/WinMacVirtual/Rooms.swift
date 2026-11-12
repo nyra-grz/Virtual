@@ -117,6 +117,9 @@ final class RoomStore {
         env["WINEDEBUG"] = env["WINEDEBUG"] ?? "fixme-all"
         // Kiosk-Apps als Overlay über anderen Apps statt Vollbild-Sperre (Mac-Treiber der Runtime).
         if Settings.shared.overlayEnabled { env["VIRTUAL_KIOSK_OVERLAY"] = "1" } else { env["VIRTUAL_KIOSK_OVERLAY"] = nil }
+        // Leistungsanzeige: wirkt in allem, was Metal zeichnet (D3DMetal, DXMT, MoltenVK). Kinder wie
+        // von Steam gestartete Spiele erben sie, darum gilt sie ab dem nächsten Start des Startprogramms.
+        if Settings.shared.metalHUD { env["MTL_HUD_ENABLED"] = "1" } else { env["MTL_HUD_ENABLED"] = nil }
         return env
     }
 }

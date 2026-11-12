@@ -109,6 +109,11 @@ final class Settings {
         get { defaults.object(forKey: "overlayEnabled") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "overlayEnabled") }
     }
+    /// Apples Metal-Leistungsanzeige (FPS, GPU-Zeit) in gestarteten Programmen.
+    var metalHUD: Bool {
+        get { defaults.object(forKey: "metalHUD") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "metalHUD") }
+    }
     var overlayShortcut: OverlayController.Shortcut {
         get {
             guard defaults.object(forKey: "overlayKey") != nil else { return .standard }
