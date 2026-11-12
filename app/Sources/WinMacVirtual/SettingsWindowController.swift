@@ -13,6 +13,7 @@ final class SettingsWindowController: NSWindowController {
     private var autoUpdateBox: NSButton!
     private var overlayBox: NSButton!
     private var hudBox: NSButton!
+    private var cleanupBox: NSButton!
     private var shortcutRecorder: ShortcutRecorder!
 
     private let versions = ["win11", "win10", "win81", "win8", "win7", "winxp"]
@@ -21,7 +22,7 @@ final class SettingsWindowController: NSWindowController {
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 640),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Einstellungen"
         self.init(window: window)
@@ -79,7 +80,7 @@ final class SettingsWindowController: NSWindowController {
         setupLog.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         logScroll.documentView = setupLog
 
-        autoUpdateBox = NSButton(checkboxWithTitle: "Beim Start nach Updates suchen", target: nil, action: nil)
+        autoUpdateBox = NSButton(checkboxWithTitle: "Automatisch nach Updates suchen", target: nil, action: nil)
         autoUpdateBox.state = Settings.shared.autoUpdate ? .on : .off
         autoUpdateBox.translatesAutoresizingMaskIntoConstraints = false
 
@@ -102,6 +103,14 @@ final class SettingsWindowController: NSWindowController {
         hudHelp.textColor = .secondaryLabelColor
         hudHelp.translatesAutoresizingMaskIntoConstraints = false
 
+        cleanupBox = NSButton(checkboxWithTitle: "Leerlaufende Räume automatisch beenden", target: nil, action: nil)
+        cleanupBox.state = Settings.shared.autoCleanup ? .on : .off
+        cleanupBox.translatesAutoresizingMaskIntoConstraints = false
+        let cleanupHelp = NSTextField(wrappingLabelWithString: "Läuft in einem Raum kein Programm mehr, das du über Virtual gestartet hast, und ist kein Fenster offen, beendet Virtual nach 5 Minuten die übrig gebliebenen Hintergrundprozesse (etwa Updater) und beim Beenden von Virtual sofort. Wine-Prozesse ohne Server entfernt Virtual ebenfalls. Spart Akku, CPU und Arbeitsspeicher.")
+        cleanupHelp.font = .systemFont(ofSize: 11)
+        cleanupHelp.textColor = .secondaryLabelColor
+        cleanupHelp.translatesAutoresizingMaskIntoConstraints = false
+
         let save = NSButton(title: "Sichern", target: self, action: #selector(saveAndClose))
         save.keyEquivalent = "\r"
         save.bezelStyle = .rounded
@@ -109,7 +118,7 @@ final class SettingsWindowController: NSWindowController {
 
         [runtimeLabel, runtimeField, runtimePick, runtimeStatus,
          prefixLabel, prefixField, prefixPick, versionLabel, versionPopup,
-         setupButton, logScroll, overlayBox, overlayHelp, shortcutLabel, shortcutRecorder, hudBox, hudHelp, autoUpdateBox, save].forEach { v.addSubview($0) }
+         setupButton, logScroll, overlayBox, overlayHelp, shortcutLabel, shortcutRecorder, hudBox, hudHelp, cleanupBox, cleanupHelp, autoUpdateBox, save].forEach { v.addSubview($0) }
 
         let m: CGFloat = 20
         NSLayoutConstraint.activate([
@@ -162,7 +171,12 @@ final class SettingsWindowController: NSWindowController {
             hudHelp.topAnchor.constraint(equalTo: hudBox.bottomAnchor, constant: 5),
             hudHelp.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
             hudHelp.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -m),
-            hudHelp.bottomAnchor.constraint(equalTo: save.topAnchor, constant: -16),
+            cleanupBox.topAnchor.constraint(equalTo: hudHelp.bottomAnchor, constant: 14),
+            cleanupBox.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
+            cleanupHelp.topAnchor.constraint(equalTo: cleanupBox.bottomAnchor, constant: 5),
+            cleanupHelp.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
+            cleanupHelp.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -m),
+            cleanupHelp.bottomAnchor.constraint(equalTo: save.topAnchor, constant: -16),
             logScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 90),
 
             autoUpdateBox.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: m),
@@ -216,6 +230,7 @@ final class SettingsWindowController: NSWindowController {
         } catch { NSAlert(error: error).runModal(); return false }
         Settings.shared.overlayEnabled = overlayBox.state == .on
         Settings.shared.metalHUD = hudBox.state == .on
+        Settings.shared.autoCleanup = cleanupBox.state == .on
         Settings.shared.overlayShortcut = shortcutRecorder.shortcut
         OverlayController.shared.update()
         Settings.shared.runtimePath = URL(fileURLWithPath: (runtimeField.stringValue as NSString).expandingTildeInPath)

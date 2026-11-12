@@ -94,7 +94,7 @@ final class Settings {
         set { defaults.set(newValue, forKey: Key.didInitPrefix) }
     }
 
-    /// Beim Start (höchstens einmal am Tag) auf GitHub nach einer neueren Version suchen.
+    /// Beim Start und danach alle paar Stunden auf GitHub nach einer neueren Version suchen.
     var autoUpdate: Bool {
         get { defaults.object(forKey: Key.autoUpdate) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Key.autoUpdate) }
@@ -108,6 +108,11 @@ final class Settings {
     var overlayEnabled: Bool {
         get { defaults.object(forKey: "overlayEnabled") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "overlayEnabled") }
+    }
+    /// Räume ohne Programm und Fenster nach einer Weile beenden, verwaiste Wine-Prozesse entfernen (Housekeeper).
+    var autoCleanup: Bool {
+        get { defaults.object(forKey: "autoCleanup") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "autoCleanup") }
     }
     /// Apples Metal-Leistungsanzeige (FPS, GPU-Zeit) in gestarteten Programmen.
     var metalHUD: Bool {

@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.mainController.window?.makeKeyAndOrderFront(nil)
         }
         RoomWatcher.shared.start()
+        Housekeeper.shared.start()
         let logs = Settings.shared.logsPath
         DispatchQueue.global(qos: .utility).async { Settings.pruneLogs(in: logs, olderThan: 14) }
         _ = OverlayController.shared   // Tastenkombination für Kiosk-Apps, solange Programme laufen
@@ -34,9 +35,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Virtual beenden lässt gestartete Windows-Programme weiterlaufen (wie ein Launcher):
     /// Sie hängen weder an Virtuals Prozess noch an einer Pipe von Virtual. Beenden kann man
-    /// sie selbst oder über „Alles beenden“ auf der Raum-Seite.
+    /// sie selbst oder über „Alles beenden“ auf der Raum-Seite. Räume, in denen nur noch
+    /// Hintergrundprozesse ohne Fenster laufen, schließt der Housekeeper dabei gleich mit.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        mainController?.canTerminate() == false ? .terminateCancel : .terminateNow
+        guard mainController?.canTerminate() != false else { return .terminateCancel }
+        Housekeeper.shared.cleanUpOnQuit()
+        return .terminateNow
     }
 
     private var pendingURLs: [URL] = []
