@@ -1,7 +1,8 @@
 import AppKit
 
-/// Liest die Icons von Windows-Programmen: aus den Ressourcen einer .exe (PE-Format) und
-/// über das Ziel einer Verknüpfung (.lnk). Ergebnisse werden pro Pfad zwischengespeichert.
+/// Liest die Icons von Windows-Programmen: aus den Ressourcen einer .exe (PE-Format) und bei
+/// Verknüpfungen (.lnk) aus deren eigenem Symbol, sonst aus dem Ziel. Ergebnisse werden pro Pfad
+/// zwischengespeichert.
 enum WindowsIcon {
     private static var cache: [String: NSImage] = [:]
 
@@ -13,7 +14,11 @@ enum WindowsIcon {
         case "exe":
             image = fromExecutable(url)
         case "lnk":
-            if let target = shortcutTarget(url), let unix = unixPath(target, in: program.room) {
+            // Startet die Verknüpfung über einen Launcher (etwa Steam), trägt sie meist das Symbol des Spiels.
+            if let icon = shortcutIcon(url), let unix = unixPath(icon.path, in: program.room) {
+                image = unix.pathExtension.lowercased() == "ico" ? NSImage(contentsOf: unix) : fromExecutable(unix, index: icon.index)
+            }
+            if image == nil, let target = shortcutTarget(url), let unix = unixPath(target, in: program.room) {
                 image = fromExecutable(unix)
             }
         default:
@@ -51,6 +56,39 @@ enum WindowsIcon {
         return data.cString(at: offset + Int(data.u32(offset + 0x10)))
     }
 
+    /// Eigenes Symbol einer .lnk-Datei (IconLocation in StringData) samt Index, mit den üblichen
+    /// Umgebungsvariablen aufgelöst; nil, wenn die Verknüpfung keines angibt.
+    static func shortcutIcon(_ url: URL) -> (path: String, index: Int)? {
+        guard let data = try? Data(contentsOf: url), data.count > 0x4C, data.u32(0) == 0x4C else { return nil }
+        let flags = data.u32(0x14)
+        guard flags & 0x40 != 0 else { return nil }                                  // HasIconLocation
+        var offset = 0x4C
+        if flags & 0x1 != 0 { offset += 2 + Int(data.u16(offset)) }                 // LinkTargetIDList
+        if flags & 0x2 != 0 { offset += Int(data.u32(offset)) }                     // LinkInfo
+        let unicode = flags & 0x80 != 0
+        // StringData in fester Reihenfolge: Name, relativer Pfad, Arbeitsordner, Argumente, Symbol.
+        for bit: UInt32 in [0x4, 0x8, 0x10, 0x20, 0x40] where flags & bit != 0 {
+            let start = offset + 2
+            let end = start + Int(data.u16(offset)) * (unicode ? 2 : 1)
+            guard end <= data.count else { return nil }
+            offset = end
+            guard bit == 0x40 else { continue }
+            let bytes = data.subdata(in: data.startIndex + start..<data.startIndex + end)
+            // Wine zählt die abschließende Null mit.
+            guard let raw = String(data: bytes, encoding: unicode ? .utf16LittleEndian : .windowsCP1252)?
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\0")), !raw.isEmpty else { return nil }
+            var path = raw
+            for (name, value) in [("%SystemRoot%", "C:\\windows"), ("%windir%", "C:\\windows"),
+                                  ("%ProgramFiles(x86)%", "C:\\Program Files (x86)"), ("%ProgramFiles%", "C:\\Program Files"),
+                                  ("%ProgramData%", "C:\\ProgramData")] {
+                path = path.replacingOccurrences(of: name, with: value, options: .caseInsensitive)
+            }
+            guard !path.contains("%") else { return nil }
+            return (path, Int(Int32(bitPattern: data.u32(0x38))))
+        }
+        return nil
+    }
+
     /// „C:\\…“ im Raum → Pfad auf dem Mac (C: ist drive_c, Z: das Mac-Dateisystem).
     static func unixPath(_ windowsPath: String, in room: Room) -> URL? {
         let parts = windowsPath.replacingOccurrences(of: "\\", with: "/")
@@ -67,10 +105,10 @@ enum WindowsIcon {
 
     // MARK: - Icons aus PE-Ressourcen
 
-    private static func fromExecutable(_ url: URL) -> NSImage? {
+    private static func fromExecutable(_ url: URL, index: Int = 0) -> NSImage? {
         guard let data = try? Data(contentsOf: url, options: .alwaysMapped), let pe = PEResources(data) else { return nil }
         // RT_GROUP_ICON (14) beschreibt die Größen, die Bilder selbst sind RT_ICON (3).
-        guard let group = pe.firstResource(type: 14), group.count >= 6 else { return nil }
+        guard let group = pe.groupIcon(index), group.count >= 6 else { return nil }
         let count = Int(group.u16(4))
         var best: (id: Int, size: Int, bits: Int)?
         for i in 0..<count where 6 + i * 14 + 14 <= group.count {
@@ -167,6 +205,15 @@ private struct PEResources {
         guard let typeDir = entries(at: rootOffset).first(where: { $0.id == type && $0.isDirectory }),
               let named = entries(at: typeDir.target).first(where: { $0.isDirectory }) else { return nil }
         return leaf(named.target)
+    }
+
+    /// Symbolgruppe nach Windows' Symbol-Index: ab 0 die n-te Gruppe in Ressourcen-Reihenfolge,
+    /// negativ die Ressourcen-Id. Ein Index außerhalb fällt auf die erste Gruppe zurück.
+    func groupIcon(_ index: Int) -> Data? {
+        guard let typeDir = entries(at: rootOffset).first(where: { $0.id == 14 && $0.isDirectory }) else { return nil }
+        let groups = entries(at: typeDir.target).filter(\.isDirectory)
+        let chosen = index < 0 ? groups.first { $0.id == -index } : groups.indices.contains(index) ? groups[index] : nil
+        return (chosen ?? groups.first).flatMap { leaf($0.target) }
     }
 
     func resource(type: Int, id: Int) -> Data? {
