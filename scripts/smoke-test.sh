@@ -403,7 +403,10 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
     chromium_options_test windows-node-child "$SCRATCH/electron$bits/probe.exe" --expect-compat --spawn-node
     chromium_options_test plain-node "$SCRATCH/node$bits/probe.exe" --expect-plain
     chromium_options_test ordinary "$SCRATCH/ordinary$bits/probe.exe" --expect-plain
-    chromium_options_test legacy "$SCRATCH/legacy$bits/probe.exe" --expect-compat
+    # Ordnerzeichen allein reichen nicht (Patch 0037): Ein Programm ohne Chromium-Importe neben
+    # icudtl.dat/resources.pak ist ein Helfer wie BeamNGs CrashSender.exe, der sich mit den
+    # Chromium-Schaltern sofort beendete und das Spiel blockierte.
+    chromium_options_test marker-only "$SCRATCH/legacy$bits/probe.exe" --expect-plain
 done
 
 # e) Ausschließlich Hardware-Gerät; kein stiller WARP-/Software-Fallback.
