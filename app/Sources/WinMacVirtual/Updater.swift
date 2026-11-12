@@ -283,7 +283,7 @@ final class Updater {
         try? Self.run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", app.path])
         try? Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
         _ = try fm.replaceItemAt(target, withItemAt: app)
-        return updateScripts()
+        return updateScripts(version: release.version)
     }
 
     /// Setzt die Engine in die geladene App. Steckt sie schon im Archiv (ältere Releases), bleibt es
@@ -367,12 +367,19 @@ final class Updater {
         if let error = failure.value { throw error }
     }
 
-    /// Skripte im Projektordner nachziehen – nur in einem sauberen Checkout dieses Repos.
-    private func updateScripts() -> String {
+    /// Skripte im Projektordner nachziehen – nur in einem sauberen Checkout dieses Repos, der hinter
+    /// dem Release liegt. Enthält der Checkout den Release-Stand schon (Entwickler), bleibt es still.
+    private func updateScripts(version: String) -> String {
         let root = Settings.shared.root
         guard FileManager.default.fileExists(atPath: root.appendingPathComponent(".git").path) else { return "" }
         guard let origin = git(["remote", "get-url", "origin"]), origin.contains(Self.repo) else {
             return "Der Projektordner ist kein Checkout von \(Self.repo) – Skripte unverändert."
+        }
+        let tag = "v\(version)"
+        _ = git(["fetch", "--quiet", "origin", "refs/tags/\(tag):refs/tags/\(tag)"])
+        if git(["merge-base", "--is-ancestor", tag, "HEAD"]) != nil { return "" }
+        guard git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) != nil else {
+            return "Der Projektordner steht auf einem Branch ohne Upstream – Skripte unverändert (selbst: git pull)."
         }
         guard git(["status", "--porcelain", "--untracked-files=no"]) == "" else {
             return "Der Projektordner hat lokale Änderungen – Skripte unverändert (selbst: git pull --ff-only)."
