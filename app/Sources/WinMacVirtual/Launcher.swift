@@ -18,6 +18,11 @@ final class Launcher {
         let stopRequest: URL?
     }
 
+    /// Wer so lange lief, hat gestartet: Ein Fehlercode beim Beenden ist dann kein Startfehler
+    /// (Chromium-Browser etwa enden unter Wine beim Schließen mit Status 4). Installer (.msi)
+    /// werden weiter immer geprüft.
+    static var normalRunTime: TimeInterval = 30
+
     /// Laufende Prozesse nach Programm-ID.
     private var running: [UUID: Running] = [:]
     private var preparing: [UUID: Program] = [:]
@@ -89,6 +94,7 @@ final class Launcher {
         }
 
         let programID = program.id
+        let startedAt = Date()
         let launch = try start(arguments, in: room, title: program.name, id: programID,
                                directory: program.url.deletingLastPathComponent(), trackChildren: true,
                                manageClose: true) { [weak self] status in
@@ -97,7 +103,9 @@ final class Launcher {
             self.stopRequested.remove(programID)
             let stopped = self.stopping.remove(programID) != nil
             let isMSI = program.url.pathExtension.lowercased() == "msi"
-            if !LaunchDiagnostics.installerSucceeded(status: status, isMSI: isMSI), !stopped, !(isMSI && (status == 1602 || status == 66)) {
+            let ranNormally = !isMSI && Date().timeIntervalSince(startedAt) >= Self.normalRunTime
+            if !LaunchDiagnostics.installerSucceeded(status: status, isMSI: isMSI), !stopped, !ranNormally,
+               !(isMSI && (status == 1602 || status == 66)) {
                 self.repairOrReport(status, program: program)
             }
         }
@@ -119,6 +127,7 @@ final class Launcher {
             guard pendingTools.removeValue(forKey: id) != nil else { return }
             do {
                 if let error { throw error }
+                let startedAt = Date()
                 let launch = try start(arguments, in: room, title: title, id: id,
                                        directory: directory, trackChildren: trackChildren,
                                        manageClose: manageClose) { [weak self] status in
@@ -126,7 +135,8 @@ final class Launcher {
                     self.tools[id] = nil
                     self.toolTitles[id] = nil
                     let stopped = self.stopping.remove(id) != nil
-                    if status != 0, !stopped { self.reportExit(status, id: id, title: title) }
+                    let ranNormally = Date().timeIntervalSince(startedAt) >= Self.normalRunTime
+                    if status != 0, !stopped, !ranNormally { self.reportExit(status, id: id, title: title) }
                 }
                 recentLogs[id] = launch.logURL
                 tools[id] = launch.process

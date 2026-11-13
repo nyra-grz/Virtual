@@ -369,6 +369,25 @@ final class ImportAndLaunchTests: XCTestCase {
         XCTAssertEqual(failures, 0)
     }
 
+    func testErrorCodeAfterLongRunIsNoStartFailure() throws {
+        let previous = Launcher.normalRunTime
+        Launcher.normalRunTime = 0.3
+        defer { Launcher.normalRunTime = previous }
+        try write("""
+        #!/bin/bash
+        sleep 0.6
+        echo 'VIRTUAL_EXIT_CODE=4'
+        exit 4
+        """, to: Settings.shared.virtualBinary, executable: true)
+        let room = room(), app = try program(in: room)
+        var failures = 0
+        tokens.append(NotificationCenter.default.addObserver(forName: Launcher.didFail, object: nil, queue: .main) { _ in failures += 1 })
+        let ended = observe(Launcher.didFinishInRoom)
+        try Launcher.shared.launch(app)
+        wait(for: [ended], timeout: 10)
+        XCTAssertEqual(failures, 0)
+    }
+
     func testParallelAppsInstallDependencyUnionBeforeEitherStarts() throws {
         let room = room()
         let first = try program(in: room, filename: "Needs VC.exe")
