@@ -36,11 +36,16 @@ English translation.
 
 ## Quick start (works right away, no source build)
 
-For users, releases now contain the Wine engine, Wine Mono, DXVK, setup scripts
-and the local authentication helper inside `Virtual.app`. Move the app to
-Applications, open it, and choose a Windows installer or program. No checkout,
-Homebrew, Python, terminal commands or agent is needed. User data stays in
-`~/WinMac_Virtual`; the bundled engine is separate from rooms and installed apps.
+For users: download `Virtual-<version>.zip` from the latest release, move
+`Virtual.app` to Applications and open it. On first launch Virtual offers to
+download its engine (Wine engine, Wine Mono, DXVK, setup scripts and the local
+authentication helper, about 680 MB) from the same release, verifies it and keeps
+it in `~/Library/Application Support/Virtual/Engine`; on Apple silicon it first
+makes sure Rosetta is installed. No checkout, Homebrew, Python, terminal commands
+or agent is needed (`Virtual.app/Contents/MacOS/Virtual --install-engine` does the
+same from a terminal). User data stays in `~/WinMac_Virtual`; the engine is
+separate from rooms and installed apps, and updates download it only when it
+changed.
 
 Before a program or installer starts, Virtual prepares its room automatically.
 Existing rooms receive setup updates once per engine version. Concurrent starts
