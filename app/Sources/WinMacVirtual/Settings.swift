@@ -27,6 +27,8 @@ final class Settings {
         if let path = ProcessInfo.processInfo.environment["WINMAC_ASSETS_ROOT"] { return URL(fileURLWithPath: path) }
         if let engine = Bundle.main.resourceURL?.appendingPathComponent("Engine"),
            FileManager.default.fileExists(atPath: engine.appendingPathComponent("engine-version").path) { return engine }
+        // Schlanke App (Release-Download): die von Virtual geladene Engine unter Application Support.
+        if FileManager.default.fileExists(atPath: EngineStore.folder.appendingPathComponent("engine-version").path) { return EngineStore.folder }
         return root
     }
 

@@ -57,8 +57,13 @@ final class Updater {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
     }
 
-    /// Engine der laufenden App (fehlt bei Entwickler-Builds ohne eingebaute Engine).
-    private var installedEngine: URL? { Bundle.main.resourceURL?.appendingPathComponent("Engine") }
+    /// Engine im Bundle der laufenden App (vollständige App); nil bei schlanken Apps.
+    private var bundledEngine: URL? {
+        let engine = Bundle.main.resourceURL?.appendingPathComponent("Engine")
+        return Self.engineVersion(at: engine) != nil ? engine : nil
+    }
+    /// Die Engine, mit der Virtual gerade arbeitet: im Bundle oder (schlanke App) unter Application Support.
+    private var activeEngine: URL? { bundledEngine ?? (EngineStore.version != nil ? EngineStore.folder : nil) }
 
     private var isWorking = false
     private(set) var isInstalling = false
@@ -133,7 +138,7 @@ final class Updater {
         let alert = NSAlert()
         alert.messageText = "Virtual \(release.version) ist verfügbar"
         var info = "Installiert ist \(currentVersion)."
-        if let engine = release.engine, Self.engineVersion(at: installedEngine) != engine.version {
+        if let engine = release.engine, Self.engineVersion(at: activeEngine) != engine.version {
             info += " Dazu kommt eine neue Engine (\(ByteCountFormatter.string(fromByteCount: engine.size, countStyle: .file)) Download)."
         }
         let notes = release.notes.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -145,7 +150,7 @@ final class Updater {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         // Der Austausch nimmt Programmen aus dem alten Bundle Dateien weg, die sie noch nachladen.
-        guard !Launcher.shared.hasRunning, !Self.bundleEngineInUse() else {
+        guard !Launcher.shared.hasRunning, !Self.engineInUse() else {
             show("Erst Programme beenden", UpdateError.inUse.localizedDescription)
             return
         }
@@ -222,7 +227,7 @@ final class Updater {
     func latestRelease() throws -> Release {
         var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(Self.repo)/releases/latest")!)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        let data = try fetch(request)
+        let data = try Self.fetch(request)
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let api = try decoder.decode(APIRelease.self, from: data)
@@ -231,7 +236,7 @@ final class Updater {
               let archive = api.assets.first(where: { $0.name == zip })?.browserDownloadUrl else { throw UpdateError.noArchive }
         var engine: EngineManifest?
         if let manifest = api.assets.first(where: { $0.name == "engine.json" }) {
-            engine = try JSONDecoder().decode(EngineManifest.self, from: fetch(URLRequest(url: manifest.browserDownloadUrl)))
+            engine = try JSONDecoder().decode(EngineManifest.self, from: Self.fetch(URLRequest(url: manifest.browserDownloadUrl)))
         }
         return Release(version: version, notes: api.body ?? "", archive: archive, engine: engine)
     }
@@ -253,7 +258,7 @@ final class Updater {
 
         let zip = work.appendingPathComponent("update.zip")
         progress("Lade Virtual \(release.version) …", nil)
-        try download(release.archive, to: zip) { progress("Lade Virtual \(release.version) …", $0) }
+        try Self.download(release.archive, to: zip) { progress("Lade Virtual \(release.version) …", $0) }
         try Self.run("/usr/bin/ditto", ["-x", "-k", zip.path, work.path])
         try? fm.removeItem(at: zip)
         guard let app = try fm.contentsOfDirectory(at: work, includingPropertiesForKeys: nil)
@@ -263,22 +268,32 @@ final class Updater {
               (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) == release.version
         else { throw UpdateError.badArchive }
 
-        try Self.assembleEngine(in: app, manifest: release.engine, installed: installedEngine) { manifest in
-            let file = work.appendingPathComponent("engine.zip")
-            let size = ByteCountFormatter.string(fromByteCount: manifest.size, countStyle: .file)
-            try self.download(manifest.url, to: file) { progress("Lade die Engine (\(size)) …", $0) }
-            progress("Prüfe die Engine …", nil)
-            let bytes = (try? fm.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value
-            guard bytes == manifest.size, try Self.sha256(of: file) == manifest.sha256 else { throw UpdateError.badEngine }
-            progress("Entpacke die Engine …", nil)
-            return file
+        let newEngine = app.appendingPathComponent("Contents/Resources/Engine")
+        if bundledEngine != nil || Self.engineVersion(at: newEngine) != nil {
+            // Vollständige App: Engine ins neue Bundle, geklont oder geladen.
+            try Self.assembleEngine(in: app, manifest: release.engine, installed: bundledEngine) { manifest in
+                let file = work.appendingPathComponent("engine.zip")
+                let size = ByteCountFormatter.string(fromByteCount: manifest.size, countStyle: .file)
+                try Self.download(manifest.url, to: file) { progress("Lade die Engine (\(size)) …", $0) }
+                progress("Prüfe die Engine …", nil)
+                try Self.verify(file, against: manifest)
+                progress("Entpacke die Engine …", nil)
+                return file
+            }
+            guard fm.isExecutableFile(atPath: newEngine.appendingPathComponent("runtime/bin/virtual").path)
+            else { throw UpdateError.badArchive }
+        } else {
+            // Schlanke App: Die Engine liegt unter Application Support und wird nur ersetzt, wenn sie sich ändert.
+            guard let manifest = release.engine else { throw UpdateError.badArchive }
+            if EngineStore.version != manifest.version {
+                guard !Self.engineInUse() else { throw UpdateError.inUse }
+                try EngineStore.install(manifest, progress: progress)
+            }
         }
-        guard fm.isExecutableFile(atPath: app.appendingPathComponent("Contents/Resources/Engine/runtime/bin/virtual").path)
-        else { throw UpdateError.badArchive }
 
         progress("Installiere …", nil)
         // Während des Downloads kann etwas gestartet worden sein (etwa aus Windows heraus).
-        guard !Self.bundleEngineInUse() else { throw UpdateError.inUse }
+        guard !Self.engineInUse() else { throw UpdateError.inUse }
         // Die App kommt ohne Engine signiert; mit Engine neu versiegeln (ad hoc, wie build-app.sh).
         try? Self.run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", app.path])
         try? Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
@@ -309,11 +324,18 @@ final class Updater {
         }
     }
 
-    /// Laufen Wine-Prozesse aus der Engine dieses Bundles, auch aus früheren Sitzungen von Virtual?
-    /// Räume mit D3DMetal laufen aus der Spiele-Engine außerhalb des Bundles und zählen nicht.
-    static func bundleEngineInUse() -> Bool {
-        let bundle = Bundle.main.bundleURL.resolvingSymlinksInPath().path + "/"
-        return Housekeeper.wineProcesses().contains { $0.executable.hasPrefix(bundle) }
+    /// Laufen Wine-Prozesse aus der Engine dieser App (im Bundle oder unter Application Support),
+    /// auch aus früheren Sitzungen von Virtual? Räume mit D3DMetal laufen aus der Spiele-Engine
+    /// und zählen nicht.
+    static func engineInUse() -> Bool {
+        let places = [Bundle.main.bundleURL, EngineStore.folder].map { $0.resolvingSymlinksInPath().path + "/" }
+        return Housekeeper.wineProcesses().contains { process in places.contains { process.executable.hasPrefix($0) } }
+    }
+
+    /// Größe und SHA-256 eines geladenen Engine-Zips gegen engine.json prüfen.
+    static func verify(_ file: URL, against manifest: EngineManifest) throws {
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value
+        guard bytes == manifest.size, try sha256(of: file) == manifest.sha256 else { throw UpdateError.badEngine }
     }
 
     static func engineVersion(at engine: URL?) -> String? {
@@ -331,7 +353,7 @@ final class Updater {
     }
 
     /// Kleine Antwort (Release-Daten, engine.json) laden.
-    private func fetch(_ request: URLRequest) throws -> Data {
+    static func fetch(_ request: URLRequest) throws -> Data {
         var request = request
         request.timeoutInterval = 20
         let reply = Box<(Data?, URLResponse?, Error?)>()
@@ -348,7 +370,7 @@ final class Updater {
     }
 
     /// Lädt `url` nach `destination` und meldet den Anteil (0…1).
-    private func download(_ url: URL, to destination: URL, progress: @escaping (Double) -> Void) throws {
+    static func download(_ url: URL, to destination: URL, progress: @escaping (Double) -> Void) throws {
         let failure = Box<Error>()
         let done = DispatchSemaphore(value: 0)
         let task = URLSession.shared.downloadTask(with: url) { tmp, response, error in
@@ -405,7 +427,7 @@ final class Updater {
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func run(_ tool: String, _ args: [String]) throws {
+    static func run(_ tool: String, _ args: [String]) throws {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: tool)
         p.arguments = args
@@ -450,8 +472,8 @@ final class Updater {
     }
 }
 
-/// Fenster mit Fortschritt, solange ein Update lädt und installiert.
-private final class UpdateProgressWindow {
+/// Fenster mit Fortschritt, solange ein Update oder die Engine lädt und installiert.
+final class UpdateProgressWindow {
     private let window: NSWindow
     private let label = NSTextField(labelWithString: "Bereite das Update vor …")
     private let bar = NSProgressIndicator()

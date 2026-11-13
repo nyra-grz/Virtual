@@ -330,7 +330,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         title.lineBreakMode = .byTruncatingTail
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let pill: NSView
-        if !runtime { pill = statusPill("Keine Runtime", color: .systemRed) }
+        if !runtime { pill = EngineSetup.shared.isInstalling ? statusPill("Engine wird geladen…", color: .systemOrange) : statusPill("Engine fehlt", color: .systemRed) }
         else if settingUp { pill = statusPill("Wird eingerichtet…", color: .systemOrange) }
         else if !room.isReady { pill = statusPill("Nicht eingerichtet", color: .systemOrange) }
         else if busy { pill = statusPill(runningApps > 1 ? "\(runningApps) Apps laufen" : "Läuft", color: .systemGreen) }
@@ -369,7 +369,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         top.setCustomSpacing(14, after: header[0])
         add(top)
 
-        if !room.isReady || settingUp || setupLogs[room.id] != nil { renderSetup(room, running: settingUp) }
+        if !runtime { renderEngine() }
+        else if !room.isReady || settingUp || setupLogs[room.id] != nil { renderSetup(room, running: settingUp) }
 
         // Apps des Raums
         section("Apps", detail: programs.isEmpty ? nil : "\(programs.count)")
@@ -456,6 +457,54 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         }
         return more
     }
+
+    /// Ohne Engine geht nichts: Release-Apps laden sie einmalig, Entwickler-Builds brauchen eine Runtime.
+    private func renderEngine() {
+        let card = CardView()
+        card.fill = NSColor.systemOrange.withAlphaComponent(0.07)
+        card.border = NSColor.systemOrange.withAlphaComponent(0.35)
+        let loading = EngineSetup.shared.isInstalling
+        let canDownload = EngineSetup.shared.canDownload
+        let heading = NSTextField(labelWithString: loading ? "Windows-Engine wird geladen…" : "Die Windows-Engine fehlt noch")
+        heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        let text = NSTextField(wrappingLabelWithString: canDownload
+            ? "Virtual lädt sie einmalig von GitHub und prüft sie. Danach richtet sich dieser Raum beim ersten Programmstart selbst ein."
+            : "Keine Runtime gefunden. Bitte den Runtime-Pfad in den Einstellungen prüfen.")
+        text.font = .systemFont(ofSize: 12)
+        text.textColor = .secondaryLabelColor
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let texts = NSStackView(views: [heading, text])
+        texts.orientation = .vertical
+        texts.alignment = .leading
+        texts.spacing = 3
+        var views: [NSView] = [symbolBadge("arrow.down.circle.fill", tint: .systemOrange), texts]
+        if loading {
+            let spinner = NSProgressIndicator()
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.startAnimation(nil)
+            views.append(spinner)
+        } else if canDownload {
+            let load = button("Engine laden", #selector(loadEngine))
+            load.bezelColor = .controlAccentColor
+            views.append(load)
+        }
+        let row = NSStackView(views: views)
+        row.spacing = 12
+        row.alignment = .centerY
+        row.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            row.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            row.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12)
+        ])
+        if let last = detail.arrangedSubviews.last { detail.setCustomSpacing(22, after: last) }
+        add(card)
+    }
+
+    @objc private func loadEngine() { EngineSetup.shared.offer() }
 
     private func renderSetup(_ room: Room, running: Bool) {
         let card = CardView()
@@ -752,7 +801,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
     private func launch(_ program: Program) {
         programLogs[program.id] = ""
-        do { try Launcher.shared.launch(program) } catch { showError(error.localizedDescription) }
+        do { try Launcher.shared.launch(program) } catch {
+            // Ohne Engine gleich den Download anbieten statt nur einer Fehlermeldung.
+            if case Launcher.LaunchError.runtimeMissing = error, EngineSetup.shared.canDownload { EngineSetup.shared.offer() }
+            else { showError(error.localizedDescription) }
+        }
     }
     @objc private func stopSelected() { if let program { Launcher.shared.stop(program) } }
     @objc private func revealProgram() { if let program { NSWorkspace.shared.activateFileViewerSelecting([program.url]) } }
@@ -814,6 +867,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         on(Library.didChange) { [weak self] _ in self?.reload() }
         on(Launcher.didChange) { [weak self] _ in self?.reload() }
         on(PrefixSetup.didChange) { [weak self] _ in self?.reload() }
+        on(EngineStore.didChange) { [weak self] _ in self?.reload() }
         on(Launcher.didFail) { [weak self] note in
             guard let title = note.userInfo?["title"] as? String, let text = note.userInfo?["message"] as? String else { return }
             self?.showError("„\(title)“ konnte nicht erfolgreich gestartet werden.\n\n\(text)")

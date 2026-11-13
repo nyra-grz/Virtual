@@ -124,7 +124,7 @@ final class PrefixSetup {
         }
         let script = settings.assetsRoot.appendingPathComponent(task.script)
         guard settings.runtimeIsInstalled, FileManager.default.fileExists(atPath: script.path) else {
-            finish(status: -1, error: SetupError("Die Windows-Umgebung dieser Virtual-Version ist unvollständig. Bitte Virtual erneut aus dem vollständigen App-Archiv installieren."))
+            finish(status: -1, error: SetupError("Die Windows-Engine fehlt oder ist unvollständig. Virtual lädt sie über „Engine laden“ auf der Raum-Seite."))
             return
         }
         let process = Process()

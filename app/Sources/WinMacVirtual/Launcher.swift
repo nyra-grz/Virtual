@@ -396,7 +396,7 @@ final class Launcher {
         var errorDescription: String? {
             switch self {
             case .runtimeMissing:
-                return "Die Windows-Runtime fehlt. Bitte installiere Virtual aus dem vollständigen App-Archiv erneut."
+                return "Die Windows-Engine fehlt noch. Virtual lädt sie über „Engine laden“ auf der Raum-Seite."
             case .fileMissing(let p):
                 return "Datei nicht gefunden: \(p)"
             case .updateInProgress:

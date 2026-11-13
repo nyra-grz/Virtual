@@ -23,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let urls = pendingURLs
         pendingURLs.removeAll()
         urls.forEach { Handoff.shared.open($0) }
+        // Schlanke App ohne Engine: erst die Engine anbieten, dann nach Updates suchen.
+        EngineSetup.shared.checkOnLaunch()
         Updater.shared.checkOnLaunch()
     }
 
