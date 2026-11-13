@@ -1,0 +1,230 @@
+From: Daniel Özdek <daniel.timur.23@gmail.com>
+Date: Fri, 13 Nov 2026 09:55:00 +0100
+Subject: [PATCH] combase: Implement IClientSecurity on standard proxies
+
+CoSetProxyBlanket, CoQueryProxyBlanket and CoCopyProxy on a cross-process
+proxy failed with E_NOTIMPL because the proxy manager's IClientSecurity
+methods were stubs. Microsoft Edge Update sets a blanket on its proxy to the
+update service and treats the failure as fatal, so the WebView2 runtime
+installer (run by Tauri and many other installers) stopped with 0x80004001.
+
+Keep the blanket per interface proxy (or per object for other interface
+pointers) and report it back; unset fields default to WinNT authentication,
+connect level and identify impersonation. Cross-process COM in Wine runs
+over local RPC on the same machine, so the settings do not change the
+transport. CopyProxy hands back the proxy itself, as its blanket cannot
+affect other users of the local transport.
+
+Tested: MicrosoftEdgeWebview2Setup.exe /silent /install in a fresh prefix
+now installs and registers the WebView2 runtime (157.0.4341.57).
+
+diff --git a/dlls/combase/marshal.c b/dlls/combase/marshal.c
+index f638604f..66ff3513 100644
+--- a/dlls/combase/marshal.c
++++ b/dlls/combase/marshal.c
+@@ -51,6 +51,22 @@ static HRESULT unmarshal_object(const STDOBJREF *stdobjref, struct apartment *ap
+ #define SORFP_NOLIFETIMEMGMT SORF_OXRES2
+ 
+ /* imported interface proxy */
++/* Virtual: Windows keeps the authentication settings of every interface proxy (IClientSecurity).
++ * Cross-process COM in Wine runs over local RPC on the same machine, where these settings do not
++ * change the transport, so they are recorded and reported back instead of failing with E_NOTIMPL;
++ * installers such as Microsoft Edge Update treat that failure as fatal. */
++struct proxy_blanket
++{
++    BOOL  set;
++    DWORD authn_service;
++    DWORD authz_service;
++    WCHAR *principal;
++    DWORD authn_level;
++    DWORD imp_level;
++    void *auth_info;
++    DWORD capabilities;
++};
++
+ struct ifproxy
+ {
+     struct list entry;       /* entry in proxy_manager list (CS parent->cs) */
+@@ -61,6 +77,7 @@ struct ifproxy
+     IRpcProxyBuffer *proxy;  /* interface proxy (RO) */
+     ULONG refs;              /* imported (public) references (LOCK) */
+     IRpcChannelBuffer *chan; /* channel to object (CS parent->cs) */
++    struct proxy_blanket blanket; /* IClientSecurity settings for this interface (CS parent->cs) */
+ };
+ 
+ /* imported object / proxy manager */
+@@ -82,6 +99,7 @@ struct proxy_manager
+     HANDLE remoting_mutex;    /* mutex used for synchronizing access to IRemUnknown */
+     MSHCTX dest_context;      /* context used for activating optimisations (LOCK) */
+     void *dest_context_data;  /* reserved context value (LOCK) */
++    struct proxy_blanket blanket; /* IClientSecurity settings for other interface pointers (CS cs) */
+ };
+ 
+ static inline struct proxy_manager *impl_from_IMultiQI(IMultiQI *iface)
+@@ -1359,6 +1377,16 @@ static ULONG WINAPI ProxyCliSec_Release(IClientSecurity *iface)
+     return IMultiQI_Release(&This->IMultiQI_iface);
+ }
+ 
++/* must be called in This->cs */
++static struct proxy_blanket *proxy_manager_get_blanket(struct proxy_manager *This, IUnknown *proxy)
++{
++    struct ifproxy *ifproxy;
++
++    LIST_FOR_EACH_ENTRY(ifproxy, &This->interfaces, struct ifproxy, entry)
++        if (ifproxy->iface == proxy) return &ifproxy->blanket;
++    return &This->blanket;
++}
++
+ static HRESULT WINAPI ProxyCliSec_QueryBlanket(IClientSecurity *iface,
+                                                IUnknown *pProxy,
+                                                DWORD *pAuthnSvc,
+@@ -1369,26 +1397,32 @@ static HRESULT WINAPI ProxyCliSec_QueryBlanket(IClientSecurity *iface,
+                                                void **pAuthInfo,
+                                                DWORD *pCapabilities)
+ {
+-    FIXME("(%p, %p, %p, %p, %p, %p, %p, %p): stub\n", pProxy, pAuthnSvc,
+-          pAuthzSvc, ppServerPrincName, pAuthnLevel, pImpLevel, pAuthInfo,
+-          pCapabilities);
++    struct proxy_manager *This = impl_from_IClientSecurity( iface );
++    struct proxy_blanket *blanket;
++    WCHAR *principal = NULL;
++    HRESULT hr = S_OK;
+ 
+-    if (pAuthnSvc)
+-        *pAuthnSvc = 0;
+-    if (pAuthzSvc)
+-        *pAuthzSvc = 0;
+-    if (ppServerPrincName)
+-        *ppServerPrincName = NULL;
+-    if (pAuthnLevel)
+-        *pAuthnLevel = RPC_C_AUTHN_LEVEL_DEFAULT;
+-    if (pImpLevel)
+-        *pImpLevel = RPC_C_IMP_LEVEL_DEFAULT;
+-    if (pAuthInfo)
+-        *pAuthInfo = NULL;
+-    if (pCapabilities)
+-        *pCapabilities = EOAC_NONE;
++    TRACE("(%p, %p, %p, %p, %p, %p, %p, %p)\n", pProxy, pAuthnSvc, pAuthzSvc, ppServerPrincName,
++          pAuthnLevel, pImpLevel, pAuthInfo, pCapabilities);
++
++    EnterCriticalSection(&This->cs);
++    blanket = proxy_manager_get_blanket(This, pProxy);
++    if (ppServerPrincName && blanket->set && blanket->principal)
++    {
++        SIZE_T size = (wcslen(blanket->principal) + 1) * sizeof(WCHAR);
++        if ((principal = CoTaskMemAlloc(size))) memcpy(principal, blanket->principal, size);
++        else hr = E_OUTOFMEMORY;
++    }
++    if (pAuthnSvc) *pAuthnSvc = blanket->set ? blanket->authn_service : RPC_C_AUTHN_WINNT;
++    if (pAuthzSvc) *pAuthzSvc = blanket->set ? blanket->authz_service : RPC_C_AUTHZ_NONE;
++    if (ppServerPrincName) *ppServerPrincName = principal;
++    if (pAuthnLevel) *pAuthnLevel = blanket->set ? blanket->authn_level : RPC_C_AUTHN_LEVEL_CONNECT;
++    if (pImpLevel) *pImpLevel = blanket->set ? blanket->imp_level : RPC_C_IMP_LEVEL_IDENTIFY;
++    if (pAuthInfo) *pAuthInfo = blanket->set ? blanket->auth_info : NULL;
++    if (pCapabilities) *pCapabilities = blanket->set ? blanket->capabilities : EOAC_NONE;
++    LeaveCriticalSection(&This->cs);
+ 
+-    return E_NOTIMPL;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI ProxyCliSec_SetBlanket(IClientSecurity *iface,
+@@ -1399,18 +1433,61 @@ static HRESULT WINAPI ProxyCliSec_SetBlanket(IClientSecurity *iface,
+                                              void *pAuthInfo,
+                                              DWORD Capabilities)
+ {
+-    FIXME("%p, %ld, %ld, %s, %ld, %ld, %p, %#lx: stub\n", pProxy, AuthnSvc, AuthzSvc,
++    struct proxy_manager *This = impl_from_IClientSecurity( iface );
++    struct proxy_blanket *blanket;
++    WCHAR *principal = NULL;
++
++    TRACE("%p, %ld, %ld, %s, %ld, %ld, %p, %#lx\n", pProxy, AuthnSvc, AuthzSvc,
+           pServerPrincName == COLE_DEFAULT_PRINCIPAL ? "<default principal>" : debugstr_w(pServerPrincName),
+           AuthnLevel, ImpLevel, pAuthInfo, Capabilities);
+-    return E_NOTIMPL;
++
++    if (pServerPrincName && pServerPrincName != COLE_DEFAULT_PRINCIPAL)
++    {
++        SIZE_T size = (wcslen(pServerPrincName) + 1) * sizeof(WCHAR);
++        if (!(principal = malloc(size))) return E_OUTOFMEMORY;
++        memcpy(principal, pServerPrincName, size);
++    }
++
++    EnterCriticalSection(&This->cs);
++    blanket = proxy_manager_get_blanket(This, pProxy);
++    if (!blanket->set)
++    {
++        blanket->authn_service = RPC_C_AUTHN_WINNT;
++        blanket->authz_service = RPC_C_AUTHZ_NONE;
++        blanket->authn_level = RPC_C_AUTHN_LEVEL_CONNECT;
++        blanket->imp_level = RPC_C_IMP_LEVEL_IDENTIFY;
++        blanket->auth_info = NULL;
++        blanket->capabilities = EOAC_NONE;
++        blanket->set = TRUE;
++    }
++    if (AuthnSvc != RPC_C_AUTHN_DEFAULT) blanket->authn_service = AuthnSvc;
++    if (AuthzSvc != RPC_C_AUTHZ_DEFAULT) blanket->authz_service = AuthzSvc;
++    if (pServerPrincName != COLE_DEFAULT_PRINCIPAL)
++    {
++        free(blanket->principal);
++        blanket->principal = principal;
++        principal = NULL;
++    }
++    if (AuthnLevel != RPC_C_AUTHN_LEVEL_DEFAULT) blanket->authn_level = AuthnLevel;
++    if (ImpLevel != RPC_C_IMP_LEVEL_DEFAULT) blanket->imp_level = ImpLevel;
++    if (pAuthInfo != COLE_DEFAULT_AUTHINFO) blanket->auth_info = pAuthInfo;
++    if (Capabilities != EOAC_DEFAULT) blanket->capabilities = Capabilities;
++    LeaveCriticalSection(&This->cs);
++
++    free(principal);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI ProxyCliSec_CopyProxy(IClientSecurity *iface,
+                                             IUnknown *pProxy, IUnknown **ppCopy)
+ {
+-    FIXME("(%p, %p): stub\n", pProxy, ppCopy);
+-    *ppCopy = NULL;
+-    return E_NOTIMPL;
++    TRACE("(%p, %p)\n", pProxy, ppCopy);
++
++    if (!pProxy || !ppCopy) return E_INVALIDARG;
++    /* Blanket settings do not change the local transport, so the proxy serves as its own copy. */
++    IUnknown_AddRef(pProxy);
++    *ppCopy = pProxy;
++    return S_OK;
+ }
+ 
+ static const IClientSecurityVtbl ProxyCliSec_Vtbl =
+@@ -1532,6 +1609,7 @@ static void ifproxy_destroy(struct ifproxy * This)
+ 
+     if (This->proxy) IRpcProxyBuffer_Release(This->proxy);
+ 
++    free(This->blanket.principal);
+     free(This);
+ }
+ 
+@@ -1574,6 +1652,7 @@ static HRESULT proxy_manager_construct(
+ 
+     list_init(&This->entry);
+     list_init(&This->interfaces);
++    memset(&This->blanket, 0, sizeof(This->blanket));
+ 
+     InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     This->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": proxy_manager");
+@@ -1729,6 +1808,7 @@ static HRESULT proxy_manager_create_ifproxy(
+     ifproxy->iid = *riid;
+     ifproxy->refs = 0;
+     ifproxy->proxy = NULL;
++    memset(&ifproxy->blanket, 0, sizeof(ifproxy->blanket));
+ 
+     assert(channel);
+     ifproxy->chan = channel; /* FIXME: we should take the binding strings and construct the channel in this function */
+@@ -1958,6 +2038,7 @@ static void proxy_manager_destroy(struct proxy_manager * This)
+ 
+     CloseHandle(This->remoting_mutex);
+ 
++    free(This->blanket.principal);
+     free(This);
+ }
+ 

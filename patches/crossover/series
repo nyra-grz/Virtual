@@ -44,3 +44,4 @@
 0039-Virtual-0040-winemac-cursor-position-quartz.patch
 0040-Virtual-0041-qpc-without-syscall.patch
 0041-Virtual-0042-winebus-sdl-idle-poll.patch
+0042-Virtual-0043-combase-proxy-client-security.patch
