@@ -170,8 +170,8 @@ final class Updater {
                 case .failure(let error):
                     self.isInstalling = false
                     self.show("Update fehlgeschlagen", error.localizedDescription)
-                case .success(let scripts):
-                    self.show("Update installiert", "Virtual \(release.version) startet jetzt neu.\(scripts.isEmpty ? "" : "\n\n" + scripts)")
+                case .success:
+                    self.show("Update erfolgreich", "Virtual \(release.version) startet jetzt neu.")
                     self.relaunch()
                 }
             }
@@ -207,14 +207,13 @@ final class Updater {
             }
             print("Aktualisiere \(currentVersion) → \(release.version) …")
             var last = ""
-            let scripts = try install(release) { text, fraction in
+            try install(release) { text, fraction in
                 let line = fraction.map { "\(text) \(Int($0 * 100)) %" } ?? text
                 guard line != last, fraction == nil || Int((fraction ?? 0) * 100) % 10 == 0 else { return }
                 last = line
                 print(line)
             }
             print("Installiert: \(Bundle.main.bundleURL.path)")
-            if !scripts.isEmpty { print(scripts) }
             return 0
         } catch {
             FileHandle.standardError.write("Update fehlgeschlagen: \(error.localizedDescription)\n".data(using: .utf8)!)
@@ -248,8 +247,7 @@ final class Updater {
     }
 
     /// Lädt die App, setzt die passende Engine ein, prüft alles und ersetzt das laufende Bundle.
-    /// Gibt einen Hinweis zu den Projekt-Skripten zurück (leer, wenn es keinen gibt).
-    func install(_ release: Release, progress: @escaping (String, Double?) -> Void = { _, _ in }) throws -> String {
+    func install(_ release: Release, progress: @escaping (String, Double?) -> Void = { _, _ in }) throws {
         let fm = FileManager.default
         let target = Bundle.main.bundleURL
         // Gleiches Volume wie das Bundle: Klonen der Engine und Austausch sind schnell.
@@ -298,7 +296,8 @@ final class Updater {
         try? Self.run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", app.path])
         try? Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
         _ = try fm.replaceItemAt(target, withItemAt: app)
-        return updateScripts(version: release.version)
+        // Skripte im Projektordner still mitziehen; für das Update selbst spielt das keine Rolle.
+        _ = updateScripts(version: release.version)
     }
 
     /// Setzt die Engine in die geladene App. Steckt sie schon im Archiv (ältere Releases), bleibt es
