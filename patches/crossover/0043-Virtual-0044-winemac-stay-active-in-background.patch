@@ -1,23 +1,30 @@
 From: Daniel Özdek <daniel.timur.23@gmail.com>
-Date: Fri, 13 Nov 2026 10:20:00 +0100
-Subject: [PATCH] winemac: Let chosen programs stay foreground when another Mac app is activated
+Date: Fri, 13 Nov 2026 10:30:00 +0100
+Subject: [PATCH] winemac: Let chosen programs stay foreground and unminimized in the background
 
 When the user switches to another Mac app, the Mac driver moves the Windows
 foreground to the desktop. Programs then get WM_ACTIVATE/WM_ACTIVATEAPP/
-WM_KILLFOCUS, and many games throttle or pause themselves.
+WM_KILLFOCUS, and many games throttle or pause themselves. Minimizing the Mac
+window minimizes the Windows window too (WM_SIZE SIZE_MINIMIZED, IsIconic),
+and many games stop rendering.
 
 For executables listed in $WINEPREFIX/.virtual/stay-active (one .exe name per
-line, case-insensitive; VIRTUAL_STAY_ACTIVE=1/0 overrides) the foreground stays
-where it is. Only the cursor clip is released so the mouse is free on the Mac,
-and restored when the app becomes active again. The list is re-read on every
-switch, so Virtual's per-program toggle takes effect immediately. Switching to
-another Wine window still changes the foreground normally (its
-WINDOW_GOT_FOCUS sets it).
+line, case-insensitive; VIRTUAL_STAY_ACTIVE=1/0 overrides):
+- the foreground stays where it is when another Mac app is activated;
+- minimizing only miniaturizes the Cocoa window (like the existing Stage
+  Manager path), the Windows window stays normal and keeps rendering;
+- the cursor clip is released while away and restored on return.
+The list is re-read on every query, so Virtual's per-program toggle takes
+effect immediately. The process name is cached at init so the check also runs
+on the Cocoa main thread. Switching to another Wine window still changes the
+foreground normally.
 
-Tested with a probe window: off = WM_CANCELMODE, WM_ACTIVATE 0, WM_ACTIVATEAPP 0,
-WM_KILLFOCUS on Cmd-Tab; on = no messages, GetForegroundWindow unchanged, clip
-released while away and restored on return; switching to a second Wine program
-still deactivates.
+Tested with probe windows (D3D11 via D3DMetal, uncapped present):
+off = WM_ACTIVATEAPP 0 on Cmd-Tab, WM_SIZE 1 + IsIconic on minimize;
+on  = no messages, GetForegroundWindow unchanged, IsIconic 0 while the Mac
+      window is minimized (AXMinimized true), rendering continues; clip restored.
+macOS itself still paces presentation of hidden/minimized windows to the
+display refresh (120 Hz here) and of inactive ones to 240 Hz.
 
 --- a/dlls/winemac.drv/window.c
 +++ b/dlls/winemac.drv/window.c
@@ -31,53 +38,67 @@ still deactivates.
  #include <IOKit/pwr_mgt/IOPMLib.h>
  #define GetCurrentThread Mac_GetCurrentThread
  #define LoadResource Mac_LoadResource
-@@ -1888,8 +1891,67 @@
-     macdrv_window_rejected_focus(event);
- }
+@@ -1886,9 +1889,101 @@
  
+     TRACE("win %p/%p rejecting focus\n", hwnd, event->window);
+     macdrv_window_rejected_focus(event);
++}
 +
-+/* Virtual: Mausbegrenzung, die beim Wechsel zu einer anderen Mac-App gelöst wurde. */
++
++/* Virtual: Mausbegrenzung, die beim Wechsel zu einer anderen Mac-App oder beim Minimieren
++ * gelöst wurde. */
 +static RECT background_clip;
 +static BOOL background_clip_saved;
- 
- /***********************************************************************
-+ *              stay_active_in_background
++
++/* Virtual: .exe-Name dieses Prozesses in Kleinbuchstaben, beim Start gemerkt, damit
++ * macdrv_stay_active_in_background() auch auf dem Cocoa-Hauptthread (ohne TEB) läuft. */
++static char stay_active_name[1024];
++
++void macdrv_init_stay_active(void)
++{
++    const WCHAR *app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer, *p;
++    int len, i;
++
++    if (!app) return;
++    if ((p = wcsrchr(app, '/'))) app = p + 1;
++    if ((p = wcsrchr(app, '\\'))) app = p + 1;
++    len = ntdll_wcstoumbs(app, wcslen(app), stay_active_name, sizeof(stay_active_name) - 1, FALSE);
++    if (len < 0) len = 0;
++    stay_active_name[len] = 0;
++    for (i = 0; i < len; i++)
++        if (stay_active_name[i] >= 'A' && stay_active_name[i] <= 'Z') stay_active_name[i] += 'a' - 'A';
++}
++
++/***********************************************************************
++ *              macdrv_stay_active_in_background
 + *
 + * Virtual: Soll dieses Programm nicht merken, dass der Benutzer zu einer anderen
-+ * Mac-App gewechselt hat? Die Liste steht in $WINEPREFIX/.virtual/stay-active
-+ * (ein .exe-Name pro Zeile, Groß-/Kleinschreibung egal, # leitet Kommentare ein).
-+ * Sie wird bei jedem Wechsel neu gelesen, damit der Schalter in Virtual sofort
-+ * wirkt. VIRTUAL_STAY_ACTIVE=1 bzw. =0 hat Vorrang vor der Liste.
++ * Mac-App gewechselt oder sein Fenster minimiert hat? Die Liste steht in
++ * $WINEPREFIX/.virtual/stay-active (ein .exe-Name pro Zeile, Groß-/Kleinschreibung
++ * egal, # leitet Kommentare ein). Sie wird bei jeder Abfrage neu gelesen, damit der
++ * Schalter in Virtual sofort wirkt. VIRTUAL_STAY_ACTIVE=1 bzw. =0 hat Vorrang.
++ * Kommt ohne TEB aus, ist also auch vom Cocoa-Hauptthread aufrufbar.
 + */
-+static BOOL stay_active_in_background(void)
++bool macdrv_stay_active_in_background(void)
 +{
 +    const char *env = getenv("VIRTUAL_STAY_ACTIVE"), *prefix, *home;
-+    const WCHAR *app, *p;
-+    char path[4096], line[1024], name[1024];
-+    BOOL ret = FALSE;
++    char path[4096], line[1024];
++    bool ret = false;
 +    FILE *file;
-+    int len, i;
++    int i;
 +
 +    if (env && *env)
 +        return env[0] == '1' || env[0] == 'y' || env[0] == 'Y' || env[0] == 't' || env[0] == 'T';
-+
-+    app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
-+    if (!app) return FALSE;
-+    if ((p = wcsrchr(app, '/'))) app = p + 1;
-+    if ((p = wcsrchr(app, '\\'))) app = p + 1;
-+    len = ntdll_wcstoumbs(app, wcslen(app), name, sizeof(name) - 1, FALSE);
-+    if (len <= 0) return FALSE;
-+    name[len] = 0;
-+    for (i = 0; i < len; i++) if (name[i] >= 'A' && name[i] <= 'Z') name[i] += 'a' - 'A';
++    if (!stay_active_name[0]) return false;
 +
 +    if ((prefix = getenv("WINEPREFIX")) && *prefix)
 +        snprintf(path, sizeof(path), "%s/.virtual/stay-active", prefix);
 +    else if ((home = getenv("HOME")))
 +        snprintf(path, sizeof(path), "%s/.wine/.virtual/stay-active", home);
 +    else
-+        return FALSE;
++        return false;
 +
-+    if (!(file = fopen(path, "r"))) return FALSE;
++    if (!(file = fopen(path, "r"))) return false;
 +    while (!ret && fgets(line, sizeof(line), file))
 +    {
 +        char *start = line, *end;
@@ -88,25 +109,45 @@ still deactivates.
 +        while (end > start && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
 +        *end = 0;
 +        for (i = 0; start[i]; i++) if (start[i] >= 'A' && start[i] <= 'Z') start[i] += 'a' - 'A';
-+        ret = *start && !strcmp(start, name);
++        ret = *start && !strcmp(start, stay_active_name);
 +    }
 +    fclose(file);
-+    TRACE("%s: %d\n", debugstr_a(name), ret);
 +    return ret;
+ }
+ 
++/* Virtual: Mausbegrenzung lösen und merken; restore_background_clip gibt sie zurück. */
++static void release_background_clip(void)
++{
++    RECT clip, full;
+ 
++    if (!NtUserGetClipCursor(&clip)) return;
++    NtUserClipCursor(NULL);
++    if (NtUserGetClipCursor(&full) && memcmp(&clip, &full, sizeof(clip)))
++    {
++        background_clip = clip;
++        background_clip_saved = TRUE;
++    }
 +}
 +
-+/***********************************************************************
++static void restore_background_clip(void)
++{
++    if (!background_clip_saved) return;
++    background_clip_saved = FALSE;
++    TRACE("restoring clip %s\n", wine_dbgstr_rect(&background_clip));
++    NtUserClipCursor(&background_clip);
++}
++
+ /***********************************************************************
   *              macdrv_window_lost_focus
   *
-  * Handler for WINDOW_LOST_FOCUS events.
-@@ -1902,6 +1964,14 @@
+@@ -1902,6 +1997,14 @@
  
      if (hwnd == NtUserGetForegroundWindow())
      {
 +        /* Virtual: Fokus ging an eine andere Mac-App; das Programm soll nichts davon merken.
 +         * Wechselt der Fokus zu einem anderen Wine-Fenster, setzt dessen WINDOW_GOT_FOCUS
 +         * den Vordergrund ganz normal um. */
-+        if (stay_active_in_background())
++        if (macdrv_stay_active_in_background())
 +        {
 +            TRACE("win %p stays foreground\n", hwnd);
 +            return;
@@ -114,7 +155,7 @@ still deactivates.
          send_message(hwnd, WM_CANCELMODE, 0, 0);
          if (hwnd == NtUserGetForegroundWindow())
              NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
-@@ -1918,6 +1988,15 @@
+@@ -1918,6 +2021,11 @@
  {
      TRACE("\n");
      macdrv_UpdateClipboard();
@@ -122,15 +163,11 @@ still deactivates.
 +    /* Virtual: Mausbegrenzung zurückgeben, die beim Wechsel weg nur auf dem Mac gelöst wurde. */
 +    if (background_clip_saved && get_active_window() &&
 +        get_active_window() == NtUserGetForegroundWindow())
-+    {
-+        background_clip_saved = FALSE;
-+        TRACE("restoring clip %s\n", wine_dbgstr_rect(&background_clip));
-+        NtUserClipCursor(&background_clip);
-+    }
++        restore_background_clip();
  }
  
  
-@@ -1928,6 +2007,28 @@
+@@ -1928,6 +2036,18 @@
   */
  void macdrv_app_deactivated(void)
  {
@@ -139,19 +176,9 @@ still deactivates.
 +    /* Virtual: Kein Vordergrundwechsel, keine WM_ACTIVATE/WM_ACTIVATEAPP – das Programm läuft
 +     * weiter, als wäre es vorne. Nur die Mausbegrenzung wird gelöst, damit die Maus auf dem
 +     * Mac frei ist; beim Zurückkommen stellt macdrv_app_activated sie wieder her. */
-+    if (active && active == NtUserGetForegroundWindow() && stay_active_in_background())
++    if (active && active == NtUserGetForegroundWindow() && macdrv_stay_active_in_background())
 +    {
-+        RECT clip, full;
-+
-+        if (NtUserGetClipCursor(&clip))
-+        {
-+            NtUserClipCursor(NULL);
-+            if (NtUserGetClipCursor(&full) && memcmp(&clip, &full, sizeof(clip)))
-+            {
-+                background_clip = clip;
-+                background_clip_saved = TRUE;
-+            }
-+        }
++        release_background_clip();
 +        TRACE("win %p stays foreground, clip saved %d\n", active, background_clip_saved);
 +        return;
 +    }
@@ -159,3 +186,72 @@ still deactivates.
      NtUserClipCursor(NULL);
  
      if (get_active_window() == NtUserGetForegroundWindow())
+@@ -1971,7 +2091,12 @@
+ 
+     /* If all our windows are minimized, disable cursor clipping. */
+     if (!macdrv_is_any_wine_window_visible())
+-        NtUserClipCursor(NULL);
++    {
++        /* Virtual: Das Programm weiß nichts vom Minimieren (siehe -[WineWindow miniaturize:]);
++         * Begrenzung beim Wiederherstellen zurückgeben. */
++        if (macdrv_stay_active_in_background()) release_background_clip();
++        else NtUserClipCursor(NULL);
++    }
+ }
+ 
+ 
+@@ -1988,7 +2113,12 @@
+     TRACE("win %p\n", hwnd);
+ 
+     if (!(data = get_win_data(hwnd))) return;
+-    if (!data->minimized) goto done;
++    if (!data->minimized)
++    {
++        /* Virtual: nur auf dem Mac minimiert gewesen (Im Hintergrund weiterlaufen). */
++        if (background_clip_saved && hwnd == NtUserGetForegroundWindow()) restore_background_clip();
++        goto done;
++    }
+ 
+     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+ 
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -2801,6 +2801,16 @@
+          * Don't start minimizing the window on the Win32 side.
+          */
+         if (stage_manager_enabled())
++        {
++            [super miniaturize:sender];
++            return;
++        }
++
++        /* Virtual: Im Hintergrund weiterlaufen – nur das Mac-Fenster minimieren, das Programm
++         * bleibt unter Windows normal (kein SC_MINIMIZE, kein WM_SIZE SIZE_MINIMIZED) und
++         * zeichnet weiter. Wie beim Stage Manager kommt beim Wiederherstellen nur
++         * WINDOW_DID_UNMINIMIZE, das ohne Windows-Minimierung nichts tut. */
++        if (macdrv_stay_active_in_background())
+         {
+             [super miniaturize:sender];
+             return;
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -458,6 +458,7 @@
+ 
+     init_win_context();
+     setup_options();
++    macdrv_init_stay_active();
+     load_strings(params->strings);
+ 
+     macdrv_err_on = ERR_ON(macdrv);
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -232,6 +232,9 @@
+ 
+ /* cursor */
+ extern void macdrv_set_cursor(CFStringRef name, CFArrayRef frames);
++/* Virtual: Im Hintergrund weiterlaufen (window.c) */
++extern void macdrv_init_stay_active(void);
++extern bool macdrv_stay_active_in_background(void);
+ extern int macdrv_get_cursor_position(CGPoint *pos);
+ extern int macdrv_set_cursor_position(CGPoint pos);
+ extern int macdrv_clip_cursor(CGRect rect);

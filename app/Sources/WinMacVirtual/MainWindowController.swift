@@ -655,7 +655,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         stay.state = program.stayActive == true ? .on : .off
         stay.isEnabled = ["exe", "lnk"].contains(program.url.pathExtension.lowercased())
         add(stay)
-        let stayInfo = label("Das Programm merkt nicht, wenn du zu einer anderen Mac-App wechselst, und drosselt oder pausiert sich darum nicht. Wirkt sofort, auch während es läuft.", size: 11)
+        let stayInfo = label("Das Programm merkt nicht, wenn du zu einer anderen Mac-App wechselst oder sein Fenster minimierst, und drosselt oder pausiert sich darum nicht. Wirkt sofort, auch während es läuft.", size: 11)
         stayInfo.textColor = .secondaryLabelColor
         detail.setCustomSpacing(2, after: stay)
         add(stayInfo)
