@@ -89,6 +89,28 @@ enum WindowsIcon {
         return nil
     }
 
+    /// Befehlszeilen-Argumente einer .lnk-Datei (StringData „Arguments“), z. B. „-applaunch 284160“.
+    static func shortcutArguments(_ url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url), data.count > 0x4C, data.u32(0) == 0x4C else { return nil }
+        let flags = data.u32(0x14)
+        guard flags & 0x20 != 0 else { return nil }                                  // HasArguments
+        var offset = 0x4C
+        if flags & 0x1 != 0 { offset += 2 + Int(data.u16(offset)) }                 // LinkTargetIDList
+        if flags & 0x2 != 0 { offset += Int(data.u32(offset)) }                     // LinkInfo
+        let unicode = flags & 0x80 != 0
+        for bit: UInt32 in [0x4, 0x8, 0x10, 0x20] where flags & bit != 0 {
+            let start = offset + 2
+            let end = start + Int(data.u16(offset)) * (unicode ? 2 : 1)
+            guard end <= data.count else { return nil }
+            offset = end
+            guard bit == 0x20 else { continue }
+            let bytes = data.subdata(in: data.startIndex + start..<data.startIndex + end)
+            return String(data: bytes, encoding: unicode ? .utf16LittleEndian : .windowsCP1252)?
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+        }
+        return nil
+    }
+
     /// „C:\\…“ im Raum → Pfad auf dem Mac (C: ist drive_c, Z: das Mac-Dateisystem).
     static func unixPath(_ windowsPath: String, in room: Room) -> URL? {
         let parts = windowsPath.replacingOccurrences(of: "\\", with: "/")

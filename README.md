@@ -190,6 +190,15 @@ server is confirmed gone (`wineserver -k`, then `-w`) and says so if it is not.
 - **Logs:** output appears live on the program page. **Log öffnen** (Open log)
   opens the launch log, which remains available after the process exits. Files
   are kept under `logs/`.
+- **Keep running in the background:** **Im Hintergrund weiterlaufen** on a program's
+  page (or in its tile menu) is off by default. When on, the program does not notice
+  that you switched to another Mac app: it stays the Windows foreground window and gets
+  no `WM_ACTIVATEAPP`/`WM_KILLFOCUS`, so games do not throttle or pause. The mouse is
+  still released on the Mac and recaptured when you return. Switching to another Windows
+  program still works normally. It applies to the program's `.exe` and the other `.exe`
+  files in its folder; for Steam shortcuts (`-applaunch <id>`) to the game's install
+  folder. Virtual writes the names to `<prefix>/.virtual/stay-active`, which the Mac
+  driver re-reads on every switch, so the toggle takes effect immediately (patch 0044).
 - **Tools:** each configured room offers Explorer, Command Prompt, Control Panel,
   Registry Editor, Task Manager, Wine configuration, and its C: drive in Finder.
 - **Manage:** rooms and programs have context menus. Additional rooms can be renamed

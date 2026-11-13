@@ -12,6 +12,9 @@ final class Program: Codable {
     var roomID: UUID?
     /// Von Virtual im Raum gefunden (Startmenü-Verknüpfung) statt von Hand hinzugefügt.
     var detected: Bool?
+    /// „Im Hintergrund weiterlaufen“: Das Programm merkt nicht, dass man zu einer anderen Mac-App
+    /// wechselt (siehe StayActive). nil = aus.
+    var stayActive: Bool?
 
     init(name: String, path: String, bookmark: Data?, roomID: UUID?, detected: Bool = false) {
         self.id = UUID()
@@ -143,11 +146,18 @@ final class Library {
     func remove(_ program: Program) {
         programs.removeAll { $0.id == program.id }
         changed()
+        if program.stayActive == true { StayActive.update(program.room) }
     }
 
     func removeAll(inRoom roomID: UUID) {
         programs.removeAll { $0.roomID == roomID }
         changed()
+    }
+
+    func setStayActive(_ program: Program, _ on: Bool) {
+        program.stayActive = on ? true : nil
+        changed()
+        StayActive.update(program.room)
     }
 
     func rename(_ program: Program, to newName: String) {

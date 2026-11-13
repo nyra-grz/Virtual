@@ -45,3 +45,4 @@
 0040-Virtual-0041-qpc-without-syscall.patch
 0041-Virtual-0042-winebus-sdl-idle-poll.patch
 0042-Virtual-0043-combase-proxy-client-security.patch
+0043-Virtual-0044-winemac-stay-active-in-background.patch

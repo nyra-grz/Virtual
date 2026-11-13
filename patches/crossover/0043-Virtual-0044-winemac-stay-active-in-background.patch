@@ -1,0 +1,161 @@
+From: Daniel Özdek <daniel.timur.23@gmail.com>
+Date: Fri, 13 Nov 2026 10:20:00 +0100
+Subject: [PATCH] winemac: Let chosen programs stay foreground when another Mac app is activated
+
+When the user switches to another Mac app, the Mac driver moves the Windows
+foreground to the desktop. Programs then get WM_ACTIVATE/WM_ACTIVATEAPP/
+WM_KILLFOCUS, and many games throttle or pause themselves.
+
+For executables listed in $WINEPREFIX/.virtual/stay-active (one .exe name per
+line, case-insensitive; VIRTUAL_STAY_ACTIVE=1/0 overrides) the foreground stays
+where it is. Only the cursor clip is released so the mouse is free on the Mac,
+and restored when the app becomes active again. The list is re-read on every
+switch, so Virtual's per-program toggle takes effect immediately. Switching to
+another Wine window still changes the foreground normally (its
+WINDOW_GOT_FOCUS sets it).
+
+Tested with a probe window: off = WM_CANCELMODE, WM_ACTIVATE 0, WM_ACTIVATEAPP 0,
+WM_KILLFOCUS on Cmd-Tab; on = no messages, GetForegroundWindow unchanged, clip
+released while away and restored on return; switching to a second Wine program
+still deactivates.
+
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -27,6 +27,9 @@
+ 
+ #include "config.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <IOKit/pwr_mgt/IOPMLib.h>
+ #define GetCurrentThread Mac_GetCurrentThread
+ #define LoadResource Mac_LoadResource
+@@ -1888,8 +1891,67 @@
+     macdrv_window_rejected_focus(event);
+ }
+ 
++
++/* Virtual: Mausbegrenzung, die beim Wechsel zu einer anderen Mac-App gelöst wurde. */
++static RECT background_clip;
++static BOOL background_clip_saved;
+ 
+ /***********************************************************************
++ *              stay_active_in_background
++ *
++ * Virtual: Soll dieses Programm nicht merken, dass der Benutzer zu einer anderen
++ * Mac-App gewechselt hat? Die Liste steht in $WINEPREFIX/.virtual/stay-active
++ * (ein .exe-Name pro Zeile, Groß-/Kleinschreibung egal, # leitet Kommentare ein).
++ * Sie wird bei jedem Wechsel neu gelesen, damit der Schalter in Virtual sofort
++ * wirkt. VIRTUAL_STAY_ACTIVE=1 bzw. =0 hat Vorrang vor der Liste.
++ */
++static BOOL stay_active_in_background(void)
++{
++    const char *env = getenv("VIRTUAL_STAY_ACTIVE"), *prefix, *home;
++    const WCHAR *app, *p;
++    char path[4096], line[1024], name[1024];
++    BOOL ret = FALSE;
++    FILE *file;
++    int len, i;
++
++    if (env && *env)
++        return env[0] == '1' || env[0] == 'y' || env[0] == 'Y' || env[0] == 't' || env[0] == 'T';
++
++    app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    if (!app) return FALSE;
++    if ((p = wcsrchr(app, '/'))) app = p + 1;
++    if ((p = wcsrchr(app, '\\'))) app = p + 1;
++    len = ntdll_wcstoumbs(app, wcslen(app), name, sizeof(name) - 1, FALSE);
++    if (len <= 0) return FALSE;
++    name[len] = 0;
++    for (i = 0; i < len; i++) if (name[i] >= 'A' && name[i] <= 'Z') name[i] += 'a' - 'A';
++
++    if ((prefix = getenv("WINEPREFIX")) && *prefix)
++        snprintf(path, sizeof(path), "%s/.virtual/stay-active", prefix);
++    else if ((home = getenv("HOME")))
++        snprintf(path, sizeof(path), "%s/.wine/.virtual/stay-active", home);
++    else
++        return FALSE;
++
++    if (!(file = fopen(path, "r"))) return FALSE;
++    while (!ret && fgets(line, sizeof(line), file))
++    {
++        char *start = line, *end;
++
++        while (*start == ' ' || *start == '\t') start++;
++        if (*start == '#') continue;
++        end = start + strlen(start);
++        while (end > start && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
++        *end = 0;
++        for (i = 0; start[i]; i++) if (start[i] >= 'A' && start[i] <= 'Z') start[i] += 'a' - 'A';
++        ret = *start && !strcmp(start, name);
++    }
++    fclose(file);
++    TRACE("%s: %d\n", debugstr_a(name), ret);
++    return ret;
++}
++
++/***********************************************************************
+  *              macdrv_window_lost_focus
+  *
+  * Handler for WINDOW_LOST_FOCUS events.
+@@ -1902,6 +1964,14 @@
+ 
+     if (hwnd == NtUserGetForegroundWindow())
+     {
++        /* Virtual: Fokus ging an eine andere Mac-App; das Programm soll nichts davon merken.
++         * Wechselt der Fokus zu einem anderen Wine-Fenster, setzt dessen WINDOW_GOT_FOCUS
++         * den Vordergrund ganz normal um. */
++        if (stay_active_in_background())
++        {
++            TRACE("win %p stays foreground\n", hwnd);
++            return;
++        }
+         send_message(hwnd, WM_CANCELMODE, 0, 0);
+         if (hwnd == NtUserGetForegroundWindow())
+             NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+@@ -1918,6 +1988,15 @@
+ {
+     TRACE("\n");
+     macdrv_UpdateClipboard();
++
++    /* Virtual: Mausbegrenzung zurückgeben, die beim Wechsel weg nur auf dem Mac gelöst wurde. */
++    if (background_clip_saved && get_active_window() &&
++        get_active_window() == NtUserGetForegroundWindow())
++    {
++        background_clip_saved = FALSE;
++        TRACE("restoring clip %s\n", wine_dbgstr_rect(&background_clip));
++        NtUserClipCursor(&background_clip);
++    }
+ }
+ 
+ 
+@@ -1928,6 +2007,28 @@
+  */
+ void macdrv_app_deactivated(void)
+ {
++    HWND active = get_active_window();
++
++    /* Virtual: Kein Vordergrundwechsel, keine WM_ACTIVATE/WM_ACTIVATEAPP – das Programm läuft
++     * weiter, als wäre es vorne. Nur die Mausbegrenzung wird gelöst, damit die Maus auf dem
++     * Mac frei ist; beim Zurückkommen stellt macdrv_app_activated sie wieder her. */
++    if (active && active == NtUserGetForegroundWindow() && stay_active_in_background())
++    {
++        RECT clip, full;
++
++        if (NtUserGetClipCursor(&clip))
++        {
++            NtUserClipCursor(NULL);
++            if (NtUserGetClipCursor(&full) && memcmp(&clip, &full, sizeof(clip)))
++            {
++                background_clip = clip;
++                background_clip_saved = TRUE;
++            }
++        }
++        TRACE("win %p stays foreground, clip saved %d\n", active, background_clip_saved);
++        return;
++    }
++
+     NtUserClipCursor(NULL);
+ 
+     if (get_active_window() == NtUserGetForegroundWindow())

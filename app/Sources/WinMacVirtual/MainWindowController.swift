@@ -601,10 +601,15 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private func appTile(_ program: Program) -> NSView {
         let running = Launcher.shared.isRunning(program)
         let menu = NSMenu()
+        menu.autoenablesItems = false
         menu.addItem(ActionMenuItem(running ? "Beenden" : "Starten") { [weak self] in
             if running { Launcher.shared.stop(program) } else { self?.launch(program) }
         })
         menu.addItem(ActionMenuItem("Details") { [weak self] in self?.selectProgram(program) })
+        let stay = ActionMenuItem("Im Hintergrund weiterlaufen") { Library.shared.setStayActive(program, program.stayActive != true) }
+        stay.state = program.stayActive == true ? .on : .off
+        stay.isEnabled = ["exe", "lnk"].contains(program.url.pathExtension.lowercased())
+        menu.addItem(stay)
         menu.addItem(ActionMenuItem("Im Finder zeigen") { NSWorkspace.shared.activateFileViewerSelecting([program.url]) })
         return AppTile(program: program, running: running,
                        onOpen: { [weak self] in self?.selectProgram(program) },
@@ -646,6 +651,14 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         let log = button("Log öffnen", #selector(revealLog))
         log.isEnabled = Launcher.shared.logURL(for: program) != nil
         row([log, button("Entfernen", #selector(removeSelected))])
+        let stay = NSButton(checkboxWithTitle: "Im Hintergrund weiterlaufen", target: self, action: #selector(toggleStayActive(_:)))
+        stay.state = program.stayActive == true ? .on : .off
+        stay.isEnabled = ["exe", "lnk"].contains(program.url.pathExtension.lowercased())
+        add(stay)
+        let stayInfo = label("Das Programm merkt nicht, wenn du zu einer anderen Mac-App wechselst, und drosselt oder pausiert sich darum nicht. Wirkt sofort, auch während es läuft.", size: 11)
+        stayInfo.textColor = .secondaryLabelColor
+        detail.setCustomSpacing(2, after: stay)
+        add(stayInfo)
         add(label("Protokoll", size: 17, weight: .semibold))
         addLog(programLogs[program.id] ?? Launcher.shared.logURL(for: program).flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? "Beim Start erscheint hier die Programmausgabe.")
     }
@@ -669,6 +682,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         scroll.heightAnchor.constraint(equalToConstant: 190).isActive = true
         add(scroll)
         visibleLog = log
+    }
+
+    @objc private func toggleStayActive(_ sender: NSButton) {
+        guard let program else { return }
+        Library.shared.setStayActive(program, sender.state == .on)
     }
 
     @objc func importPrograms() {

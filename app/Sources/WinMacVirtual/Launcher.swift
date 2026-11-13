@@ -58,6 +58,8 @@ final class Launcher {
         }
         if isRunning(program) { return }
         repaired.remove(program.id)
+        // Liste neu aufbauen, falls ein Update neue .exe in den Programmordner gelegt hat.
+        if program.stayActive == true { StayActive.update(program.room) }
 
         preparing[program.id] = program
         NotificationCenter.default.post(name: Self.didChange, object: nil)
